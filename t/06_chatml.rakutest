@@ -1,0 +1,45 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+
+plan 3;
+
+my $template = LLM::Chat::Template::ChatML.new;
+
+is $template.name, 'chatml', 'Template name is correct';
+
+my @messages = (
+    LLM::Chat::Conversation::Message.new(:role<system>,    :content('You are a helpful assistant.')),
+    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi there!'))
+);
+
+my $expected = q:to/END/;
+<|im_start|>system
+You are a helpful assistant.
+<|im_end|>
+<|im_start|>user
+Hello?
+<|im_end|>
+<|im_start|>assistant
+Hi there!
+<|im_end|>
+END
+
+is $template.render(@messages), $expected, 'ChatML full render correct';
+
+my $expected-cont = q:to/ENDC/;
+<|im_start|>system
+You are a helpful assistant.
+<|im_end|>
+<|im_start|>user
+Hello?
+<|im_end|>
+<|im_start|>assistant
+Hi there!
+ENDC
+
+is $template.render(@messages, True), $expected-cont.trim, 'ChatML continuation omits final im_end';
+

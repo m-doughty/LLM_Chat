@@ -1,0 +1,54 @@
+use Test;
+use lib 'lib';
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Response::Stream;
+
+plan 15;
+
+my $resp = LLM::Chat::Backend::Response.new(id => "1");
+
+my @events;
+$resp.supply.tap(-> $e { @events.push: $e });
+
+$resp.emit("Hello World");
+$resp.done;
+
+await Promise.in(0.1);
+
+is $resp.msg,           "Hello World",   "Last emitted message is stored correctly";
+ok $resp.is-done,                        "Response is marked as done";
+ok $resp.is-success,                     "Response is marked as success";
+ok !$resp.is-cancelled,                  "Response is not cancelled";
+is-deeply @events,      ["Hello World"], "Supply events captured in order";
+
+my $cancelled = LLM::Chat::Backend::Response.new(id => "2");
+$cancelled.cancel;
+await Promise.in(0.1);
+
+ok $cancelled.is-cancelled,                      "Cancel flag is set correctly";
+is $cancelled.err,          "Cancelled by user", "Correct error value";
+
+my $stream = LLM::Chat::Backend::Response::Stream.new(id => "3");
+
+my @stream_events;
+$stream.supply.tap(-> $e { @stream_events.push: $e });
+
+$stream.emit("Hel");
+$stream.emit("lo,");
+await Promise.in(0.1);
+
+is $stream.latest,        "Hello,",       "Get a partial message mid-stream.";
+is $stream.msg,           "",             "Message correctly not set";
+ok !$stream.is-done,                      "Stream is not done";
+is-deeply @stream_events, ["Hel", "lo,"], "Correct events";
+
+$stream.emit(" Wo");
+$stream.emit("rld!");
+$stream.done;
+await Promise.in(0.1);
+
+is $stream.latest,        "Hello, World!",               "Got a complete response from stream";
+is $stream.msg,           "Hello, World!",               "Message correctly set";
+ok $stream.is-done,                                      "Stream is done";
+is-deeply @stream_events, ["Hel", "lo,", " Wo", "rld!"], "Correct events";
+

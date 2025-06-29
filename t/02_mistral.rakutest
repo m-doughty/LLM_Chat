@@ -1,0 +1,28 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::MistralV7;
+
+plan 3;
+
+my $template = LLM::Chat::Template::MistralV7.new;
+
+is $template.name, 'mistral-v7', 'Template name is correct';
+
+my @messages = (
+    LLM::Chat::Conversation::Message.new(:role<system>,    :content('Be helpful.'),            :sysprompt(True)),
+    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi! How can I help you?'))
+);
+
+my $rendered = $template.render(@messages);
+
+is $rendered, '<s>[SYSTEM_PROMPT]Be helpful.[/SYSTEM_PROMPT][INST]Hello?[/INST]Hi! How can I help you?</s>',
+    'Renders all message roles correctly';
+
+my $continuation = $template.render(@messages, True);
+
+is $continuation, '<s>[SYSTEM_PROMPT]Be helpful.[/SYSTEM_PROMPT][INST]Hello?[/INST]Hi! How can I help you?',
+    'Renders continuation correctly';
+

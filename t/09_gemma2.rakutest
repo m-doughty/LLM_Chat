@@ -1,0 +1,45 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::Gemma2;
+
+plan 3;
+
+my $template = LLM::Chat::Template::Gemma2.new;
+
+is $template.name, 'gemma-2', 'Template name is correct';
+
+my @messages = (
+    LLM::Chat::Conversation::Message.new(:role<system>,    :content('You are a helpful assistant.')),
+    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi there!'))
+);
+
+my $expected = q:to/END/;
+<start_of_turn>user
+You are a helpful assistant.
+<end_of_turn>
+<start_of_turn>user
+Hello?
+<end_of_turn>
+<start_of_turn>model
+Hi there!
+<end_of_turn>
+END
+
+is $template.render(@messages), $expected, 'Gemma2 full render correct';
+
+my $expected-cont = q:to/ENDC/;
+<start_of_turn>user
+You are a helpful assistant.
+<end_of_turn>
+<start_of_turn>user
+Hello?
+<end_of_turn>
+<start_of_turn>model
+Hi there!
+ENDC
+
+is $template.render(@messages, True), $expected-cont.trim, 'Gemma2 continuation omits final im_end';
+

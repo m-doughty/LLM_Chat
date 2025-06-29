@@ -1,0 +1,94 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::TokenCounter;
+use LLM::Chat::Template::MistralV7;
+use Tokenizers;
+
+my $template  = LLM::Chat::Template::MistralV7.new;
+my $t = Tokenizers.new-from-json(slurp('t/fixtures/tokenizer.json'));
+
+class DummyTokenCounter is LLM::Chat::TokenCounter {
+	method get-conversation-count(@messages) {
+		@messages.map({ self.get-message-count($_) }).sum;
+	}
+	method get-message-count($msg) {
+		my $c = $msg.content;
+		if $c ~~ /token\-(\d+)/ {
+			return $0.Int;
+		}
+		die "Unknown content: $c";
+	}
+	method get-template-count() { 0 }
+}
+
+my $tc = DummyTokenCounter.new(:tokenizer($t), :template($template));
+my $conv = LLM::Chat::Conversation.new(:token-counter($tc), :context-budget(80));
+
+sub make-msg($role, $content, :$depth, :$sticky, :$sysprompt) {
+	LLM::Chat::Conversation::Message.new(
+		:role($role),
+		:content($content),
+		:depth($depth // Nil),
+		:sticky($sticky // False),
+		:sysprompt($sysprompt // False),
+	);
+}
+
+# Test 1: Context overflow by sticky messages causes fail
+my @overflow = (
+	make-msg('user', 'token-40', :sticky),
+	make-msg('user', 'token-50', :sticky),
+);
+my $result = $conv.prepare-for-inference(@overflow);
+ok $result ~~ Failure, "Fails if context is exceeded by sticky messages";
+
+# Test 2: No shift, no iad, under budget
+my @plain = (
+	make-msg('user', 'token-10'),
+	make-msg('user', 'token-20'),
+);
+my $res2 = $conv.prepare-for-inference(@plain);
+is-deeply $res2.map(*.content), <token-10 token-20>, "Returns unchanged messages when under budget";
+
+# Test 3: Insert-at-depth messages go in the right place
+my @iad = (
+	make-msg('user', 'token-10'),
+	make-msg('user', 'token-20'),
+	make-msg('user', 'token-30', :depth(1)),  # should insert before last message
+);
+my $res3 = $conv.prepare-for-inference(@iad);
+is-deeply $res3.map(*.content), <token-10 token-30 token-20>, "IAD message inserted correctly";
+
+# Test 4: Context shifting trims non-sticky
+my @shift = (
+	make-msg('user', 'token-10'),
+	make-msg('user', 'token-20'),
+	make-msg('user', 'token-30'),
+	make-msg('user', 'token-50', :sticky),
+);
+my $res4 = $conv.prepare-for-inference(@shift);
+is-deeply $res4.map(*.content), <token-30 token-50>, "Context shift drops old non-stickies";
+
+# Test 5: Sysprompts always come first
+my @sys = (
+	make-msg('user', 'token-10'),
+	make-msg('system', 'token-20', :sysprompt),
+	make-msg('user', 'token-30'),
+);
+my $res5 = $conv.prepare-for-inference(@sys);
+is $res5[0].role, 'system', "Sysprompt is first";
+
+# Test 6: Stickies never dropped
+my @sticky = (
+	make-msg('user', 'token-10', :sticky),
+	make-msg('user', 'token-30'),
+	make-msg('user', 'token-40'),
+);
+my $res6 = $conv.prepare-for-inference(@sticky);
+ok $res6.first(*.content eq 'token-10'), "Sticky message retained during context shift";
+
+done-testing;
+

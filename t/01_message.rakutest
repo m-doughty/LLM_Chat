@@ -1,0 +1,47 @@
+use Test;
+use lib 'lib';
+use LLM::Chat::Conversation::Message;
+
+plan 16;
+
+my $msg = LLM::Chat::Conversation::Message.new(
+	role    => 'user',
+	content => 'Hello, world!',
+	sticky  => True,
+	depth   => 3,
+);
+
+isa-ok $msg, LLM::Chat::Conversation::Message, 'Created message object';
+is $msg.role, 'user', 'Role is set correctly';
+is $msg.content, 'Hello, world!', 'Content is correct';
+is $msg.is-insert-at-depth, True, 'Message is insert-at-depth';
+is $msg.is-sysprompt, False, 'Message is not a system prompt';
+is $msg.depth, 3, 'Depth is set correctly';
+ok $msg.sticky, 'Sticky is True';
+
+my $msg2 = LLM::Chat::Conversation::Message.new(
+	role      => 'system',
+	content   => 'Be helpful.',
+	sticky    => True,
+	sysprompt => True,
+);
+
+isa-ok $msg2, LLM::Chat::Conversation::Message, 'Created message object';
+is $msg2.role, 'system', 'Role is set correctly';
+is $msg2.content, 'Be helpful.', 'Content is correct';
+is $msg2.is-insert-at-depth, False, 'Depth is correctly undefined';
+is $msg2.is-sysprompt, True, 'Message is the system prompt';
+ok $msg2.sticky, 'Sticky is True';
+
+my $checksum = $msg.get-checksum;
+ok $checksum ~~ /^^<[0..9a..f]> ** 64$$/, 'Checksum is valid hex';
+is $checksum, 'e1eb21fd713fed6ff683c096b641c455350212e8e3443da0ff2691449cec2913', 
+	'Checksum returns expected value';
+
+my %expected := {
+	role    => 'user',
+	content => 'Hello, world!',
+};
+
+is-deeply $msg.to-hash, %expected, '.to-hash returns correct structure';
+

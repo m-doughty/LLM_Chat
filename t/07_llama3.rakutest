@@ -1,0 +1,34 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::Llama3;
+
+plan 3;
+
+my $template = LLM::Chat::Template::Llama3.new;
+
+is $template.name, 'llama-3', 'Correct template name';
+
+my @messages = (
+    LLM::Chat::Conversation::Message.new(:role<system>,    :content('Be helpful.')),
+    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi!'))
+);
+
+is $template.render(@messages), 
+"<|start_header_id|>system<|end_header_id|>\nBe helpful.<|eot_id|>\n<|start_header_id|>user<|end_header_id|>\nHello?<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>\nHi!<|eot_id|>\n",
+"LLaMA3 format renders correctly";
+
+# Continuation mode (last message held back and re-inserted raw)
+my $cont-expected = q:to/END/;
+<|start_header_id|>system<|end_header_id|>
+Be helpful.<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+Hello?<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+Hi!
+END
+
+my $continuation = $template.render(@messages, True);
+is $continuation, $cont-expected.trim, 'LLaMA3 continuation renders correctly';

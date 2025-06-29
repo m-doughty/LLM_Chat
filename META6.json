@@ -1,0 +1,39 @@
+{
+  "name": "LLM::Chat",
+  "version": "0.1.0",
+  "auth": "zef:apogee",
+  "description": "Simple framework for LLM inferencing",
+  "authors": ["Matt Doughty"],
+  "license": "Artistic-2.0",
+  "provides": {
+    "LLM::Chat::Backend": "lib/LLM/Chat/Backend.rakumod",
+    "LLM::Chat::Backend::KoboldCpp": "lib/LLM/Chat/Backend/KoboldCpp.rakumod",
+    "LLM::Chat::Backend::OpenAICommon": "lib/LLM/Chat/Backend/OpenAICommon.rakumod",
+    "LLM::Chat::Backend::Response": "lib/LLM/Chat/Backend/Response.rakumod",
+    "LLM::Chat::Backend::Response::Stream": "lib/LLM/Chat/Backend/Response/Stream.rakumod",
+    "LLM::Chat::Backend::Settings": "lib/LLM/Chat/Backend/Settings.rakumod",
+    "LLM::Chat::Conversation": "lib/LLM/Chat/Conversation.rakumod",
+    "LLM::Chat::Conversation::Message": "lib/LLM/Chat/Conversation/Message.rakumod",
+    "LLM::Chat::Template": "lib/LLM/Chat/Template.rakumod",
+    "LLM::Chat::Template::ChatML": "lib/LLM/Chat/Template/ChatML.rakumod",
+    "LLM::Chat::Template::Gemma2": "lib/LLM/Chat/Template/Gemma2.rakumod",
+    "LLM::Chat::Template::Llama3": "lib/LLM/Chat/Template/Llama3.rakumod",
+    "LLM::Chat::Template::Llama4": "lib/LLM/Chat/Template/Llama4.rakumod",
+    "LLM::Chat::Template::MistralV7": "lib/LLM/Chat/Template/MistralV7.rakumod",
+    "LLM::Chat::TokenCounter": "lib/LLM/Chat/TokenCounter.rakumod"
+  },
+  "depends": [
+    "Cro::HTTP",
+    "Digest::SHA256::Native",
+    "JSON::Fast",
+    "Tokenizers",
+    "UUID::V4"
+  ],
+  "source-url": "https://github.com/m-doughty/LLM_Chat.git",
+  "tags": ["llm", "inferencing", "ai"],
+  "support": {
+    "bugtracker": "https://github.com/m-doughty/LLM_Chat/issues",
+    "source": "https://github.com/m-doughty/LLM_Chat"
+  }
+}
+

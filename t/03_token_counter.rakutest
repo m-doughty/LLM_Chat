@@ -1,0 +1,27 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::MistralV7;
+use LLM::Chat::TokenCounter;
+use Tokenizers;
+
+plan 4;
+
+my $template  = LLM::Chat::Template::MistralV7.new;
+my $tokenizer = Tokenizers.new-from-json(slurp('t/fixtures/tokenizer.json'));
+
+my $token-counter = LLM::Chat::TokenCounter.new(:$template, :$tokenizer);
+isa-ok $token-counter, LLM::Chat::TokenCounter, 'Instantiated a token counter';
+is $token-counter.get-template-count, 1, 'Correct token count for template';
+
+my $message = LLM::Chat::Conversation::Message.new(:role<system>, :content('This is a system prompt.'), :sysprompt(True));
+is $token-counter.get-message-count($message), 20, 'Correct token count for message';
+
+my @messages = (
+    LLM::Chat::Conversation::Message.new(:role<system>,    :content('Be helpful.'),            :sysprompt(True)),
+    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi! How can I help you?'))
+);
+is $token-counter.get-conversation-count(@messages), 31, 'Correct token count for conversation';
+
