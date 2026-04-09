@@ -1,0 +1,112 @@
+use Test;
+use lib 'lib';
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::Jinja2;
+use JSON::Fast;
+
+plan 6;
+
+# Helper to create messages
+sub msg(Str:D $role, Str:D $content --> LLM::Chat::Conversation::Message) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content);
+}
+
+# === ChatML-style Jinja2 template ===
+
+my $chatml-jinja = q:to/END/.chomp;
+{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{{ message.content }}<|im_end|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+<|im_start|>assistant
+{%- endif -%}
+END
+
+subtest 'Jinja2 ChatML: basic render' => {
+	plan 2;
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($chatml-jinja));
+	is $tmpl.name, 'jinja2', 'Name is jinja2';
+	my @messages = (
+		msg('system', 'You are helpful.'),
+		msg('user', 'Hello!'),
+	);
+	my $result = $tmpl.render(@messages);
+	ok $result.contains('<|im_start|>user') && $result.contains('Hello!'),
+		'Renders messages with ChatML markers';
+};
+
+subtest 'Jinja2 ChatML: generation prompt' => {
+	plan 2;
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($chatml-jinja));
+	my @messages = (msg('user', 'Hi'),);
+
+	my $with-prompt = $tmpl.render(@messages, False);
+	ok $with-prompt.ends-with('<|im_start|>assistant'),
+		'Non-continuation adds generation prompt';
+
+	my $without-prompt = $tmpl.render(@messages, True);
+	nok $without-prompt.ends-with('<|im_start|>assistant'),
+		'Continuation mode omits generation prompt';
+};
+
+subtest 'Jinja2 ChatML: multi-turn' => {
+	plan 1;
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($chatml-jinja));
+	my @messages = (
+		msg('system', 'You are helpful.'),
+		msg('user', 'Hello!'),
+		msg('assistant', 'Hi there!'),
+		msg('user', 'How are you?'),
+	);
+	my $result = $tmpl.render(@messages);
+	ok $result.contains('Hello!') && $result.contains('Hi there!')
+		&& $result.contains('How are you?'),
+		'Multi-turn renders all messages';
+};
+
+# === BOS token passthrough ===
+
+subtest 'Jinja2: bos_token' => {
+	plan 1;
+	my $bos-tmpl = q:to/END/.chomp;
+	{{ bos_token }}{%- for message in messages -%}
+	[{{ message.role }}] {{ message.content }}
+	{%- endfor -%}
+	END
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($bos-tmpl), :bos-token('<s>'));
+	my $result = $tmpl.render([msg('user', 'Hi'),]);
+	ok $result.starts-with('<s>'), 'bos_token passed through';
+};
+
+# === from-tokenizer-config ===
+
+subtest 'from-tokenizer-config: Command A' => {
+	plan 3;
+	my $json = 't/fixtures/tokenizer_config_command_a.json'.IO.slurp;
+	my $tmpl = LLM::Chat::Template::Jinja2.from-tokenizer-config($json);
+	isa-ok $tmpl, LLM::Chat::Template::Jinja2, 'Creates Jinja2 template';
+	ok $tmpl.template.chars > 1000, 'Template loaded (>1000 chars)';
+
+	my @messages = (msg('user', 'Hello!'),);
+	my $result = $tmpl.render(@messages);
+	ok $result.contains('Hello!') && $result.chars > 100,
+		'Renders Command A template with user message';
+};
+
+subtest 'from-tokenizer-config: renders correctly' => {
+	plan 2;
+	my $json = 't/fixtures/tokenizer_config_command_a.json'.IO.slurp;
+	my $tmpl = LLM::Chat::Template::Jinja2.from-tokenizer-config($json);
+
+	my @messages = (
+		msg('system', 'You are a helpful assistant.'),
+		msg('user', 'What is 2+2?'),
+		msg('assistant', 'The answer is 4.'),
+	);
+	my $result = $tmpl.render(@messages);
+	ok $result.contains('You are a helpful assistant'), 'System message rendered';
+	ok $result.contains('The answer is 4'), 'Assistant message rendered';
+};
+
+done-testing;

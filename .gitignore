@@ -21,6 +21,7 @@ resources/lib/libtokenizersffi.*
 resources/include/tokenizers_ffi.h
 lib/.precomp
 .precomp
+LLM-Chat-*
 
 # === Shared Object Dumps & C Linker Junk ===
 *.obj

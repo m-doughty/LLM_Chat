@@ -1,14 +1,15 @@
-[![Actions Status](https://github.com/m-doughty/LLM_Chat/actions/workflows/test.yml/badge.svg)](https://github.com/m-doughty/LLM_Chat/actions)
+=begin pod
 
-LLM::Chat
-=========
+=head1 LLM::Chat
 
-Simple framework for LLM inferencing in Raku. Supports multiple backends (OpenAI-compatible, KoboldCpp), chat templates (ChatML, Llama 3/4, Mistral, Gemma 2, and any HuggingFace Jinja2 template), conversation management with context shifting, and token counting.
+Simple framework for LLM inferencing in Raku. Supports multiple backends
+(OpenAI-compatible, KoboldCpp), chat templates (ChatML, Llama 3/4, Mistral,
+Gemma 2, and any HuggingFace Jinja2 template), conversation management
+with context shifting, and token counting.
 
-Synopsis
---------
+=head2 Synopsis
 
-```raku
+=begin code :lang<raku>
 use LLM::Chat::Backend::KoboldCpp;
 use LLM::Chat::Template::ChatML;
 use LLM::Chat::Conversation;
@@ -22,14 +23,13 @@ my $conv = LLM::Chat::Conversation.new;
 $conv.add-message('user', 'Hello!');
 
 my $response = $backend.text-completion($conv.messages);
-```
+=end code
 
-Templates
----------
+=head2 Templates
 
-### Built-in Templates
+=head3 Built-in Templates
 
-```raku
+=begin code :lang<raku>
 use LLM::Chat::Template::ChatML;
 use LLM::Chat::Template::Llama3;
 use LLM::Chat::Template::Llama4;
@@ -37,13 +37,13 @@ use LLM::Chat::Template::MistralV7;
 use LLM::Chat::Template::Gemma2;
 
 my $template = LLM::Chat::Template::ChatML.new;
-```
+=end code
 
-### Jinja2 Templates (HuggingFace)
+=head3 Jinja2 Templates (HuggingFace)
 
-Load any HuggingFace `chat_template` directly from a `tokenizer_config.json`:
+Load any HuggingFace C<chat_template> directly from a C<tokenizer_config.json>:
 
-```raku
+=begin code :lang<raku>
 use LLM::Chat::Template::Jinja2;
 
 # From tokenizer_config.json
@@ -56,16 +56,17 @@ my $template = LLM::Chat::Template::Jinja2.new(
     bos-token => '<s>',
     eos-token => '</s>',
 );
-```
+=end code
 
-The Jinja2 template support is powered by [Template::Jinja2](https://raku.land/zef:apogee/Template::Jinja2), a complete Jinja2 engine for Raku with byte-identical output to Python Jinja2.
+The Jinja2 template support is powered by
+L<Template::Jinja2|https://raku.land/zef:apogee/Template::Jinja2>,
+a complete Jinja2 engine for Raku with byte-identical output to Python Jinja2.
 
-Backends
---------
+=head2 Backends
 
-### KoboldCpp
+=head3 KoboldCpp
 
-```raku
+=begin code :lang<raku>
 use LLM::Chat::Backend::KoboldCpp;
 
 my $backend = LLM::Chat::Backend::KoboldCpp.new(
@@ -73,25 +74,24 @@ my $backend = LLM::Chat::Backend::KoboldCpp.new(
     template  => $template,  # for text completions
     max_tokens => 200,
 );
-```
+=end code
 
-### OpenAI-compatible
+=head3 OpenAI-compatible
 
 Any OpenAI-compatible API (vLLM, Ollama, etc.):
 
-```raku
+=begin code :lang<raku>
 use LLM::Chat::Backend::OpenAICommon;
 
 my $backend = LLM::Chat::Backend::OpenAICommon.new(
     api_url => 'http://localhost:8000/v1',
     model   => 'my-model',
 );
-```
+=end code
 
-Conversation Management
------------------------
+=head2 Conversation Management
 
-```raku
+=begin code :lang<raku>
 use LLM::Chat::Conversation;
 
 my $conv = LLM::Chat::Conversation.new;
@@ -101,12 +101,11 @@ $conv.add-message('assistant', 'Hi there!');
 
 # Access messages
 say $conv.messages;
-```
+=end code
 
-Token Counting
---------------
+=head2 Token Counting
 
-```raku
+=begin code :lang<raku>
 use LLM::Chat::TokenCounter;
 
 my $counter = LLM::Chat::TokenCounter.new(
@@ -115,26 +114,21 @@ my $counter = LLM::Chat::TokenCounter.new(
 );
 
 my $count = $counter.count-messages(@messages);
-```
+=end code
 
-Dependencies
-------------
+=head2 Dependencies
 
-  * [Cro::HTTP](Cro::HTTP) — HTTP client for API calls
+=item L<Cro::HTTP> — HTTP client for API calls
+=item L<Template::Jinja2|https://raku.land/zef:apogee/Template::Jinja2> — Jinja2 template engine
+=item L<Tokenizers> — HuggingFace tokenizers via Rust FFI
+=item L<JSON::Fast> — JSON parsing
 
-  * [Template::Jinja2](https://raku.land/zef:apogee/Template::Jinja2) — Jinja2 template engine
-
-  * [Tokenizers](Tokenizers) — HuggingFace tokenizers via Rust FFI
-
-  * [JSON::Fast](JSON::Fast) — JSON parsing
-
-Author
-------
+=head2 Author
 
 Matt Doughty
 
-License
--------
+=head2 License
 
 Artistic-2.0
 
+=end pod

@@ -1,0 +1,12 @@
+Revision history for LLM::Chat
+
+{{$NEXT}}
+
+0.2.1  2026-04-09T04:41:36+01:00
+    - Add LLM::Chat::Template::Jinja2 for HuggingFace chat template support
+    - from-tokenizer-config class method loads templates from tokenizer_config.json
+    - Supports bos_token, eos_token passthrough
+    - Continuation mode maps to add_generation_prompt=false
+
+0.2.0
+    - Previous releases
