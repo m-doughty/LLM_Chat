@@ -6,6 +6,8 @@ has          $.err       = Nil;
 has Bool     $.done      = False;
 has Bool     $.success   = False;
 has Bool     $.cancelled = False;
+has          @.tool-calls;
+has Str      $.finish-reason;
 has Supplier $.supplier  is required;
 has Tap      $.tap       is required;
 
@@ -46,6 +48,18 @@ method _set-tap($t) {
 
 method _emit($e) {
 	$!msg = $e;
+}
+
+method _set-tool-calls(@calls) {
+	@!tool-calls = @calls;
+}
+
+method _set-finish-reason(Str $reason) {
+	$!finish-reason = $reason;
+}
+
+method has-tool-calls(--> Bool:D) {
+	@!tool-calls.elems > 0;
 }
 
 method _done {

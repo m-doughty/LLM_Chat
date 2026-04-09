@@ -15,13 +15,15 @@ method set-settings(LLM::Chat::Backend::Settings $settings) {
 
 method chat-completion(
 	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	:@tools,
 	--> LLM::Chat::Backend::Response
 ) {
 	fail "chat-completion must be implemented by the subclass";
 }
 
 method chat-completion-stream(
-	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message, 
+	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	:@tools,
 	--> LLM::Chat::Backend::Response::Stream
 ) {
 	fail "chat-completion-stream must be implemented by the subclass";

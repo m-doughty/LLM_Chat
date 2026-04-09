@@ -38,7 +38,8 @@ method !get-api-headers(--> Hash) {
 }
 
 method chat-completion(
-	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message, 
+	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	:@tools,
 	--> LLM::Chat::Backend::Response
 ) {
 	my $response = LLM::Chat::Backend::Response.new(id => uuid-v4());
@@ -46,23 +47,34 @@ method chat-completion(
 	start {
 		my %settings = self!get-api-settings;
 		%settings<messages> = @messages.map(*.to-hash).Array;
+		%settings<tools> = @tools if @tools.elems > 0;
 
-		my $client = Cro::HTTP::Client.new: 
+		my $client = Cro::HTTP::Client.new:
 			content-type => 'application/json';
 
 		my $url = $.api_url.subst(/'/' $/, '');
 		$url ~= "/chat/completions";
 
-		my $res = await $client.post: 
-			$url, 
+		my $res = await $client.post:
+			$url,
 			body    => %settings,
 			headers => self!get-api-headers;
 
 		my $data = await $res.body;
 
-		my $msg  = $data<choices>[0]<message><content>;
+		my $choice = $data<choices>[0];
+		my $finish = $choice<finish_reason> // '';
+		$response._set-finish-reason($finish);
 
-		$response.emit($msg);
+		if $finish eq 'tool_calls' && $choice<message><tool_calls>.defined {
+			$response._set-tool-calls($choice<message><tool_calls>.list);
+			# Also capture any content the model produced alongside tool calls
+			my $msg = $choice<message><content> // '';
+			$response.emit($msg);
+		} else {
+			my $msg = $choice<message><content> // '';
+			$response.emit($msg);
+		}
 		$response.done;
 
 		CATCH {
@@ -77,6 +89,7 @@ method chat-completion(
 
 method chat-completion-stream(
 	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	:@tools,
 	--> LLM::Chat::Backend::Response::Stream
 ) {
 	my $response = LLM::Chat::Backend::Response::Stream.new(id => uuid-v4());
@@ -85,6 +98,7 @@ method chat-completion-stream(
 		my %settings = self!get-api-settings;
 		%settings<messages> = @messages.map(*.to-hash).Array;
 		%settings<stream> = True;
+		%settings<tools> = @tools if @tools.elems > 0;
 
 		my $client = Cro::HTTP::Client.new: 
 			content-type => 'application/json';

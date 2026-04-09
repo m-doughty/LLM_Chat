@@ -1,0 +1,134 @@
+use Test;
+use lib 'lib';
+use JSON::Fast;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+
+plan 6;
+
+# === Response tool call parsing ===
+
+subtest 'Response: no tool calls by default' => {
+	plan 2;
+	my $resp = LLM::Chat::Backend::Response.new(id => 'r1');
+	nok $resp.has-tool-calls, 'No tool calls initially';
+	is $resp.tool-calls.elems, 0, 'Empty tool calls list';
+};
+
+subtest 'Response: tool calls set and retrieved' => {
+	plan 3;
+	my $resp = LLM::Chat::Backend::Response.new(id => 'r2');
+	my @calls = (
+		{
+			id => 'call_123',
+			type => 'function',
+			function => {
+				name => 'get_weather',
+				arguments => '{"location": "London"}',
+			},
+		},
+	);
+	$resp._set-tool-calls(@calls);
+	$resp._set-finish-reason('tool_calls');
+
+	ok $resp.has-tool-calls, 'Has tool calls';
+	is $resp.tool-calls[0]<function><name>, 'get_weather', 'Tool name extracted';
+	is $resp.finish-reason, 'tool_calls', 'Finish reason set';
+};
+
+subtest 'Response: multiple tool calls' => {
+	plan 2;
+	my $resp = LLM::Chat::Backend::Response.new(id => 'r3');
+	my @calls = (
+		{ id => 'c1', type => 'function', function => { name => 'search', arguments => '{"q":"raku"}' } },
+		{ id => 'c2', type => 'function', function => { name => 'fetch', arguments => '{"url":"http://example.com"}' } },
+	);
+	$resp._set-tool-calls(@calls);
+
+	is $resp.tool-calls.elems, 2, 'Two tool calls';
+	is $resp.tool-calls[1]<function><name>, 'fetch', 'Second tool name';
+};
+
+# === Tool definitions in OpenAI format ===
+
+subtest 'Tool definition format' => {
+	plan 3;
+	my @tools = [
+		{
+			type => 'function',
+			function => {
+				name => 'get_weather',
+				description => 'Get weather for a location',
+				parameters => {
+					type => 'object',
+					properties => {
+						location => { type => 'string', description => 'City name' },
+					},
+					required => ['location'],
+				},
+			},
+		},
+	];
+
+	is @tools[0]<type>, 'function', 'Tool type';
+	is @tools[0]<function><name>, 'get_weather', 'Function name';
+	is @tools[0]<function><parameters><required>[0], 'location', 'Required param';
+};
+
+# === Simulated tool call flow ===
+
+subtest 'Simulated tool call response parsing' => {
+	plan 4;
+	# Simulate what the OpenAI API returns as JSON (parsed via from-json like the real code)
+	my $json = q:to/END/;
+	{
+		"choices": [{
+			"finish_reason": "tool_calls",
+			"message": {
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [
+					{
+						"id": "call_abc123",
+						"type": "function",
+						"function": {
+							"name": "get_weather",
+							"arguments": "{\"location\": \"London\"}"
+						}
+					}
+				]
+			}
+		}]
+	}
+	END
+	my $api-response = from-json($json);
+
+	my $choice = $api-response<choices>[0];
+	my $finish = $choice<finish_reason>;
+
+	is $finish, 'tool_calls', 'Finish reason is tool_calls';
+	ok $choice<message><tool_calls>.defined, 'Tool calls present';
+	is $choice<message><tool_calls>[0]<function><name>, 'get_weather', 'Tool name';
+
+	# Parse the arguments JSON
+	my %args = from-json($choice<message><tool_calls>[0]<function><arguments>);
+	is %args<location>, 'London', 'Tool arguments parsed';
+};
+
+subtest 'Tool result message format' => {
+	plan 3;
+	# After executing a tool, you send the result back as a tool message
+	my $tool-result-msg = LLM::Chat::Conversation::Message.new(
+		role => 'tool',
+		content => '{"temperature": "15C", "conditions": "cloudy"}',
+	);
+	is $tool-result-msg.role, 'tool', 'Tool message role';
+	ok $tool-result-msg.content.contains('15C'), 'Tool result content';
+
+	my %hash = $tool-result-msg.to-hash;
+	is %hash<role>, 'tool', 'Tool role in hash';
+};
+
+done-testing;
