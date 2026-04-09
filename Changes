@@ -2,6 +2,11 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.2.3  2026-04-09T05:09:48+01:00
+    - Add GitHub Actions CI workflow with Rust toolchain for Tokenizers
+    - Add dist.ini for mi6 (UploadToZef, ReadmeFromPod, Badges)
+    - Add docs/Readme.rakudoc
+
 0.2.2  2026-04-09T04:59:41+01:00
     - Add stub LLM::Chat to make mi6 stop renaming the module.
 
