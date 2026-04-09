@@ -2,6 +2,9 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.2.4  2026-04-09T05:15:41+01:00
+    - CI: exclude Windows (Tokenizers Rust FFI build not yet supported)
+
 0.2.3  2026-04-09T05:09:48+01:00
     - Add GitHub Actions CI workflow with Rust toolchain for Tokenizers
     - Add dist.ini for mi6 (UploadToZef, ReadmeFromPod, Badges)
