@@ -15,8 +15,9 @@
   ],
   "description": "Simple framework for LLM inferencing",
   "license": "Artistic-2.0",
-  "name": "LLM::Chat::Backend",
+  "name": "LLM::Chat",
   "provides": {
+    "LLM::Chat": "lib/LLM/Chat.rakumod",
     "LLM::Chat::Backend": "lib/LLM/Chat/Backend.rakumod",
     "LLM::Chat::Backend::KoboldCpp": "lib/LLM/Chat/Backend/KoboldCpp.rakumod",
     "LLM::Chat::Backend::OpenAICommon": "lib/LLM/Chat/Backend/OpenAICommon.rakumod",
@@ -48,5 +49,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.2.1"
+  "version": "0.2.2"
 }

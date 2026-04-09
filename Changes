@@ -2,6 +2,9 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.2.2  2026-04-09T04:59:41+01:00
+    - Add stub LLM::Chat to make mi6 stop renaming the module.
+
 0.2.1  2026-04-09T04:41:36+01:00
     - Add LLM::Chat::Template::Jinja2 for HuggingFace chat template support
     - from-tokenizer-config class method loads templates from tokenizer_config.json
