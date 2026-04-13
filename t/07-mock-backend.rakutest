@@ -1,0 +1,159 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+
+plan 8;
+
+sub msg($role, $content) {
+    LLM::Chat::Conversation::Message.new(:$role, :$content);
+}
+
+subtest 'chat-completion returns canned response' => {
+    plan 3;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['hello world'],
+    );
+    my $resp = $mock.chat-completion([msg('user', 'hi')]);
+    my @got;
+    my $p = Promise.new;
+    $resp.supply.tap(
+        -> $t { @got.push($t) },
+        done => -> { $p.keep },
+    );
+    await Promise.anyof($p, Promise.in(2));
+    is @got.elems, 1, 'single emission for non-stream';
+    is @got[0], 'hello world', 'emitted text matches canned response';
+    ok $p.status ~~ Kept, 'supply closed';
+};
+
+subtest 'streaming splits canned response into tokens' => {
+    plan 2;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['the quick brown fox'],
+    );
+    my $stream = $mock.chat-completion-stream([msg('user', 'hi')]);
+    my @tokens;
+    my $p = Promise.new;
+    $stream.supply.tap(
+        -> $t { @tokens.push($t) },
+        done => -> { $p.keep },
+    );
+    await Promise.anyof($p, Promise.in(2));
+    is @tokens.elems, 4, 'one emission per word';
+    is @tokens.join, 'the quick brown fox', 'reassembled text matches';
+};
+
+subtest 'responses advance through queue' => {
+    plan 3;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['first', 'second', 'third'],
+    );
+    my @got;
+    for ^3 {
+        my $resp = $mock.chat-completion([msg('user', 'q')]);
+        my $p = Promise.new;
+        $resp.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
+        await Promise.anyof($p, Promise.in(2));
+    }
+    is @got[0], 'first',  'first call';
+    is @got[1], 'second', 'second call';
+    is @got[2], 'third',  'third call';
+};
+
+subtest 'exhausted queue repeats last by default' => {
+    plan 2;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['only'],
+    );
+    my @got;
+    for ^3 {
+        my $resp = $mock.chat-completion([msg('user', 'q')]);
+        my $p = Promise.new;
+        $resp.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
+        await Promise.anyof($p, Promise.in(2));
+    }
+    is @got[1], 'only', 'second call repeats';
+    is @got[2], 'only', 'third call repeats';
+};
+
+subtest 'fail-on-empty raises when queue drained' => {
+    plan 1;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings      => LLM::Chat::Backend::Settings.new,
+        responses     => ['once'],
+        fail-on-empty => True,
+    );
+    # Consume the single canned response
+    my $r1 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r1.supply.Promise, Promise.in(2));
+    dies-ok {
+        $mock.chat-completion([msg('user', 'q')]);
+    }, 'second call dies with fail-on-empty';
+};
+
+subtest 'reset rewinds cursor' => {
+    plan 2;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['a', 'b'],
+    );
+    my @got;
+    my $consume = -> {
+        my $r = $mock.chat-completion([msg('user', 'q')]);
+        my $p = Promise.new;
+        $r.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
+        await Promise.anyof($p, Promise.in(2));
+    };
+    $consume();  # 'a'
+    $consume();  # 'b'
+    $mock.reset;
+    $consume();  # 'a' again
+    is @got[0], 'a', 'first consumption';
+    is @got[2], 'a', 'after reset, first response again';
+};
+
+subtest 'recorded-calls logs every completion' => {
+    plan 7;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['reply1', 'reply2'],
+    );
+
+    my @msgs1 = [msg('system', 'you are helpful'), msg('user', 'hi')];
+    my @msgs2 = [msg('user', 'second turn')];
+
+    my $r1 = $mock.chat-completion(@msgs1);
+    my $r2 = $mock.chat-completion-stream(@msgs2);
+    await Promise.anyof($r1.supply.Promise, Promise.in(2));
+    await Promise.anyof($r2.supply.Promise, Promise.in(2));
+
+    is $mock.recorded-calls.elems, 2, 'two calls logged';
+    is $mock.recorded-calls[0]<kind>, 'chat-completion',         'first kind';
+    is $mock.recorded-calls[1]<kind>, 'chat-completion-stream',  'second kind';
+    is $mock.recorded-calls[0]<messages>.elems, 2, 'first call had 2 messages';
+    is $mock.recorded-calls[0]<messages>[0].role, 'system',   'first msg was system';
+    is $mock.recorded-calls[1]<messages>[0].content, 'second turn',
+        'second call captured user content';
+    is $mock.recorded-calls[0]<response>, 'reply1', 'recorded response aligns with queue';
+};
+
+subtest 'clear-recorded-calls empties the log' => {
+    plan 2;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['x', 'y'],
+    );
+    my $r = $mock.chat-completion([msg('user', 'a')]);
+    await Promise.anyof($r.supply.Promise, Promise.in(2));
+    is $mock.recorded-calls.elems, 1, 'one recorded';
+
+    $mock.clear-recorded-calls;
+    is $mock.recorded-calls.elems, 0, 'empty after clear';
+};

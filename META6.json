@@ -20,6 +20,7 @@
     "LLM::Chat": "lib/LLM/Chat.rakumod",
     "LLM::Chat::Backend": "lib/LLM/Chat/Backend.rakumod",
     "LLM::Chat::Backend::KoboldCpp": "lib/LLM/Chat/Backend/KoboldCpp.rakumod",
+    "LLM::Chat::Backend::Mock": "lib/LLM/Chat/Backend/Mock.rakumod",
     "LLM::Chat::Backend::OpenAICommon": "lib/LLM/Chat/Backend/OpenAICommon.rakumod",
     "LLM::Chat::Backend::Response": "lib/LLM/Chat/Backend/Response.rakumod",
     "LLM::Chat::Backend::Response::Stream": "lib/LLM/Chat/Backend/Response/Stream.rakumod",
@@ -49,5 +50,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.2.5"
+  "version": "0.2.6"
 }

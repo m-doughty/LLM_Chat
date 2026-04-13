@@ -2,6 +2,22 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.2.6  2026-04-13T17:03:42+01:00
+    - LLM::Chat::Backend::Mock: new test-only backend that returns
+      canned responses in order. Supports streaming (default splits
+      on whitespace, configurable via :token-splitter), optional delay
+      between tokens via :stream-delay, and an :initial-delay (10ms
+      default) so consumers can attach taps before tokens flow.
+      :fail-on-empty makes the backend die when the response queue
+      is exhausted instead of repeating the last entry. Useful for
+      exercising error paths in downstream consumers.
+      Recording: every completion call is logged to @.recorded-calls
+      as a hash with kind / messages / tools / response / at. Tests
+      can assert on what reached the backend, not just what came
+      back — catches prompt-assembly and template-substitution
+      regressions. clear-recorded-calls resets the log between
+      test phases.
+
 0.2.5  2026-04-09T12:30:48+01:00
     - Optional :@tools parameter on chat-completion and chat-completion-stream
     - Response.tool-calls and has-tool-calls for detecting LLM tool call requests
