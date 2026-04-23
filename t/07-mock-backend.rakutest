@@ -5,7 +5,7 @@ use LLM::Chat::Backend::Mock;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 
-plan 8;
+plan 11;
 
 sub msg($role, $content) {
     LLM::Chat::Conversation::Message.new(:$role, :$content);
@@ -156,4 +156,93 @@ subtest 'clear-recorded-calls empties the log' => {
 
     $mock.clear-recorded-calls;
     is $mock.recorded-calls.elems, 0, 'empty after clear';
+};
+
+subtest 'fake-usage populates telemetry attrs on every response' => {
+    plan 6;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings   => LLM::Chat::Backend::Settings.new,
+        responses  => ['ok1', 'ok2'],
+        fake-usage => %(
+            prompt     => 100,
+            completion => 25,
+            total      => 125,
+            cost       => 0.0023e0,
+            model      => 'mock/test-v1',
+            id         => 'gen-xxx',
+        ),
+    );
+    my $r1 = $mock.chat-completion([msg('user', 'hi')]);
+    await Promise.anyof($r1.supply.Promise, Promise.in(2));
+    is $r1.prompt-tokens,     100,             'prompt on first response';
+    is $r1.completion-tokens, 25,              'completion on first response';
+    is $r1.cost,              0.0023e0,        'cost on first response';
+    is $r1.model-used,        'mock/test-v1',  'model-used on first response';
+
+    # Fake usage applies per-call — second response gets the same shape.
+    my $r2 = $mock.chat-completion([msg('user', 'again')]);
+    await Promise.anyof($r2.supply.Promise, Promise.in(2));
+    is $r2.prompt-tokens, 100, 'prompt on second response';
+
+    # Backend with no fake-usage → Response attrs stay undefined.
+    my $bare = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['plain'],
+    );
+    my $r3 = $bare.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r3.supply.Promise, Promise.in(2));
+    nok $r3.prompt-tokens.defined, 'no fake-usage → attrs undefined';
+};
+
+subtest 'error-producer scripts per-call failures' => {
+    plan 11;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['success'],
+        error-producer => -> $i {
+            when $i == 0 { { class => 'http', status => 500, message => 'boom' } }
+            when $i == 1 { { class => 'timeout' } }
+            default      { Nil }
+        },
+    );
+
+    # Call 0: HTTP 500
+    my $r0 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r0.supply.Promise, Promise.in(2));
+    ok $r0.is-done,                       'failed call completes';
+    nok $r0.is-success,                   'failed call not success';
+    is $r0.error-class,  'http',          'error-class propagated';
+    is $r0.error-status, 500,             'error-status propagated';
+    is ~$r0.err,         'boom',          'error message propagated';
+
+    # Call 1: timeout (no status)
+    my $r1 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r1.supply.Promise, Promise.in(2));
+    is $r1.error-class,  'timeout',       'timeout class on second call';
+    nok $r1.error-status.defined,         'no status for timeout class';
+
+    # Call 2: success. Response queue was NOT consumed by the prior failures,
+    # so 'success' is still at the head.
+    my $r2 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r2.supply.Promise, Promise.in(2));
+    ok $r2.is-success,                    'third call succeeds';
+    is $r2.msg, 'success',                'response queue intact across failures';
+
+    is $mock.call-index, 3,               'call-index bumped once per call';
+    is $mock.recorded-calls.elems, 3,     'recorded-calls covers all three';
+};
+
+subtest 'error-producer returning Nil falls through to responses queue' => {
+    plan 2;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['a', 'b'],
+        error-producer => -> $i { Nil },   # never fails
+    );
+    my $r1 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r1.supply.Promise, Promise.in(2));
+    is $r1.msg, 'a', 'Nil from error-producer → normal response';
+    my $r2 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r2.supply.Promise, Promise.in(2));
+    is $r2.msg, 'b', 'queue advances normally';
 };

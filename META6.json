@@ -6,12 +6,12 @@
   "build-depends": [
   ],
   "depends": [
-    "Cro::HTTP",
-    "Digest::SHA256::Native",
-    "JSON::Fast",
+    "Cro::HTTP:ver<0.8.11>:auth<zef:cro>",
+    "Digest::SHA256::Native:ver<1.0.0>",
+    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
     "Template::Jinja2:auth<zef:apogee>",
-    "Tokenizers",
-    "UUID::V4"
+    "Tokenizers:auth<zef:apogee>",
+    "UUID::V4:ver<1.0.0>:auth<zef:masukomi>"
   ],
   "description": "Simple framework for LLM inferencing",
   "license": "Artistic-2.0",
@@ -50,5 +50,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.2.6"
+  "version": "0.3.0"
 }

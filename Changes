@@ -2,6 +2,29 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.3.0  2026-04-23T15:56:28+01:00
+    - LLM::Chat::Backend::Response gains structured error metadata:
+      $.error-status (Int HTTP code) and $.error-class (Str —
+      'http' / 'timeout' / 'connection' / 'response' / 'unknown').
+      Populated via _set-error-info(:$class, :$status) alongside
+      the existing .quit path. Lets consumers branch on error kind
+      without regex-parsing raw messages — used by the
+      LLM::Data::Inference::Task model-fallback policy.
+    - LLM::Chat::Backend::OpenAICommon CATCH blocks classify Cro
+      exceptions (X::Cro::HTTP::Error — picks up status off
+      .response.status; X::Cro::HTTP::Client::Timeout) plus
+      heuristic socket-error detection into the Response's error
+      fields before quitting. Finish-reason quits (length /
+      content_filter / unknown) are tagged error-class => 'response'
+      so the fallback layer advances on them.
+    - LLM::Chat::Backend::Mock gains &.error-producer — an optional
+      (Int $call-index --> Hash) callback that scripts per-call
+      failures for fallback / retry tests. Returning a hash like
+      { class => 'http', status => 500, message => 'x' } fails
+      that call without consuming a slot from @.responses. Also
+      exposes $.call-index (monotonic per-backend call count,
+      bumped on every completion regardless of outcome).
+
 0.2.6  2026-04-13T17:03:42+01:00
     - LLM::Chat::Backend::Mock: new test-only backend that returns
       canned responses in order. Supports streaming (default splits

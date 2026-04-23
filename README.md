@@ -88,6 +88,82 @@ my $backend = LLM::Chat::Backend::OpenAICommon.new(
 );
 ```
 
+### Mock (for tests)
+
+Canned-response backend for unit and integration tests. Returns pre-configured responses in order, records every call for assertions, and can be scripted to fail on specific calls to exercise retry / fallback paths in downstream consumers.
+
+```raku
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Settings;
+
+my $mock = LLM::Chat::Backend::Mock.new(
+    settings  => LLM::Chat::Backend::Settings.new,
+    responses => ['first', 'second', 'third'],
+    # Optional: script per-call failures by index. Returning a defined
+    # hash fails that call; returning Nil proceeds normally.
+    error-producer => -> $i {
+        when $i == 0 { { class => 'http', status => 503,
+                         message => 'bad gateway' } }
+        default      { Nil }
+    },
+);
+
+my $resp = $mock.chat-completion(@messages);
+# $mock.recorded-calls[0]<messages>, <response>, <error>, <call-index>, ...
+# $mock.call-index — monotonic counter, bumped on every call
+```
+
+See [LLM::Chat::Backend::Mock](../lib/LLM/Chat/Backend/Mock.rakumod) for the full attribute list and recording contract.
+
+Response
+--------
+
+Every completion method returns an `LLM::Chat::Backend::Response` (or `::Stream` for streaming calls). Callers poll `.is-done`, read `.msg` on success, and inspect `.err` on failure.
+
+Responses also carry structured error metadata on the failure path so consumers can classify errors without regex-parsing raw messages:
+
+```raku
+until $resp.is-done { sleep 0.01 }
+
+if $resp.is-success {
+    say $resp.msg;
+}
+else {
+    say "failed: {$resp.err}";
+    say "  class:  {$resp.error-class  // '(none)'}";   # 'http' / 'timeout' /
+                                                        # 'connection' /
+                                                        # 'response' / 'unknown'
+    say "  status: {$resp.error-status // '(none)'}";   # HTTP code when
+                                                        # error-class eq 'http'
+}
+```
+
+`error-class` values:
+
+  * `'http'` — HTTP-level error. `error-status` is populated with the code.
+
+  * `'timeout'` — request exceeded the client-side deadline.
+
+  * `'connection'` — network unreachable / connection reset / DNS failure.
+
+  * `'response'` — HTTP succeeded but the body was malformed, empty, or finished with a `'length'` / `'content_filter'` quit.
+
+  * `'unknown'` — catch-all for exceptions that don't classify.
+
+[LLM::Data::Inference::Task](https://raku.land/zef:apogee/LLM::Data::Inference) reads these fields to decide between abort / retry-same / advance in its model-fallback policy — consumers that want the same policy without depending on that module can implement it against the `Response.error-class` / `.error-status` pair directly.
+
+Provider-reported usage is also available on the Response when the backend emits it:
+
+```raku
+$resp.prompt-tokens;       # Int, undefined on backends that don't emit usage
+$resp.completion-tokens;   # Int
+$resp.total-tokens;        # Int
+$resp.cost;                # Num (credits)
+$resp.model-used;          # Str, provider-reported routed model
+$resp.provider-id;         # Str, provider-assigned request id
+$resp.finish-reason;       # Str ('stop' / 'length' / 'content_filter' / ...)
+```
+
 Conversation Management
 -----------------------
 

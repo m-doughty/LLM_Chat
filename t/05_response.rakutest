@@ -3,7 +3,7 @@ use lib 'lib';
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Response::Stream;
 
-plan 15;
+plan 37;
 
 my $resp = LLM::Chat::Backend::Response.new(id => "1");
 
@@ -51,4 +51,59 @@ is $stream.latest,        "Hello, World!",               "Got a complete respons
 is $stream.msg,           "Hello, World!",               "Message correctly set";
 ok $stream.is-done,                                      "Stream is done";
 is-deeply @stream_events, ["Hel", "lo,", " Wo", "rld!"], "Correct events";
+
+# --- Usage attrs (telemetry) ------------------------------------------
+
+my $u = LLM::Chat::Backend::Response.new(id => "u");
+nok $u.prompt-tokens.defined,     "prompt-tokens undefined by default";
+nok $u.cost.defined,              "cost undefined by default";
+nok $u.model-used.defined,        "model-used undefined by default";
+
+$u._set-usage(
+    prompt     => 120,
+    completion => 37,
+    total      => 157,
+    cost       => 0.00041e0,
+    model      => 'z-ai/glm-5.1',
+    id         => 'gen-abc123',
+);
+is $u.prompt-tokens,     120,              "prompt-tokens populated";
+is $u.completion-tokens, 37,               "completion-tokens populated";
+is $u.total-tokens,      157,              "total-tokens populated";
+is $u.cost,              0.00041e0,        "cost populated as Num";
+is $u.model-used,        'z-ai/glm-5.1',   "model-used populated";
+is $u.provider-id,       'gen-abc123',     "provider-id populated";
+
+# Presence-guarded: later partial update must not clear prior values.
+$u._set-usage(completion => 42);   # bumps completion only
+is $u.completion-tokens, 42,       "completion updated";
+is $u.prompt-tokens,     120,      "prompt unchanged by partial update";
+
+# --- Structured error info (Task fallback classification) ------------
+
+my $e = LLM::Chat::Backend::Response.new(id => "e");
+nok $e.error-class.defined,   "error-class undefined by default";
+nok $e.error-status.defined,  "error-status undefined by default";
+
+$e._set-error-info(class => 'http', status => 403);
+is $e.error-class,  'http', "error-class populated";
+is $e.error-status, 403,    "error-status populated";
+
+# Partial update: class-only leaves status as-is.
+my $e2 = LLM::Chat::Backend::Response.new(id => "e2");
+$e2._set-error-info(class => 'http', status => 500);
+$e2._set-error-info(class => 'timeout');
+is $e2.error-class,  'timeout', "error-class overwritten by later _set-error-info";
+is $e2.error-status, 500,       "error-status retained when later call omits :status";
+
+# Error info survives .quit() — consumers read it off the done response.
+my $e3 = LLM::Chat::Backend::Response.new(id => "e3");
+$e3._set-error-info(class => 'http', status => 429);
+$e3.quit("rate limited");
+await Promise.in(0.1);
+ok $e3.is-done,                     "quitted response is done";
+ok !$e3.is-success,                 "quitted response not success";
+is $e3.error-class,  'http',        "error-class survives quit";
+is $e3.error-status, 429,           "error-status survives quit";
+is ~$e3.err,         "rate limited", "raw error message survives quit";
 
