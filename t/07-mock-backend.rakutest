@@ -2,10 +2,12 @@ use Test;
 use lib 'lib';
 
 use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::Response::OpenRouter;
+use LLM::Chat::Backend::Response::OpenRouter::Stream;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 
-plan 11;
+plan 12;
 
 sub msg($role, $content) {
     LLM::Chat::Conversation::Message.new(:$role, :$content);
@@ -158,7 +160,7 @@ subtest 'clear-recorded-calls empties the log' => {
     is $mock.recorded-calls.elems, 0, 'empty after clear';
 };
 
-subtest 'fake-usage populates telemetry attrs on every response' => {
+subtest 'fake-usage populates OAI-spec attrs on base Response' => {
     plan 6;
     my $mock = LLM::Chat::Backend::Mock.new(
         settings   => LLM::Chat::Backend::Settings.new,
@@ -167,16 +169,18 @@ subtest 'fake-usage populates telemetry attrs on every response' => {
             prompt     => 100,
             completion => 25,
             total      => 125,
-            cost       => 0.0023e0,
             model      => 'mock/test-v1',
-            id         => 'gen-xxx',
+            # OR-specific keys are silently dropped on a base Response
+            # — see the next subtest for them landing on OR Response.
+            cost          => 0.0023e0,
+            generation-id => 'gen-xxx',
         ),
     );
     my $r1 = $mock.chat-completion([msg('user', 'hi')]);
     await Promise.anyof($r1.supply.Promise, Promise.in(2));
     is $r1.prompt-tokens,     100,             'prompt on first response';
     is $r1.completion-tokens, 25,              'completion on first response';
-    is $r1.cost,              0.0023e0,        'cost on first response';
+    is $r1.total-tokens,      125,             'total on first response';
     is $r1.model-used,        'mock/test-v1',  'model-used on first response';
 
     # Fake usage applies per-call — second response gets the same shape.
@@ -192,6 +196,48 @@ subtest 'fake-usage populates telemetry attrs on every response' => {
     my $r3 = $bare.chat-completion([msg('user', 'q')]);
     await Promise.anyof($r3.supply.Promise, Promise.in(2));
     nok $r3.prompt-tokens.defined, 'no fake-usage → attrs undefined';
+};
+
+subtest 'fake-usage populates OR-specific attrs on Response::OpenRouter' => {
+    plan 11;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings              => LLM::Chat::Backend::Settings.new,
+        responses             => ['ok1'],
+        response-class        => LLM::Chat::Backend::Response::OpenRouter,
+        stream-response-class => LLM::Chat::Backend::Response::OpenRouter::Stream,
+        fake-usage            => %(
+            # OAI-spec
+            prompt     => 80,
+            completion => 30,
+            total      => 110,
+            model      => 'anthropic/claude-opus-4-7',
+            # OR extras
+            cost          => 0.0041e0,
+            generation-id => 'gen-mock-abc',
+            provider-name => 'Anthropic',
+            is-byok       => True,
+        ),
+    );
+    my $r1 = $mock.chat-completion([msg('user', 'hi')]);
+    await Promise.anyof($r1.supply.Promise, Promise.in(2));
+    isa-ok $r1, LLM::Chat::Backend::Response::OpenRouter,
+                                                   'mock returns OR Response when configured';
+    is $r1.prompt-tokens,     80,                  'OAI-spec prompt populated alongside OR extras';
+    is $r1.completion-tokens, 30,                  'OAI-spec completion populated';
+    is $r1.total-tokens,      110,                 'OAI-spec total populated';
+    is $r1.model-used,        'anthropic/claude-opus-4-7',
+                                                   'OAI-spec model-used populated';
+    is $r1.cost,              0.0041e0,            'OR cost populated';
+    is $r1.generation-id,     'gen-mock-abc',      'OR generation-id populated';
+    is $r1.provider-name,     'Anthropic',         'OR provider-name populated';
+    is $r1.is-byok,           True,                'OR is-byok populated';
+
+    # Streaming counterpart uses the configured stream-response-class.
+    my $stream = $mock.chat-completion-stream([msg('user', 'hi')]);
+    await Promise.anyof($stream.supply.Promise, Promise.in(2));
+    isa-ok $stream, LLM::Chat::Backend::Response::OpenRouter::Stream,
+                                                   'stream uses OR Stream class';
+    is $stream.cost,          0.0041e0,            'OR cost present on stream too';
 };
 
 subtest 'error-producer scripts per-call failures' => {

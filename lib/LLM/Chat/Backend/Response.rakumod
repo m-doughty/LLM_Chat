@@ -28,17 +28,27 @@ has Tap      $.tap       is required;
 has Int      $.error-status;
 has Str      $.error-class;
 
-# Usage attrs. Populated by provider-specific backends (OpenRouter,
-# OpenAI, any OpenAICommon-derived) when the response body carries a
-# `usage` block. Stay undefined on backends that don't emit one
-# (mock / local / stream without include_usage) so callers can tell
-# "unknown" from "zero" — "$.cost.defined ?? 'known' !! 'unknown'".
+# OAI-spec usage attrs. Populated by any OpenAI-compatible backend
+# whose response body carries a `usage` block. Stay undefined on
+# backends that don't emit one (mock / local / stream without
+# include_usage) so callers can tell "unknown" from "zero" —
+# "$.prompt-tokens.defined ?? 'known' !! 'unknown'".
+#
+# Provider-specific extras (OpenRouter's cost, generation-id, routed
+# provider name, BYOK flag, ...) live on the provider's Response
+# subclass — see C<LLM::Chat::Backend::Response::OpenRouter>.
 has Int      $.prompt-tokens;
 has Int      $.completion-tokens;
 has Int      $.total-tokens;
-has Num      $.cost;
 has Str      $.model-used;
-has Str      $.provider-id;
+
+# Reasoning trace from thinking-capable models (DeepSeek-R1, Claude
+# with thinking enabled, OpenAI o-series, etc.). Streamed under
+# `delta.reasoning` separately from `delta.content`, accumulated by
+# the OAI-spec stream loop. Stays undefined for non-reasoning models
+# so callers can distinguish "model emitted nothing" from "model
+# doesn't support reasoning at all".
+has Str      $.reasoning-text;
 
 submethod BUILD(:$id) {
 	$!id       := $id;
@@ -100,21 +110,36 @@ method _set-error-info(Str :$class, Int :$status) {
 	$!error-status = $status if $status.defined;
 }
 
-#|( Partial-update usage attrs from whatever a provider sent us.
-    Every parameter is optional; only defined values are written,
-    so a late-arriving streaming chunk can fill in fields an earlier
-    chunk left undefined without ever clearing them. Idempotent
-    when called with the same payload twice. )
+#|( Partial-update OAI-spec usage attrs from whatever a provider
+    sent us. Every parameter is optional; only defined values are
+    written, so a late-arriving streaming chunk can fill in fields
+    an earlier chunk left undefined without ever clearing them.
+    Idempotent when called with the same payload twice.
+
+    Provider-specific extras go through the provider's own setter
+    on its Response subclass (e.g.
+    C<Response::OpenRouter._set-or-usage>). Backends should call
+    this for OAI-spec fields and the provider-specific setter for
+    anything beyond that. )
 method _set-usage(
-	:$prompt, :$completion, :$total,
-	:$cost, :$model, :$id,
+	:$prompt, :$completion, :$total, :$model,
 ) {
 	$!prompt-tokens     = $prompt.Int         if $prompt.defined;
 	$!completion-tokens = $completion.Int     if $completion.defined;
 	$!total-tokens      = $total.Int          if $total.defined;
-	$!cost              = $cost.Num           if $cost.defined;
 	$!model-used        = $model.Str          if $model.defined;
-	$!provider-id       = $id.Str             if $id.defined;
+}
+
+#|( Append a chunk of reasoning text. Streaming reasoning models emit
+    one C<delta.reasoning> fragment per chunk before they switch to
+    emitting C<delta.content>; backends call this once per chunk and
+    the response carries the concatenated trace by the time the
+    stream closes. Idempotent on the empty string, so calling it on
+    every chunk regardless of whether reasoning was present is safe. )
+method _append-reasoning(Str:D $chunk) {
+	return unless $chunk.chars;
+	$!reasoning-text //= '';
+	$!reasoning-text ~= $chunk;
 }
 
 method has-tool-calls(--> Bool:D) {

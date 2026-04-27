@@ -1,0 +1,84 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Debug;
+
+# Debug logger is gated on the LLM_CHAT_DEBUG env var. When unset, every
+# call must be a no-op (the production cost is one hash lookup). When
+# set, records land in append-only form with a timestamp + section
+# banner, and the Authorization header is redacted in headers logging.
+
+plan 5;
+
+subtest 'no-op when LLM_CHAT_DEBUG is unset' => {
+    plan 1;
+    %*ENV<LLM_CHAT_DEBUG>:delete;
+    lives-ok {
+        LLM::Chat::Debug.log('TEST', 'should not write anywhere');
+        LLM::Chat::Debug.log-json('TEST', %( a => 1 ));
+        LLM::Chat::Debug.log-headers('TEST', %( Authorization => 'Bearer secret' ));
+    }, 'all log calls are silent no-ops without env var';
+};
+
+my $log-path = $*TMPDIR.add("llm-chat-debug-test-{$*PID}.log").Str;
+LEAVE { unlink $log-path if $log-path.IO.e }
+
+subtest 'log writes labelled records to LLM_CHAT_DEBUG path' => {
+    plan 3;
+    %*ENV<LLM_CHAT_DEBUG> = $log-path;
+    LEAVE { %*ENV<LLM_CHAT_DEBUG>:delete }
+    LLM::Chat::Debug.log('REQUEST URL', 'https://openrouter.ai/api/v1/chat/completions');
+    ok $log-path.IO.e,                              'log file created';
+    my $content = slurp $log-path;
+    ok $content.contains('=== REQUEST URL ==='),    'section banner emitted';
+    ok $content.contains('https://openrouter.ai'),  'body content recorded';
+};
+
+subtest 'log-json pretty-prints associative bodies' => {
+    plan 2;
+    %*ENV<LLM_CHAT_DEBUG> = $log-path;
+    LEAVE { %*ENV<LLM_CHAT_DEBUG>:delete }
+    spurt $log-path, '';   # reset
+    LLM::Chat::Debug.log-json('REQUEST BODY', %(
+        model       => 'anthropic/claude-opus-4-7',
+        max_tokens  => 4096,
+        temperature => 0.7,
+    ));
+    my $content = slurp $log-path;
+    ok $content.contains('"model": "anthropic/claude-opus-4-7"'),
+                                                    'JSON-formatted output';
+    ok $content.lines.elems > 3,
+                                                    'multi-line pretty body';
+};
+
+subtest 'log-headers redacts Authorization' => {
+    plan 3;
+    %*ENV<LLM_CHAT_DEBUG> = $log-path;
+    LEAVE { %*ENV<LLM_CHAT_DEBUG>:delete }
+    spurt $log-path, '';
+    LLM::Chat::Debug.log-headers('REQUEST HEADERS', %(
+        Authorization => 'Bearer sk-or-real-secret-token',
+        'HTTP-Referer'  => 'https://example.com/app',
+        'X-Title'       => 'Cantina',
+    ));
+    my $content = slurp $log-path;
+    nok $content.contains('sk-or-real-secret-token'),
+                                                    'real token NOT in log';
+    ok $content.contains('<redacted>'),
+                                                    'redacted marker present';
+    ok $content.contains('https://example.com/app'),
+                                                    'attribution headers visible';
+};
+
+subtest 'multiple writes append rather than overwrite' => {
+    plan 1;
+    %*ENV<LLM_CHAT_DEBUG> = $log-path;
+    LEAVE { %*ENV<LLM_CHAT_DEBUG>:delete }
+    spurt $log-path, '';
+    LLM::Chat::Debug.log('FIRST',  'one');
+    LLM::Chat::Debug.log('SECOND', 'two');
+    LLM::Chat::Debug.log('THIRD',  'three');
+    my $content = slurp $log-path;
+    ok $content.contains('FIRST') && $content.contains('SECOND') && $content.contains('THIRD'),
+        'all three records present';
+};

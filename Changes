@@ -2,6 +2,59 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.5.0  2026-04-27T22:52:25+01:00
+    - LLM::Chat::Backend::OpenRouter request shape now mirrors
+      SillyTavern's wire bytes verbatim. Removed two body fields
+      that were causing OpenRouter's upstream router to hold 200 OK
+      headers indefinitely against some providers (~80% header-phase
+      timeouts in App::Cantina vs ~0% in SillyTavern on the same
+      models / keys / network):
+        * `usage: { include: true }` — no longer sent.
+        * `stream_options: { include_usage: true }` — no longer sent
+          (also removed from OpenAICommon.chat-completion-stream so
+          all OAI-compatible streams now match this shape).
+        * `reasoning: { effort, enabled }` — `enabled` key dropped;
+          we now send only `{ effort }` when reasoning_effort is
+          configured, matching ST.
+      Added on every request, also matching ST:
+        * `include_reasoning: Bool` — Boolean parity with ST's flag.
+        * `top_k` — plumbed from Settings into the OAI body.
+      `repetition_penalty` is now omitted when at the default 1.0
+      (was previously sent unconditionally).
+    - Cost telemetry that the inline `usage: { include: true }`
+      block used to carry now arrives via a one-shot post-stream
+      GET against `/generation?id=...` after `[DONE]`. Lookup is
+      async and best-effort; on failure $resp.cost stays Nil rather
+      than escalating. Lifts cost, provider-name, and (when not
+      already populated from the stream) prompt/completion tokens.
+      Latency: ~50–200ms after .is-done becomes True before .cost
+      is readable. New hook _on-stream-complete on OpenAICommon so
+      future provider subclasses can do the same kind of
+      post-stream metadata fetch.
+    - LLM::Chat::Backend::OpenAICommon stream parser now buffers
+      bytes across body-byte-stream emissions and splits on the
+      SSE `\n\n` event delimiter before parsing, instead of
+      decoding+parsing each TCP chunk independently. Pre-fix, a
+      `data: {...}` JSON object split across two TCP packets would
+      crash from-json on the truncated half and terminate the
+      stream as 'unknown' error class. Both chat-completion-stream
+      and text-completion-stream got the fix. Heartbeat / SSE
+      comment lines (`: OPENROUTER PROCESSING`) are dropped per
+      spec — never produce a chunk.
+    - LLM::Chat::Backend::OpenAICommon.!classify-exception no
+      longer string-matches "timeout" / "timed out" in the default
+      arm; only X::Cro::HTTP::Client::Timeout maps to error-class
+      'timeout' now. Substring matching was masking unrelated
+      errors (JSON parse failures, stream-cancel messages) as
+      header timeouts. Connection-error pattern (refused / reset /
+      DNS / unreachable) stayed — those don't have a typed
+      exception class to discriminate on.
+    - LLM::Chat::Debug log format gains elapsed-ms timestamps for
+      streaming requests: HEADERS RECEIVED, FIRST BODY BYTE, and
+      EXCEPTION lines all carry "+Nms" relative to the call start
+      so latency can be diagnosed without external instrumentation.
+      Existing log labels unchanged.
+
 0.3.0  2026-04-23T15:56:28+01:00
     - LLM::Chat::Backend::Response gains structured error metadata:
       $.error-status (Int HTTP code) and $.error-class (Str —

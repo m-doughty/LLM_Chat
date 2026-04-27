@@ -65,6 +65,9 @@ Only the raw text in C<responses> gets returned.
 =item C<&.token-splitter> — sub that takes a Str and returns a list of tokens. Default splits on whitespace and preserves spacing by re-appending a space after each token except the last.
 =item C<&.error-producer> — optional C<(Int $call-index --> Hash)> callback. When it returns a defined hash, that call is scripted to fail. Used to exercise the Task fallback policy. See L</SIMULATING FAILURES>.
 =item C<$.call-index> — monotonically-increasing per-backend call count, bumped on every completion call whether it succeeded or failed. Distinct from the internal response cursor — tests can read this to assert call counts without reasoning about the response queue.
+=item C<$.response-class> — class minted for non-streaming completion calls. Defaults to L<LLM::Chat::Backend::Response>; pass L<LLM::Chat::Backend::Response::OpenRouter> to exercise the OR-flavoured Response shape.
+=item C<$.stream-response-class> — streaming counterpart to C<$.response-class>. Pair with L<LLM::Chat::Backend::Response::OpenRouter::Stream>.
+=item C<%.fake-usage> — per-call usage payload. OAI-spec keys (C<prompt>, C<completion>, C<total>, C<model>) flow into C<._set-usage>; OR-specific keys (C<cost>, C<generation-id>, C<provider-name>, C<is-byok>) flow into C<._set-or-usage> when the configured response class consumes the OR Augment role.
 
 =head1 SIMULATING FAILURES
 
@@ -133,6 +136,8 @@ Use C<clear-recorded-calls> to reset the log between phases of a test.
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Response::Stream;
+use LLM::Chat::Backend::Response::OpenRouter;
+use LLM::Chat::Backend::Response::OpenRouter::Stream;
 use LLM::Chat::Conversation::Message;
 
 use UUID::V4;
@@ -143,13 +148,30 @@ has Str @.responses is rw;
 has Bool $.fail-on-empty = False;
 has Numeric $.stream-delay = 0;
 
+#|( Response class minted for non-streaming completion calls. Defaults
+    to the base C<LLM::Chat::Backend::Response>; pass
+    C<:response-class(LLM::Chat::Backend::Response::OpenRouter)> to
+    exercise the OpenRouter-flavoured Response shape (cost,
+    generation-id, provider-name, is-byok) end-to-end in tests. )
+has Mu $.response-class = LLM::Chat::Backend::Response;
+
+#|( Streaming counterpart to C<$.response-class>. Defaults to
+    C<LLM::Chat::Backend::Response::Stream>; pair with
+    C<LLM::Chat::Backend::Response::OpenRouter::Stream> when testing
+    OR-flavoured streaming. )
+has Mu $.stream-response-class = LLM::Chat::Backend::Response::Stream;
+
 #|( Optional per-call usage payload. When non-empty, every
-    completion call invokes C<Response._set-usage(|%.fake-usage)>
-    on the freshly-minted Response so telemetry tests can assert on
-    a concrete shape. Accepts the same keys as
-    C<Response._set-usage>: C<prompt>, C<completion>, C<total>,
-    C<cost>, C<model>, C<id>. Left empty by default so non-
-    telemetry tests don't drift. )
+    completion call applies it to the freshly-minted Response so
+    telemetry tests can assert on a concrete shape.
+
+    OAI-spec keys (C<prompt>, C<completion>, C<total>, C<model>)
+    flow into C<Response._set-usage>. OR-specific keys (C<cost>,
+    C<generation-id>, C<provider-name>, C<is-byok>) flow into
+    C<Response::OpenRouter::Augment._set-or-usage> when
+    C<$.response-class> is OR-typed and are silently ignored
+    otherwise. Left empty by default so non-telemetry tests
+    don't drift. )
 has %.fake-usage;
 
 #|( Optional prompt-aware responder. When set, each call invokes
@@ -242,6 +264,32 @@ method peek-next-response(--> Str) {
 #| Reset the response cursor to the start of the queue.
 method reset() { $!cursor = 0 }
 
+# OAI-spec keys go to base Response._set-usage; everything else is
+# treated as an OR-augment key. Centralised so chat / stream paths
+# both apply fake-usage identically.
+my constant @OAI-USAGE-KEYS = <prompt completion total model>;
+
+#|( Apply C<%.fake-usage> to a freshly-minted Response. Splits keys:
+    OAI-spec into C<._set-usage>, OR extras into C<._set-or-usage>
+    when the Response consumes the OR Augment role. Anything that
+    doesn't match either bucket is silently dropped. )
+method !apply-fake-usage($resp) {
+    return unless %!fake-usage.elems;
+    my %oai;
+    my %or;
+    for %!fake-usage.kv -> $k, $v {
+        if $k eq any(@OAI-USAGE-KEYS) {
+            %oai{$k} = $v;
+        } else {
+            %or{$k} = $v;
+        }
+    }
+    $resp._set-usage(|%oai) if %oai.elems;
+    if %or.elems && $resp ~~ LLM::Chat::Backend::Response::OpenRouter::Augment {
+        $resp._set-or-usage(|%or);
+    }
+}
+
 #| Empty the recorded-calls log. Call between test phases when you
 #| want to assert on calls from a specific window of activity.
 method clear-recorded-calls() { @!recorded-calls = () }
@@ -254,8 +302,8 @@ method chat-completion(
     --> LLM::Chat::Backend::Response
 ) {
     my $id = uuid-v4;
-    my $resp = LLM::Chat::Backend::Response.new(:$id, supplier => Supplier.new);
-    $resp._set-usage(|%!fake-usage) if %!fake-usage.elems;
+    my $resp = $!response-class.new(:$id, supplier => Supplier.new);
+    self!apply-fake-usage($resp);
 
     # Capture the call index BEFORE running the error-producer so
     # the producer sees the same index the recorded-calls entry
@@ -353,8 +401,8 @@ method chat-completion-stream(
     --> LLM::Chat::Backend::Response::Stream
 ) {
     my $id = uuid-v4;
-    my $resp = LLM::Chat::Backend::Response::Stream.new(:$id, supplier => Supplier.new);
-    $resp._set-usage(|%!fake-usage) if %!fake-usage.elems;
+    my $resp = $!stream-response-class.new(:$id, supplier => Supplier.new);
+    self!apply-fake-usage($resp);
     my $text;
     if &!responder.defined {
         $text = &!responder(@messages);

@@ -22,11 +22,15 @@
     "LLM::Chat::Backend::KoboldCpp": "lib/LLM/Chat/Backend/KoboldCpp.rakumod",
     "LLM::Chat::Backend::Mock": "lib/LLM/Chat/Backend/Mock.rakumod",
     "LLM::Chat::Backend::OpenAICommon": "lib/LLM/Chat/Backend/OpenAICommon.rakumod",
+    "LLM::Chat::Backend::OpenRouter": "lib/LLM/Chat/Backend/OpenRouter.rakumod",
     "LLM::Chat::Backend::Response": "lib/LLM/Chat/Backend/Response.rakumod",
+    "LLM::Chat::Backend::Response::OpenRouter": "lib/LLM/Chat/Backend/Response/OpenRouter.rakumod",
+    "LLM::Chat::Backend::Response::OpenRouter::Stream": "lib/LLM/Chat/Backend/Response/OpenRouter/Stream.rakumod",
     "LLM::Chat::Backend::Response::Stream": "lib/LLM/Chat/Backend/Response/Stream.rakumod",
     "LLM::Chat::Backend::Settings": "lib/LLM/Chat/Backend/Settings.rakumod",
     "LLM::Chat::Conversation": "lib/LLM/Chat/Conversation.rakumod",
     "LLM::Chat::Conversation::Message": "lib/LLM/Chat/Conversation/Message.rakumod",
+    "LLM::Chat::Debug": "lib/LLM/Chat/Debug.rakumod",
     "LLM::Chat::Template": "lib/LLM/Chat/Template.rakumod",
     "LLM::Chat::Template::ChatML": "lib/LLM/Chat/Template/ChatML.rakumod",
     "LLM::Chat::Template::Gemma2": "lib/LLM/Chat/Template/Gemma2.rakumod",
@@ -50,5 +54,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.3.0"
+  "version": "0.5.0"
 }

@@ -13,7 +13,11 @@ has Str $.api_url is required;
 has Str $.api_key is rw;
 has Str $.model   is rw;
 
-method !get-api-settings(--> Hash) {
+#|( KoboldCpp accepts the OAI-spec body fields plus a long tail of
+    sampler extras (top_k, min_p, typical_p, DRY, XTC, ...). Override
+    of OpenAICommon's hook so the inherited chat / text completion
+    methods send the full surface. )
+method _get-api-settings(--> Hash) {
 	my $s = self.settings;
 	my %r;
 
@@ -41,22 +45,22 @@ method !get-api-settings(--> Hash) {
 	return %r;
 }
 
-method !get-api-headers(--> Hash) {
+method _get-api-headers(--> Hash) {
     my %h;
     %h<Authorization> = "Bearer {$!api_key}" if $!api_key.defined;
     return %h;
 }
 
 method cancel(LLM::Chat::Backend::Response $resp) {
-	my $client = Cro::HTTP::Client.new: 
+	my $client = Cro::HTTP::Client.new:
 		content-type => 'application/json';
 
 	my $url = $.api_url.subst(/ 'v1' '/'? $/, '');
 	$url ~= "/api/extra/abort";
 
-	await $client.post: 
-		$url, 
-		headers => self!get-api-headers;
+	await $client.post:
+		$url,
+		headers => self._get-api-headers;
 
 	$resp.cancel;
 }

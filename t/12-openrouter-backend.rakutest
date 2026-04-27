@@ -1,0 +1,226 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::OpenRouter;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Response::OpenRouter;
+use LLM::Chat::Backend::Response::OpenRouter::Stream;
+use LLM::Chat::Backend::Settings;
+
+# Unit coverage for the OpenRouter backend's overrides. The HTTP
+# transport is inherited verbatim from OpenAICommon and exercised
+# elsewhere; here we focus on what OpenRouter adds:
+#
+#   * Default api_url
+#   * Subclass shape (is-a OpenAICommon, is-a Backend)
+#   * Factory methods returning OR-typed Response
+#   * _get-api-settings shape matches SillyTavern's request bytes:
+#     include_reasoning + reasoning.effort (no enabled key), and
+#     deliberately omits usage.include + stream_options.include_usage
+#   * _get-api-headers adding HTTP-Referer / X-Title when configured
+#   * _lift-usage extracting cost / generation-id / provider-name /
+#     is-byok and still calling callsame for OAI-spec lifts
+#   * _lift-usage no-op on a base Response (defensive)
+#   * Presence-gating across partial bodies + stream chunk shapes
+
+plan 11;
+
+sub make-backend(*%args) {
+    LLM::Chat::Backend::OpenRouter.new(
+        settings => LLM::Chat::Backend::Settings.new,
+        model    => 'anthropic/claude-opus-4-7',
+        api_key  => 'test-key',
+        |%args,
+    );
+}
+
+subtest 'class hierarchy' => {
+    plan 3;
+    my $b = make-backend();
+    isa-ok $b, LLM::Chat::Backend::OpenAICommon, 'is-a OpenAICommon';
+    isa-ok $b, LLM::Chat::Backend,                'is-a Backend';
+    is $b.api_url, 'https://openrouter.ai/api/v1', 'default api_url';
+};
+
+subtest 'api_url override is honoured' => {
+    plan 1;
+    my $b = make-backend(api_url => 'https://or.example.com/v1');
+    is $b.api_url, 'https://or.example.com/v1', 'caller-supplied api_url wins';
+};
+
+subtest 'make-response returns Response::OpenRouter' => {
+    plan 2;
+    my $b = make-backend();
+    my $r = $b.make-response;
+    isa-ok $r, LLM::Chat::Backend::Response::OpenRouter, 'OR-typed response';
+    ok $r.id.chars > 0, 'response has a generated id';
+};
+
+subtest 'make-stream-response returns Response::OpenRouter::Stream' => {
+    plan 1;
+    my $b = make-backend();
+    my $s = $b.make-stream-response;
+    isa-ok $s, LLM::Chat::Backend::Response::OpenRouter::Stream, 'OR Stream-typed response';
+};
+
+subtest '_get-api-settings matches SillyTavern wire shape' => {
+    plan 9;
+    my $b = make-backend();
+    my %s = $b._get-api-settings;
+    # OAI-spec fields preserved.
+    is %s<model>,          'anthropic/claude-opus-4-7', 'OAI-spec model preserved';
+    ok %s<temperature>:exists,                         'OAI-spec temperature preserved';
+    ok %s<max_tokens>:exists,                          'OAI-spec max_tokens preserved';
+    ok %s<top_p>:exists,                               'OAI-spec top_p preserved';
+    ok %s<top_k>:exists,                               'top_k plumbed (matches ST)';
+    # include_reasoning is sent as a Boolean on every request, mirroring ST.
+    is %s<include_reasoning>, False,
+        'include_reasoning is False when no reasoning_effort configured';
+    # Deliberately omitted to keep the request bytes identical to ST.
+    nok %s<usage>:exists,
+        'usage block NOT sent (was triggering OR header-phase hangs)';
+    nok %s<stream_options>:exists,
+        'stream_options NOT sent (was triggering OR header-phase hangs)';
+    # repetition_penalty default is 1.0, treated as "unset" for OR.
+    nok %s<repetition_penalty>:exists,
+        'repetition_penalty omitted at default 1.0 (matches ST conditional)';
+};
+
+subtest '_get-api-headers adds attribution when configured, omits when not' => {
+    plan 6;
+    my $bare = make-backend();
+    my %h = $bare._get-api-headers;
+    is %h<Authorization>, 'Bearer test-key',           'Authorization preserved';
+    nok %h<HTTP-Referer>:exists,                       'no HTTP-Referer when unset';
+    nok %h<X-Title>:exists,                            'no X-Title when unset';
+
+    my $attr = make-backend(
+        http-referer => 'https://example.com/app',
+        x-title      => 'My App',
+    );
+    my %h2 = $attr._get-api-headers;
+    is %h2<Authorization>, 'Bearer test-key',          'Authorization still set';
+    is %h2<HTTP-Referer>,  'https://example.com/app', 'HTTP-Referer set';
+    is %h2<X-Title>,       'My App',                  'X-Title set';
+};
+
+subtest '_lift-usage extracts OR extras from a full response body' => {
+    plan 8;
+    my $b = make-backend();
+    my $resp = $b.make-response;
+    my %payload = %(
+        id       => 'gen-xyz789',
+        model    => 'anthropic/claude-opus-4-7',
+        provider => 'Anthropic',
+        usage    => %(
+            prompt_tokens     => 200,
+            completion_tokens => 50,
+            total_tokens      => 250,
+            cost              => 0.0125e0,
+            is_byok           => False,
+        ),
+    );
+    $b._lift-usage($resp, %payload);
+    # OAI-spec lifts (parent's callsame path)
+    is $resp.prompt-tokens,      200,                   'OAI prompt-tokens via callsame';
+    is $resp.completion-tokens,  50,                    'OAI completion-tokens via callsame';
+    is $resp.total-tokens,       250,                   'OAI total-tokens via callsame';
+    is $resp.model-used, 'anthropic/claude-opus-4-7',   'OAI model via callsame';
+    # OR extras (subclass-specific lift)
+    is $resp.cost,               0.0125e0,              'OR cost extracted';
+    is $resp.generation-id,      'gen-xyz789',          'OR generation-id extracted from top-level id';
+    is $resp.provider-name,      'Anthropic',           'OR provider-name extracted';
+    is $resp.is-byok,            False,                 'OR is-byok extracted';
+};
+
+subtest '_lift-usage is presence-gated for partial bodies' => {
+    plan 6;
+    my $b = make-backend();
+
+    # Body with only a usage block + no top-level id/provider —
+    # cost gets set, generation-id / provider-name stay undefined.
+    my $r1 = $b.make-response;
+    $b._lift-usage($r1, %( usage => %( cost => 0.002e0 ) ));
+    is  $r1.cost, 0.002e0,                              'cost set';
+    nok $r1.generation-id.defined,                      'generation-id stays undefined';
+    nok $r1.provider-name.defined,                      'provider-name stays undefined';
+
+    # Body with only top-level id — generation-id set, cost stays undefined.
+    my $r2 = $b.make-response;
+    $b._lift-usage($r2, %( id => 'gen-only' ));
+    is  $r2.generation-id, 'gen-only',                  'generation-id set';
+    nok $r2.cost.defined,                               'cost stays undefined';
+
+    # Empty payload is a no-op.
+    my $r3 = $b.make-response;
+    $b._lift-usage($r3, %());
+    nok $r3.cost.defined,                               'empty payload leaves OR fields untouched';
+};
+
+subtest '_lift-usage is defensive against base Response (no _set-or-usage)' => {
+    plan 3;
+    my $b = make-backend();
+    my $base = LLM::Chat::Backend::Response.new(id => 'base1');
+    my %payload = %(
+        id       => 'gen-zzz',
+        provider => 'OpenAI',
+        model    => 'openai/gpt-5.4',
+        usage    => %(
+            prompt_tokens => 10,
+            cost          => 0.0001e0,
+        ),
+    );
+    # Should NOT die even though base Response lacks _set-or-usage.
+    lives-ok {
+        $b._lift-usage($base, %payload);
+    }, 'lift-usage tolerates a non-OR Response';
+    # OAI-spec still lifts via callsame (it works on base Response).
+    is $base.prompt-tokens, 10,                         'OAI-spec lift still works';
+    is $base.model-used,    'openai/gpt-5.4',           'OAI-spec model lift still works';
+};
+
+subtest 'reasoning_effort omitted from request when unset' => {
+    plan 2;
+    my $b = make-backend();
+    my %s = $b._get-api-settings;
+    nok %s<reasoning>:exists,
+        'reasoning field stays out of the body when not configured';
+    is %s<include_reasoning>, False,
+        'include_reasoning is Boolean False when reasoning_effort unset';
+};
+
+subtest 'reasoning_effort serialises only `effort` (matches ST shape)' => {
+    plan 7;
+    for <low medium high> -> $level {
+        my $b = LLM::Chat::Backend::OpenRouter.new(
+            settings => LLM::Chat::Backend::Settings.new(
+                reasoning_effort => $level,
+            ),
+            model    => 'anthropic/claude-opus-4-7',
+            api_key  => 'test-key',
+        );
+        my %s = $b._get-api-settings;
+        is %s<reasoning><effort>, $level,
+            "$level effort serialised under reasoning.effort";
+    }
+    # Mirroring SillyTavern's wire bytes verbatim: only `effort`,
+    # never the speculative `enabled` key we used to send. ST's
+    # ~0 % failure rate vs our ~80 % was the dispositive evidence
+    # that anything beyond what ST sends could trigger the hang.
+    my $b = LLM::Chat::Backend::OpenRouter.new(
+        settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high'),
+        model    => 'anthropic/claude-opus-4-7',
+        api_key  => 'test-key',
+    );
+    my %s = $b._get-api-settings;
+    nok %s<reasoning><enabled>:exists,
+        '`enabled` key NOT sent (matches ST shape)';
+    is %s<reasoning>.keys.elems,         1,
+        'reasoning hash has exactly the effort key';
+    is %s<reasoning><effort>,            'high',
+        'effort still carries the configured level';
+    is %s<include_reasoning>,            True,
+        'include_reasoning Boolean True when reasoning_effort set';
+};

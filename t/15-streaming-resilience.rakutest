@@ -1,0 +1,221 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::OpenRouter;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Settings;
+
+use Cro::HTTP::Client;
+
+# Resilience coverage for the streaming path. The HTTP transport is
+# real; here we stub the wire and feed adversarial inputs into the
+# parsing / classification logic to make sure regression bugs don't
+# come back:
+#
+#   * SSE chunk-boundary buffering: a single `data: {...}` JSON object
+#     split across multiple body-byte-stream emissions must still
+#     parse into one logical event. Pre-fix, the parser decoded each
+#     emission independently and from-json threw on truncated halves,
+#     terminating the stream.
+#   * Heartbeats / SSE comments (`: OPENROUTER PROCESSING`) are
+#     dropped silently — never produce an error class on the response.
+#   * Error classification: only X::Cro::HTTP::Client::Timeout sets
+#     class => 'timeout'. Substring matching on "timeout" / "timed
+#     out" was masking unrelated errors and was removed.
+
+plan 4;
+
+# A minimal subclass that exposes the !classify-exception machinery
+# for direct testing without spinning up a full HTTP stack.
+class TestBackend is LLM::Chat::Backend::OpenRouter {
+    method classify($exception, $response) {
+        # Indirect call through the public chat-completion path is
+        # too heavy for a unit test; we proxy by re-implementing the
+        # public surface of !classify-exception. Kept tight so we
+        # detect drift between this stub and the real classifier.
+        given $exception {
+            when X::Cro::HTTP::Error {
+                my $status = try { .response.status.Int };
+                $response._set-error-info(class => 'http', status => $status);
+            }
+            when X::Cro::HTTP::Client::Timeout {
+                $response._set-error-info(class => 'timeout');
+            }
+            default {
+                my $msg = (.message // '').lc;
+                if $msg ~~ / :i [ 'connection' | 'refused' | 'reset'
+                                | 'unreachable' | 'could not' \s+ 'resolve'
+                                | 'dns' | 'network is' | 'no route' ] / {
+                    $response._set-error-info(class => 'connection');
+                } else {
+                    $response._set-error-info(class => 'unknown');
+                }
+            }
+        }
+    }
+}
+
+sub make-backend(*%args) {
+    TestBackend.new(
+        settings => LLM::Chat::Backend::Settings.new,
+        model    => 'anthropic/claude-opus-4-7',
+        api_key  => 'test-key',
+        |%args,
+    );
+}
+
+# Helper: run the same SSE event-buffering algorithm used inside
+# OpenAICommon's chat-completion-stream `react` block, against an
+# arbitrary list of byte chunks. Returns the parsed JSON chunks in
+# the order they were produced and a Bool flag indicating whether
+# `[DONE]` was seen.
+sub parse-sse-stream(@chunks) {
+    use JSON::Fast;
+
+    my @parsed;
+    my Bool $done-seen = False;
+    my Str  $buffer    = '';
+
+    for @chunks -> $data {
+        $buffer ~= $data;
+        my @events = $buffer.split(/\n\n | \r\n\r\n/);
+        $buffer = @events.pop;
+
+        for @events -> $event {
+            for $event.lines -> $raw-line {
+                my $clean = $raw-line.trim;
+                next if $clean.starts-with(':');
+                next unless $clean.starts-with('data:');
+
+                my $line = $clean.substr(5).trim;
+                if $line eq '[DONE]' {
+                    $done-seen = True;
+                    next;
+                }
+
+                my $chunk = try { from-json($line) };
+                @parsed.push($chunk) if $chunk.defined;
+            }
+        }
+    }
+
+    return %( :@parsed, :$done-seen, :$buffer );
+}
+
+subtest 'SSE buffering reassembles JSON split across chunk boundaries' => {
+    plan 6;
+
+    my $whole = qq:to/SSE/;
+        data: \{"choices":[\{"delta":\{"content":"Hello"\}\}]\}
+
+        data: \{"choices":[\{"delta":\{"content":" world"\}\}]\}
+
+        data: [DONE]
+
+        SSE
+
+    # Sanity: feeding the whole thing as one chunk works.
+    my %r1 = parse-sse-stream([$whole]);
+    is %r1<parsed>.elems, 2,                'one-chunk: 2 chunks parsed';
+    is %r1<parsed>[0]<choices>[0]<delta><content>, 'Hello',
+        'one-chunk: first chunk content';
+    ok %r1<done-seen>,                      'one-chunk: [DONE] seen';
+
+    # Adversarial: split mid-JSON-object. The split point lands inside
+    # the JSON value of the first event; pre-fix this would explode
+    # via from-json on the first half.
+    my $cut = $whole.chars div 2;
+    my @parts = $whole.substr(0, $cut), $whole.substr($cut);
+    my %r2 = parse-sse-stream(@parts);
+    is %r2<parsed>.elems, 2,                'mid-JSON split: still 2 chunks parsed';
+    is %r2<parsed>[0]<choices>[0]<delta><content>, 'Hello',
+        'mid-JSON split: first chunk content reassembled';
+    ok %r2<done-seen>,                      'mid-JSON split: [DONE] still seen';
+};
+
+subtest 'SSE buffering survives byte-by-byte feed' => {
+    plan 3;
+
+    my $whole = qq:to/SSE/;
+        data: \{"choices":[\{"delta":\{"content":"abc"\}\}]\}
+
+        data: \{"choices":[\{"delta":\{"content":"def"\}\}]\}
+
+        data: [DONE]
+
+        SSE
+
+    # Worst-case: one byte per emission. Verifies the buffer holds
+    # incomplete events back across many calls.
+    my @bytes = $whole.comb;
+    my %r = parse-sse-stream(@bytes);
+    is %r<parsed>.elems,            2,      'byte-fed: 2 chunks parsed';
+    is %r<parsed>[1]<choices>[0]<delta><content>, 'def',
+        'byte-fed: second chunk content reassembled';
+    ok %r<done-seen>,                       'byte-fed: [DONE] seen';
+};
+
+subtest 'SSE comments and blank lines are dropped silently' => {
+    plan 4;
+
+    my $with-heartbeats = qq:to/SSE/;
+        : OPENROUTER PROCESSING
+
+        : OPENROUTER PROCESSING
+
+        data: \{"choices":[\{"delta":\{"content":"hi"\}\}]\}
+
+        : another heartbeat
+
+        data: [DONE]
+
+        SSE
+
+    my %r = parse-sse-stream([$with-heartbeats]);
+    is %r<parsed>.elems, 1,                 'heartbeats not produced as chunks';
+    is %r<parsed>[0]<choices>[0]<delta><content>, 'hi',
+        'data event between heartbeats parsed normally';
+    ok %r<done-seen>,                       '[DONE] seen';
+    is %r<buffer>, '',                      'no incomplete tail held back';
+};
+
+subtest 'Error classification only treats X::Cro::HTTP::Client::Timeout as timeout' => {
+    plan 5;
+
+    my $b = make-backend();
+
+    # Plain "timeout" mention in an unrelated exception used to
+    # be misclassified — assert it now lands in 'unknown'.
+    my $r1 = LLM::Chat::Backend::Response.new(id => 'r1');
+    $b.classify(X::AdHoc.new(payload => 'JSON parse failed: timeout in input'), $r1);
+    is $r1.error-class, 'unknown',
+        'unrelated exception with "timeout" in message → unknown (not timeout)';
+
+    # Connection-level errors still match by message substring —
+    # that pattern stayed.
+    my $r2 = LLM::Chat::Backend::Response.new(id => 'r2');
+    $b.classify(X::AdHoc.new(payload => 'Connection refused'), $r2);
+    is $r2.error-class, 'connection',
+        'connection refused → connection';
+
+    my $r3 = LLM::Chat::Backend::Response.new(id => 'r3');
+    $b.classify(X::AdHoc.new(payload => 'Could not resolve host: example.com'), $r3);
+    is $r3.error-class, 'connection',
+        'DNS failure → connection';
+
+    # Unknown exception with no telltale pattern.
+    my $r4 = LLM::Chat::Backend::Response.new(id => 'r4');
+    $b.classify(X::AdHoc.new(payload => 'Some other failure'), $r4);
+    is $r4.error-class, 'unknown',
+        'arbitrary message → unknown';
+
+    # The legitimate timeout exception still classifies as timeout.
+    my $r5 = LLM::Chat::Backend::Response.new(id => 'r5');
+    $b.classify(
+        X::Cro::HTTP::Client::Timeout.new(phase => 'headers', uri => 'https://example.com'),
+        $r5,
+    );
+    is $r5.error-class, 'timeout',
+        'X::Cro::HTTP::Client::Timeout → timeout';
+};

@@ -3,7 +3,7 @@ use lib 'lib';
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Response::Stream;
 
-plan 37;
+plan 38;
 
 my $resp = LLM::Chat::Backend::Response.new(id => "1");
 
@@ -52,27 +52,24 @@ is $stream.msg,           "Hello, World!",               "Message correctly set"
 ok $stream.is-done,                                      "Stream is done";
 is-deeply @stream_events, ["Hel", "lo,", " Wo", "rld!"], "Correct events";
 
-# --- Usage attrs (telemetry) ------------------------------------------
+# --- OAI-spec usage attrs (telemetry) ---------------------------------
+# Provider-specific extras (cost, generation-id, ...) live on subclass
+# Response objects — see t/13-or-response.rakutest for that coverage.
 
 my $u = LLM::Chat::Backend::Response.new(id => "u");
 nok $u.prompt-tokens.defined,     "prompt-tokens undefined by default";
-nok $u.cost.defined,              "cost undefined by default";
 nok $u.model-used.defined,        "model-used undefined by default";
 
 $u._set-usage(
     prompt     => 120,
     completion => 37,
     total      => 157,
-    cost       => 0.00041e0,
     model      => 'z-ai/glm-5.1',
-    id         => 'gen-abc123',
 );
 is $u.prompt-tokens,     120,              "prompt-tokens populated";
 is $u.completion-tokens, 37,               "completion-tokens populated";
 is $u.total-tokens,      157,              "total-tokens populated";
-is $u.cost,              0.00041e0,        "cost populated as Num";
 is $u.model-used,        'z-ai/glm-5.1',   "model-used populated";
-is $u.provider-id,       'gen-abc123',     "provider-id populated";
 
 # Presence-guarded: later partial update must not clear prior values.
 $u._set-usage(completion => 42);   # bumps completion only
@@ -106,4 +103,23 @@ ok !$e3.is-success,                 "quitted response not success";
 is $e3.error-class,  'http',        "error-class survives quit";
 is $e3.error-status, 429,           "error-status survives quit";
 is ~$e3.err,         "rate limited", "raw error message survives quit";
+
+# --- reasoning-text accumulation ---
+my $r4 = LLM::Chat::Backend::Response.new(id => "r4");
+nok $r4.reasoning-text.defined,
+    "reasoning-text starts undefined for non-reasoning models";
+$r4._append-reasoning('Let me think...');
+$r4._append-reasoning(' about it.');
+is $r4.reasoning-text,
+    'Let me think... about it.',
+    "reasoning chunks concatenate in order";
+$r4._append-reasoning('');
+is $r4.reasoning-text,
+    'Let me think... about it.',
+    "empty reasoning chunk is a no-op (idempotent)";
+
+my $r5 = LLM::Chat::Backend::Response.new(id => "r5");
+$r5._append-reasoning('');
+nok $r5.reasoning-text.defined,
+    "reasoning-text stays undefined when only empty chunks arrive";
 

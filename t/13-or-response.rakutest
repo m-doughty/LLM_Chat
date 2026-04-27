@@ -1,0 +1,103 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Response::Stream;
+use LLM::Chat::Backend::Response::OpenRouter;
+use LLM::Chat::Backend::Response::OpenRouter::Stream;
+
+# Coverage for the Response::OpenRouter::Augment role and the two
+# concrete classes that consume it. Behaviour split:
+#
+#   * OAI-spec fields (prompt-tokens, completion-tokens, total-tokens,
+#     model-used) live on base Response and are exercised in
+#     t/05_response.rakutest.
+#   * OR-specific fields (cost, generation-id, provider-name, is-byok)
+#     live on the role and are exercised here.
+#
+# The role declares only attrs and a fresh setter — no callsame /
+# nextsame from inside the role — so it sidesteps the known broken
+# role-redispatch case noted in the project memory. These tests pin
+# that contract.
+
+plan 6;
+
+subtest 'Response::OpenRouter inherits + composes correctly' => {
+    plan 4;
+    my $r = LLM::Chat::Backend::Response::OpenRouter.new(id => 'r1');
+    isa-ok $r, LLM::Chat::Backend::Response,
+                                            'is-a base Response';
+    ok $r ~~ LLM::Chat::Backend::Response::OpenRouter::Augment,
+                                            'does Augment role';
+    nok $r ~~ LLM::Chat::Backend::Response::Stream,
+                                            'is NOT a Stream';
+    can-ok $r, '_set-or-usage',             'role method available';
+};
+
+subtest 'Response::OpenRouter::Stream inherits + composes correctly' => {
+    plan 4;
+    my $s = LLM::Chat::Backend::Response::OpenRouter::Stream.new(id => 's1');
+    isa-ok $s, LLM::Chat::Backend::Response::Stream,
+                                            'is-a Stream';
+    isa-ok $s, LLM::Chat::Backend::Response,
+                                            'is-a base Response (transitive)';
+    ok $s ~~ LLM::Chat::Backend::Response::OpenRouter::Augment,
+                                            'does Augment role';
+    can-ok $s, '_set-or-usage',             'role method available';
+};
+
+subtest 'OR fields undefined by default' => {
+    plan 4;
+    my $r = LLM::Chat::Backend::Response::OpenRouter.new(id => 'r2');
+    nok $r.cost.defined,                    'cost undefined';
+    nok $r.generation-id.defined,           'generation-id undefined';
+    nok $r.provider-name.defined,           'provider-name undefined';
+    nok $r.is-byok.defined,                 'is-byok undefined';
+};
+
+subtest '_set-or-usage populates all OR fields' => {
+    plan 4;
+    my $r = LLM::Chat::Backend::Response::OpenRouter.new(id => 'r3');
+    $r._set-or-usage(
+        cost          => 0.0023e0,
+        generation-id => 'gen-abc123',
+        provider-name => 'Anthropic',
+        is-byok       => True,
+    );
+    is $r.cost,           0.0023e0,         'cost populated as Num';
+    is $r.generation-id,  'gen-abc123',     'generation-id populated';
+    is $r.provider-name,  'Anthropic',      'provider-name populated';
+    is $r.is-byok,        True,             'is-byok populated';
+};
+
+subtest '_set-or-usage is presence-gated and idempotent' => {
+    plan 6;
+    my $r = LLM::Chat::Backend::Response::OpenRouter.new(id => 'r4');
+
+    # Initial partial set
+    $r._set-or-usage(cost => 0.001e0);
+    is  $r.cost,                  0.001e0,  'cost set on first call';
+    nok $r.generation-id.defined,           'generation-id still undefined';
+
+    # Later partial set must not clear earlier values
+    $r._set-or-usage(generation-id => 'gen-X');
+    is $r.cost,           0.001e0,          'cost preserved by later partial update';
+    is $r.generation-id,  'gen-X',          'generation-id added';
+
+    # Repeating the same payload is a no-op (idempotent)
+    $r._set-or-usage(generation-id => 'gen-X');
+    is $r.generation-id,  'gen-X',          'idempotent on repeat';
+    is $r.cost,           0.001e0,          'cost still preserved after idempotent call';
+};
+
+subtest 'cost.defined distinguishes "unknown" from literal zero' => {
+    plan 4;
+    my $unknown = LLM::Chat::Backend::Response::OpenRouter.new(id => 'u');
+    nok $unknown.cost.defined,              'unknown: .cost.defined False';
+
+    my $zero = LLM::Chat::Backend::Response::OpenRouter.new(id => 'z');
+    $zero._set-or-usage(cost => 0e0);
+    ok  $zero.cost.defined,                 'zero: .cost.defined True';
+    is  $zero.cost,                  0e0,   'zero: cost is 0e0';
+    nok $zero.cost,                         'zero: cost is falsy as a number';
+};
