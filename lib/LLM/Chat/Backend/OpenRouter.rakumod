@@ -56,12 +56,17 @@ OpenAI-compatible code path:
       C<.provider-name>, and C<.is-byok>.
 =item Lifts those fields off the response body / stream chunks via
       C<_lift-usage> (calls C<callsame> first to handle OAI-spec).
-=item After a stream closes with a known C<generation-id>, fires a
+=item After a completion finishes — streaming or blocking — fires a
       one-shot GET against C</generation?id=...> to populate
       C<.cost> / C<.provider-name> from OpenRouter's metadata
       endpoint. Replaces the inline C<usage.cost> we used to ask for
-      via C<usage: { include: true }>; lookup is async and best-effort,
-      so a failure leaves C<.cost> Nil rather than erroring the call.
+      via C<usage: { include: true }>; lookup is best-effort, so a
+      failure leaves C<.cost> Nil rather than erroring the call.
+      Wired in via the C<_on-stream-complete> /
+      C<_on-blocking-complete> hooks that the parent class fires
+      before C<$response.done>, so consumers see populated cost
+      metadata by the time the response is observably done on
+      either path.
 
 Everything else — request shape, error classification, fallback /
 retry interaction, streaming mechanics, cancel — is inherited
@@ -207,31 +212,30 @@ method _lift-usage($response, $payload) {
 	$response._set-or-usage(|%args) if %args.elems;
 }
 
-#|( Post-stream metadata lookup. When the streaming response
-    naturally finishes (`[DONE]` received and a generation-id was
-    captured along the way), fire a one-shot GET against
+#|( Post-completion metadata lookup. Fired from both the streaming
+    and blocking completion paths via C<_on-stream-complete> /
+    C<_on-blocking-complete>. When a known C<generation-id> has been
+    captured (top-level C<id> on the response body, or a stream
+    chunk carrying it), fires a one-shot GET against
     C</generation?id=...> to lift cost / provider-name from
-    OpenRouter's metadata endpoint. This replaces the inline
+    OpenRouter's metadata endpoint. Replaces the inline
     C<usage.cost> we used to ask for via C<usage: { include: true }>
     — which we no longer send because it triggered OpenRouter's
     upstream router to hold 200 OK headers indefinitely on some
     providers (the bug this whole change set targets).
 
-    Runs synchronously inside the parent's streaming worker block so
+    Runs synchronously inside the parent's request-worker block so
     that consumers see C<.cost> populated by the time they observe
-    C<.is-done = True>. Adds ~50–200 ms of latency between the final
-    SSE chunk and C<.is-done>, which is well within the noise floor
-    of an LLM round-trip and avoids a regression for Cantina
-    (which reads C<.cost> the moment the stream completes).
+    the response as done. Adds ~50–200 ms of latency on top of the
+    primary call, which is well within the noise floor of an LLM
+    round-trip.
 
     Best-effort: any failure (network, parse, missing fields) leaves
-    C<.cost> Nil and is logged via LLM::Chat::Debug — the stream
-    itself already succeeded. Skipped silently when the response
-    isn't an OR-augmented type or no generation-id was captured
-    (test mocks, malformed streams). )
-method _on-stream-complete(LLM::Chat::Backend::Response::Stream $response) {
-	callsame;
-
+    C<.cost> Nil and is logged via LLM::Chat::Debug — the primary
+    call itself already succeeded. Skipped silently when the
+    response isn't an OR-augmented type or no generation-id was
+    captured (test mocks, malformed bodies). )
+method !fetch-generation-metadata(LLM::Chat::Backend::Response $response) {
 	return unless $response ~~ LLM::Chat::Backend::Response::OpenRouter::Augment;
 	return unless $response.generation-id.defined && $response.generation-id.chars;
 
@@ -242,8 +246,9 @@ method _on-stream-complete(LLM::Chat::Backend::Response::Stream $response) {
 
 	LLM::Chat::Debug.log('GENERATION LOOKUP', $url);
 
-	# Same HTTP/1.1 pin as the parent's stream client — see
-	# OpenAICommon.chat-completion-stream for the rationale.
+	# Same HTTP/1.1 pin as the parent's request clients — see
+	# OpenAICommon.chat-completion / chat-completion-stream for the
+	# rationale.
 	my $client = Cro::HTTP::Client.new:
 		:http<1.1>,
 		content-type => 'application/json',
@@ -271,10 +276,15 @@ method _on-stream-complete(LLM::Chat::Backend::Response::Stream $response) {
 
 	$response._set-or-usage(|%args) if %args.elems;
 
-	# Token counts also arrive on the metadata endpoint and are
-	# typically more accurate than the streaming usage frame for
-	# providers that don't emit one. Lift them onto the OAI-spec
-	# fields when we have them and they weren't already populated.
+	# Token counts also arrive on the metadata endpoint. The
+	# blocking path already lifted them off the response body's
+	# `usage` block (OAI spec, present even without
+	# `usage: { include: true }`); the streaming path under our
+	# current request shape doesn't get a usage frame at all, so
+	# this is the only place the stream picks them up. Presence-
+	# gated against an already-populated field so the blocking
+	# path never overwrites with the metadata endpoint's value
+	# (which is occasionally rounded for cached / cancelled gens). )
 	my %oai-args;
 	%oai-args<prompt>     = %payload<tokens_prompt>
 		if %payload<tokens_prompt>:exists
@@ -292,10 +302,29 @@ method _on-stream-complete(LLM::Chat::Backend::Response::Stream $response) {
 			LLM::Chat::Debug.log('GENERATION LOOKUP FAILED',
 				"{.^name}: {.message}");
 			# Best-effort. Leave .cost Nil rather than escalating
-			# to the user — the stream itself succeeded. The CATCH
-			# returns normally (doesn't rethrow) so the parent's
-			# CATCH treats this as a no-op for error-classification
-			# purposes.
+			# to the user — the primary call itself already
+			# succeeded. CATCH returns normally (doesn't rethrow)
+			# so the parent's CATCH treats this as a no-op for
+			# error-classification purposes.
 		}
 	}
+}
+
+#|( Streaming-path post-completion hook. Fires after C<[DONE]>,
+    before C<$response.done>; delegates to
+    C<!fetch-generation-metadata> for the actual lookup so the
+    blocking path can share the same code. )
+method _on-stream-complete(LLM::Chat::Backend::Response::Stream $response) {
+	callsame;
+	self!fetch-generation-metadata($response);
+}
+
+#|( Blocking-path post-completion hook. Fires after the response
+    body has been parsed and OAI/OR usage fields lifted, before
+    C<$response.done>; delegates to C<!fetch-generation-metadata>
+    so consumers of C<chat-completion> see C<.cost> populated by
+    the time the response is observably done. )
+method _on-blocking-complete(LLM::Chat::Backend::Response $response) {
+	callsame;
+	self!fetch-generation-metadata($response);
 }

@@ -2,6 +2,35 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.5.1  2026-04-29T23:47:12+01:00
+    - Bump Github Actions to use node 24+
+    - LLM::Chat::Backend::OpenAICommon gains a symmetric
+      `_on-blocking-complete` hook on the non-streaming path,
+      mirroring the existing `_on-stream-complete` contract: fires
+      after the response body has been parsed and `_lift-usage`
+      has lifted OAI/provider usage fields, before
+      `$response.done`. Default implementation is a no-op.
+      Subclasses use it to attach post-call metadata that isn't
+      in the body itself — symmetric with what was already
+      possible on streams.
+    - LLM::Chat::Backend::OpenRouter wires the new hook through
+      to the same `/generation?id=...` lookup the streaming path
+      already uses, so blocking callers (e.g. App::Storygen, which
+      calls `chat-completion` rather than `chat-completion-stream`)
+      now see `.cost` populated by the time `$response.done` fires.
+      Pre-fix this was the silent regression from dropping
+      `usage: { include: true }` — `Response::OpenRouter.cost`
+      stayed Nil on every blocking call.
+    - LLM::Chat::Backend::OpenRouter refactor: the lookup logic
+      is now in a private `!fetch-generation-metadata` helper that
+      both `_on-stream-complete` and `_on-blocking-complete`
+      delegate to. No behaviour change on the streaming path.
+    - Tests — t/12-openrouter-backend.rakutest gains a subtest
+      covering the defensive guards on both completion hooks
+      (no-op when generation-id is undefined; no crash when the
+      response isn't OR-augmented). Plan goes 11 → 12; total
+      LLM::Chat tests 130.
+
 0.5.0  2026-04-27T22:52:25+01:00
     - LLM::Chat::Backend::OpenRouter request shape now mirrors
       SillyTavern's wire bytes verbatim. Removed two body fields

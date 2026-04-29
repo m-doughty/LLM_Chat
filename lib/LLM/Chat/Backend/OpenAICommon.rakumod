@@ -46,13 +46,15 @@ keep that path clean, the following internal methods are
 underscore-prefixed (rather than C<!>-private) so subclasses can
 override them:
 
-=item C<_get-api-settings>      — body params for every request.
-=item C<_get-api-headers>       — HTTP headers for every request.
-=item C<_lift-usage>            — extract usage / model from a response body or stream chunk into the Response.
-=item C<make-response>          — factory for non-streaming Response objects (used by C<chat-completion> / C<text-completion>).
-=item C<make-stream-response>   — factory for streaming Response objects.
+=item C<_get-api-settings>       — body params for every request.
+=item C<_get-api-headers>        — HTTP headers for every request.
+=item C<_lift-usage>             — extract usage / model from a response body or stream chunk into the Response.
+=item C<make-response>           — factory for non-streaming Response objects (used by C<chat-completion> / C<text-completion>).
+=item C<make-stream-response>    — factory for streaming Response objects.
+=item C<_on-blocking-complete>   — fires after a non-streaming completion's body has been parsed and lifted, before C<$response.done>. Subclasses use it to attach post-call metadata (e.g. OpenRouter's C</generation> cost lookup).
+=item C<_on-stream-complete>     — same hook for the streaming path; fires after C<[DONE]>, before C<$response.done>.
 
-L<LLM::Chat::Backend::OpenRouter> overrides all five.
+L<LLM::Chat::Backend::OpenRouter> overrides all of these.
 
 C<!classify-exception> stays private — it's pure Raku/Cro mapping
 with no provider-specific behaviour.
@@ -312,6 +314,13 @@ method chat-completion(
 		my $reasoning = $choice<message><reasoning> // '';
 		$response._append-reasoning($reasoning) if $reasoning.chars;
 
+		# Hook fires before $response.done so any subclass-supplied
+		# post-call metadata (e.g. OpenRouter's /generation cost
+		# lookup, which is the only place blocking-path callers can
+		# pick up usage.cost since we no longer ask for it inline)
+		# is populated by the time consumers see the final body.
+		# See _on-blocking-complete docs.
+		self._on-blocking-complete($response);
 		$response.done;
 
 		CATCH {
@@ -514,6 +523,26 @@ method chat-completion-stream(
 
     Default is a no-op for vanilla OAI-compatible endpoints. )
 method _on-stream-complete(LLM::Chat::Backend::Response::Stream $response) {
+	# No-op — subclasses (e.g. OpenRouter) override.
+}
+
+#|( Hook called when a non-streaming chat-completion successfully
+    completes — body parsed, usage / generation-id lifted onto the
+    Response by C<_lift-usage>. Fires I<before> C<$response.done>,
+    so any subclass-supplied post-call metadata (e.g. OpenRouter's
+    C</generation> cost lookup, which is the only place a blocking
+    caller can pick up C<usage.cost> since we no longer ask for it
+    inline) is readable by the time consumers observe the final
+    body.
+
+    Symmetric counterpart to C<_on-stream-complete>: same contract,
+    same timing, same exception handling — runs synchronously inside
+    the request worker's C<start { }> block, hooks swallow their own
+    exceptions, an unhandled throw lands in the caller's CATCH and
+    is classified as a generic failure.
+
+    Default is a no-op for vanilla OAI-compatible endpoints. )
+method _on-blocking-complete(LLM::Chat::Backend::Response $response) {
 	# No-op — subclasses (e.g. OpenRouter) override.
 }
 

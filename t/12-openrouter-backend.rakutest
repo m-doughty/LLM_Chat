@@ -24,8 +24,13 @@ use LLM::Chat::Backend::Settings;
 #     is-byok and still calling callsame for OAI-spec lifts
 #   * _lift-usage no-op on a base Response (defensive)
 #   * Presence-gating across partial bodies + stream chunk shapes
+#   * _on-blocking-complete / _on-stream-complete defensive guards
+#     (no network call when the response has no generation-id, and
+#     no crash when the response isn't OR-augmented). The actual
+#     /generation HTTP fetch is not exercised here — it would need
+#     a mock server — but the early-return guards are.
 
-plan 11;
+plan 12;
 
 sub make-backend(*%args) {
     LLM::Chat::Backend::OpenRouter.new(
@@ -189,6 +194,42 @@ subtest 'reasoning_effort omitted from request when unset' => {
         'reasoning field stays out of the body when not configured';
     is %s<include_reasoning>, False,
         'include_reasoning is Boolean False when reasoning_effort unset';
+};
+
+subtest 'completion hooks defend against missing gen-id and non-OR Response' => {
+    plan 4;
+    my $b = make-backend();
+
+    # Fresh OR Response with no generation-id captured — both hooks
+    # must early-return before attempting a /generation fetch. We
+    # can't directly observe the absence of a network call in a unit
+    # test, but we CAN observe that the method completes synchronously
+    # without throwing.
+    my $r-or = $b.make-response;
+    lives-ok {
+        $b._on-blocking-complete($r-or);
+    }, '_on-blocking-complete is a no-op when generation-id is undefined';
+
+    my $s-or = $b.make-stream-response;
+    lives-ok {
+        $b._on-stream-complete($s-or);
+    }, '_on-stream-complete is a no-op when generation-id is undefined';
+
+    # Base Response (not OR-augmented). The OR override checks the
+    # role with a `~~` guard before touching subclass-only methods,
+    # so passing a plain Response must not crash. The blocking-path
+    # hook is the only one that can receive a base Response — the
+    # streaming hook is signature-pinned to Response::Stream.
+    my $base = LLM::Chat::Backend::Response.new(id => 'base1');
+    lives-ok {
+        $b._on-blocking-complete($base);
+    }, '_on-blocking-complete tolerates a non-OR Response';
+
+    # Sanity check — the Augment role membership is what gates the
+    # fetch path, so confirm Response::OpenRouter does it and a base
+    # Response doesn't.
+    ok $r-or ~~ LLM::Chat::Backend::Response::OpenRouter::Augment,
+        'OR-typed response carries the Augment role';
 };
 
 subtest 'reasoning_effort serialises only `effort` (matches ST shape)' => {
