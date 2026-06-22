@@ -1,0 +1,230 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Response::Stream;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::ToolLoop;
+
+plan 5;
+
+sub msg($role, $content) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content);
+}
+
+sub wait-msg($resp, Numeric $timeout = 3) {
+	my $deadline = now + $timeout;
+	sleep 0.01 until $resp.is-done || now > $deadline;
+	$resp.msg;
+}
+
+class ScriptedBackend is LLM::Chat::Backend {
+	has @.steps is rw;
+	has @.recorded-calls;
+	has Int $!next-id = 0;
+
+	method chat-completion(
+		@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+		:@tools,
+		--> LLM::Chat::Backend::Response
+	) {
+		die 'ScriptedBackend only implements streaming';
+	}
+
+	method chat-completion-stream(
+		@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+		:@tools,
+		--> LLM::Chat::Backend::Response::Stream
+	) {
+		my $id = 'scripted-' ~ ++$!next-id;
+		my $resp = LLM::Chat::Backend::Response::Stream.new(:$id);
+		my %step = @!steps.elems ?? @!steps.shift !! %(content => '');
+
+		@!recorded-calls.push: {
+			messages => @messages.clone,
+			tools => @tools.clone,
+			step => %step,
+		};
+
+		start {
+			sleep 0.01;
+			if %step<error>:exists {
+				$resp.quit(%step<error>);
+			} else {
+				for (%step<chunks> // [%step<content> // '']).list -> $chunk {
+					$resp.emit($chunk) if $chunk.defined && $chunk.Str.chars;
+				}
+				if %step<tool-calls>:exists {
+					$resp._set-tool-calls(%step<tool-calls>.list);
+					$resp._set-finish-reason('tool_calls');
+				} else {
+					$resp._set-finish-reason('stop');
+				}
+				$resp.done;
+			}
+		}
+
+		$resp;
+	}
+}
+
+my @tools = [{
+	type => 'function',
+	function => {
+		name => 'get_weather',
+		description => 'Get weather for a location',
+		parameters => {
+			type => 'object',
+			properties => { location => { type => 'string' } },
+			required => ['location'],
+		},
+	},
+},];
+
+my @weather-call = [{
+	id => 'call_weather',
+	type => 'function',
+	function => {
+		name => 'get_weather',
+		arguments => '{"location":"London"}',
+	},
+},];
+
+subtest 'No-tool response streams once and finishes' => {
+	plan 4;
+	my $backend = ScriptedBackend.new(
+		settings => LLM::Chat::Backend::Settings.new,
+		steps => [{ chunks => ['hello ', 'world'] },],
+	);
+	my $loop = LLM::Chat::ToolLoop.new(
+		:$backend,
+		tools => @tools,
+		execute-tools => -> @calls { die 'should not execute tools' },
+	);
+
+	my $resp = $loop.chat-completion-stream([msg('user', 'hi')]);
+	is wait-msg($resp), 'hello world', 'Visible text is aggregated';
+	ok $resp.is-success, 'Aggregated stream succeeds';
+	is $backend.recorded-calls.elems, 1, 'One backend call';
+	is $backend.recorded-calls[0]<tools>.elems, 1, 'Tools were sent on first call';
+};
+
+subtest 'One tool round executes and follows up with tool result' => {
+	plan 7;
+	my $backend = ScriptedBackend.new(
+		settings => LLM::Chat::Backend::Settings.new,
+		steps => [
+			{ tool-calls => @weather-call },
+			{ chunks => ['London is ', '15C.'] },
+		],
+	);
+	my $executed = 0;
+	my $loop = LLM::Chat::ToolLoop.new(
+		:$backend,
+		tools => @tools,
+		execute-tools => -> @calls {
+			$executed++;
+			is @calls[0]<function><name>, 'get_weather', 'Executor receives tool call';
+			[{
+				role => 'tool',
+				tool_call_id => @calls[0]<id>,
+				content => 'London: 15C and cloudy',
+			},];
+		},
+	);
+
+	my $resp = $loop.chat-completion-stream([msg('user', 'weather?')]);
+	is wait-msg($resp), 'London is 15C.', 'Final answer is streamed after tool result';
+	is $executed, 1, 'Executor called once';
+	is $backend.recorded-calls.elems, 2, 'Two backend calls';
+	is $backend.recorded-calls[1]<messages>[*-2].tool-calls[0]<id>, 'call_weather',
+		'Assistant tool-call turn was appended';
+	is $backend.recorded-calls[1]<messages>[*-1].role, 'tool',
+		'Tool result turn was appended';
+	is $backend.recorded-calls[1]<messages>[*-1].tool-call-id, 'call_weather',
+		'Tool result preserves tool_call_id';
+};
+
+subtest 'Round limit forces a final no-tool completion' => {
+	plan 5;
+	my $backend = ScriptedBackend.new(
+		settings => LLM::Chat::Backend::Settings.new,
+		steps => [
+			{ tool-calls => @weather-call },
+			{ chunks => ['limited answer'] },
+		],
+	);
+	my $executed = 0;
+	my $limited = 0;
+	my $loop = LLM::Chat::ToolLoop.new(
+		:$backend,
+		tools => @tools,
+		max-tool-rounds => 0,
+		execute-tools => -> @calls { $executed++ },
+		on-limit => -> $reason, @calls { $limited++ },
+	);
+
+	my $resp = $loop.chat-completion-stream([msg('user', 'weather?')]);
+	is wait-msg($resp), 'limited answer', 'Final no-tool answer is streamed';
+	is $executed, 0, 'Executor was not called after limit';
+	is $limited, 1, 'Limit callback fired';
+	is $backend.recorded-calls[1]<tools>.elems, 0, 'Final call omits tools';
+	is $backend.recorded-calls[1]<messages>[*-1].role, 'system',
+		'Limit instruction was appended';
+};
+
+subtest 'Repeated identical calls are stopped' => {
+	plan 5;
+	my $backend = ScriptedBackend.new(
+		settings => LLM::Chat::Backend::Settings.new,
+		steps => [
+			{ tool-calls => @weather-call },
+			{ tool-calls => @weather-call },
+			{ chunks => ['repeat limited'] },
+		],
+	);
+	my $executed = 0;
+	my $loop = LLM::Chat::ToolLoop.new(
+		:$backend,
+		tools => @tools,
+		max-identical-calls => 1,
+		execute-tools => -> @calls {
+			$executed++;
+			[{ role => 'tool', tool_call_id => @calls[0]<id>, content => 'first result' },];
+		},
+	);
+
+	my $resp = $loop.chat-completion-stream([msg('user', 'weather?')]);
+	is wait-msg($resp), 'repeat limited', 'Final answer after repeat limit';
+	is $executed, 1, 'Only first identical call executed';
+	is $backend.recorded-calls.elems, 3, 'Third backend call is final no-tool request';
+	is $backend.recorded-calls[2]<tools>.elems, 0, 'Repeat-limit final call omits tools';
+	is $backend.recorded-calls[2]<messages>[*-1].role, 'system',
+		'Repeat-limit instruction was appended';
+};
+
+subtest 'Executor exception becomes tool result message' => {
+	plan 4;
+	my $backend = ScriptedBackend.new(
+		settings => LLM::Chat::Backend::Settings.new,
+		steps => [
+			{ tool-calls => @weather-call },
+			{ chunks => ['handled executor failure'] },
+		],
+	);
+	my $loop = LLM::Chat::ToolLoop.new(
+		:$backend,
+		tools => @tools,
+		execute-tools => -> @calls { die 'tool process crashed' },
+	);
+
+	my $resp = $loop.chat-completion-stream([msg('user', 'weather?')]);
+	is wait-msg($resp), 'handled executor failure', 'Loop continues after executor failure';
+	is $backend.recorded-calls.elems, 2, 'Follow-up call still happens';
+	is $backend.recorded-calls[1]<messages>[*-1].role, 'tool',
+		'Executor failure was converted into a tool result';
+	like $backend.recorded-calls[1]<messages>[*-1].content, /'tool process crashed'/,
+		'Tool result contains executor failure message';
+};

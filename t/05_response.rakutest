@@ -3,7 +3,7 @@ use lib 'lib';
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Response::Stream;
 
-plan 38;
+plan 39;
 
 my $resp = LLM::Chat::Backend::Response.new(id => "1");
 
@@ -123,3 +123,25 @@ $r5._append-reasoning('');
 nok $r5.reasoning-text.defined,
     "reasoning-text stays undefined when only empty chunks arrive";
 
+subtest 'last-activity-at advances on response lifecycle events' => {
+    plan 4;
+
+    my $s = LLM::Chat::Backend::Response::Stream.new(id => 'activity');
+    ok $s.last-activity-at.defined,
+        'activity timestamp is set at construction';
+
+    my $past = now - 10;
+    $s._touch-activity(at => $past);
+    is $s.last-activity-at, $past,
+        'explicit activity touch is recorded';
+
+    $s._touch-activity(at => $past);
+    $s.emit('x');
+    ok $s.last-activity-at > $past,
+        'emitting content advances activity';
+
+    $s._touch-activity(at => $past);
+    $s.done;
+    ok $s.last-activity-at > $past,
+        'terminal success advances activity';
+};

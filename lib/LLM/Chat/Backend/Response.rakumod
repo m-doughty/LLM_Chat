@@ -1,5 +1,7 @@
 unit class LLM::Chat::Backend::Response;
 
+use JSON::Fast;
+
 has Str      $.id        is required;
 has Str      $.msg       = "";
 has          $.err       = Nil;
@@ -7,9 +9,11 @@ has Bool     $.done      = False;
 has Bool     $.success   = False;
 has Bool     $.cancelled = False;
 has          @.tool-calls;
+has          %!tool-call-builders;
 has Str      $.finish-reason;
 has Supplier $.supplier  is required;
 has Tap      $.tap       is required;
+has Instant  $.last-activity-at;
 
 # Structured error metadata. Populated by backend implementations
 # alongside C<.quit(...)> via C<_set-error-info>. Lets consumers
@@ -53,6 +57,7 @@ has Str      $.reasoning-text;
 submethod BUILD(:$id) {
 	$!id       := $id;
 	$!supplier := Supplier.new;
+	$!last-activity-at = now;
 
 	$!tap = self.supply.tap(
 		-> $e { self._emit($e) },
@@ -85,12 +90,60 @@ method _set-tap($t) {
 	$!tap = $t;
 }
 
+method _touch-activity(Instant :$at = now) {
+	$!last-activity-at = $at;
+	Nil;
+}
+
 method _emit($e) {
 	$!msg = $e;
 }
 
 method _set-tool-calls(@calls) {
 	@!tool-calls = @calls;
+}
+
+method _append-tool-call-deltas(@deltas) {
+	for @deltas -> $delta {
+		next unless $delta ~~ Associative;
+
+		my $index = ($delta<index> // %!tool-call-builders.elems).Int;
+		my %call = %!tool-call-builders{$index}:exists
+			?? %!tool-call-builders{$index}
+			!! %(index => $index, function => %(arguments => ''));
+
+		%call<id>   = $delta<id>   if $delta<id>:exists   && $delta<id>.defined;
+		%call<type> = $delta<type> if $delta<type>:exists && $delta<type>.defined;
+
+		if $delta<function> ~~ Associative {
+			my %fn = $delta<function>;
+			my %state-fn = %call<function> ~~ Associative
+				?? %call<function>
+				!! %(arguments => '');
+
+			%state-fn<name> = %fn<name>
+				if %fn<name>:exists && %fn<name>.defined;
+
+			if %fn<arguments>:exists && %fn<arguments>.defined {
+				if %fn<arguments> ~~ Associative {
+					%state-fn<arguments> = to-json(%fn<arguments>);
+				} else {
+					%state-fn<arguments> = (%state-fn<arguments> // '')
+						~ %fn<arguments>.Str;
+				}
+			}
+
+			%call<function> = %state-fn;
+		}
+
+		%!tool-call-builders{$index} = %call;
+	}
+
+	self._set-tool-calls(
+		%!tool-call-builders.keys.sort(*.Int).map({
+			%!tool-call-builders{$_}
+		}).list
+	) if %!tool-call-builders.elems;
 }
 
 method _set-finish-reason(Str $reason) {
@@ -160,17 +213,21 @@ method _quit($ex) {
 }
 
 method emit($e) { 
+	self._touch-activity;
 	$.supplier.emit($e);
 }
 
 method done {
+	self._touch-activity;
 	$.supplier.done;
 }
 
 method cancel {
+	self._touch-activity;
 	$.supplier.quit("Cancelled by user");
 }
 
 method quit($err) {
+	self._touch-activity;
 	$.supplier.quit($err);
 }

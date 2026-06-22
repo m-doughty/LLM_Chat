@@ -6,12 +6,14 @@
   "build-depends": [
   ],
   "depends": [
-    "Cro::HTTP:ver<0.8.11>:auth<zef:cro>",
-    "Digest::SHA256::Native:ver<1.0.0>",
-    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>",
-    "Template::Jinja2:auth<zef:apogee>",
-    "Tokenizers:auth<zef:apogee>",
-    "UUID::V4:ver<1.0.0>:auth<zef:masukomi>"
+    "Cro::HTTP::Client",
+    "Digest::SHA256::Native",
+    "JSON::Fast",
+    "LLM::Chat::Backend::Response::OpenRouter",
+    "LLM::Chat::Backend::Response::OpenRouter::Stream",
+    "Template::Jinja2",
+    "Tokenizers",
+    "UUID::V4"
   ],
   "description": "Simple framework for LLM inferencing",
   "license": "Artistic-2.0",
@@ -24,8 +26,7 @@
     "LLM::Chat::Backend::OpenAICommon": "lib/LLM/Chat/Backend/OpenAICommon.rakumod",
     "LLM::Chat::Backend::OpenRouter": "lib/LLM/Chat/Backend/OpenRouter.rakumod",
     "LLM::Chat::Backend::Response": "lib/LLM/Chat/Backend/Response.rakumod",
-    "LLM::Chat::Backend::Response::OpenRouter": "lib/LLM/Chat/Backend/Response/OpenRouter.rakumod",
-    "LLM::Chat::Backend::Response::OpenRouter::Stream": "lib/LLM/Chat/Backend/Response/OpenRouter/Stream.rakumod",
+    "LLM::Chat::Backend::Response::OpenRouter::Augment": "lib/LLM/Chat/Backend/Response/OpenRouter.rakumod",
     "LLM::Chat::Backend::Response::Stream": "lib/LLM/Chat/Backend/Response/Stream.rakumod",
     "LLM::Chat::Backend::Settings": "lib/LLM/Chat/Backend/Settings.rakumod",
     "LLM::Chat::Conversation": "lib/LLM/Chat/Conversation.rakumod",
@@ -38,7 +39,8 @@
     "LLM::Chat::Template::Llama3": "lib/LLM/Chat/Template/Llama3.rakumod",
     "LLM::Chat::Template::Llama4": "lib/LLM/Chat/Template/Llama4.rakumod",
     "LLM::Chat::Template::MistralV7": "lib/LLM/Chat/Template/MistralV7.rakumod",
-    "LLM::Chat::TokenCounter": "lib/LLM/Chat/TokenCounter.rakumod"
+    "LLM::Chat::TokenCounter": "lib/LLM/Chat/TokenCounter.rakumod",
+    "LLM::Chat::ToolLoop": "lib/LLM/Chat/ToolLoop.rakumod"
   },
   "resources": [
   ],
@@ -54,5 +56,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.5.1"
+  "version": "0.6.0"
 }

@@ -2,7 +2,7 @@ use Test;
 use lib 'lib';
 use LLM::Chat::Conversation::Message;
 
-plan 16;
+plan 24;
 
 my $msg = LLM::Chat::Conversation::Message.new(
 	role    => 'user',
@@ -35,7 +35,7 @@ ok $msg2.sticky, 'Sticky is True';
 
 my $checksum = $msg.get-checksum;
 ok $checksum ~~ /^^<[0..9a..f]> ** 64$$/, 'Checksum is valid hex';
-is $checksum, 'e1eb21fd713fed6ff683c096b641c455350212e8e3443da0ff2691449cec2913', 
+is $checksum, 'dfd05f28189faeb3c8cc366ca27a182d991dbf74053d367ae0b9e2b5a9770186',
 	'Checksum returns expected value';
 
 my %expected := {
@@ -45,3 +45,36 @@ my %expected := {
 
 is-deeply $msg.to-hash, %expected, '.to-hash returns correct structure';
 
+my $assistant-tool-msg = LLM::Chat::Conversation::Message.new(
+	role => 'assistant',
+	tool-calls => [{
+		id => 'call_1',
+		type => 'function',
+		function => {
+			name => 'get_weather',
+			arguments => '{"location":"London"}',
+		},
+	},],
+);
+
+my %assistant-tool-hash = $assistant-tool-msg.to-hash;
+is %assistant-tool-hash<role>, 'assistant', 'Tool-call assistant role serialized';
+nok %assistant-tool-hash<content>.defined,
+	'Empty assistant tool-call content serializes as an undefined value';
+is %assistant-tool-hash<tool_calls>[0]<id>, 'call_1', 'Assistant tool call ID serialized';
+is %assistant-tool-hash<tool_calls>[0]<function><name>, 'get_weather',
+	'Assistant tool call function serialized';
+
+my $tool-result-msg = LLM::Chat::Conversation::Message.new(
+	role => 'tool',
+	content => 'London: 15C and cloudy',
+	tool-call-id => 'call_1',
+);
+
+my %tool-result-hash = $tool-result-msg.to-hash;
+is %tool-result-hash<role>, 'tool', 'Tool result role serialized';
+is %tool-result-hash<tool_call_id>, 'call_1', 'Tool result call ID serialized';
+is %tool-result-hash<content>, 'London: 15C and cloudy',
+	'Tool result content serialized';
+ok $assistant-tool-msg.get-checksum ne $tool-result-msg.get-checksum,
+	'Tool metadata participates in checksums';

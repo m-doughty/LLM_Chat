@@ -2,6 +2,31 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.6.0  2026-06-22T23:33:11+01:00
+    - Add LLM::Chat::ToolLoop, a generic streaming tool-call
+      round loop. It sends OpenAI-format tools to any chat backend,
+      executes returned tool calls through a caller-supplied
+      callback, appends assistant/tool turns, and continues until a
+      final answer or guardrail limit is reached.
+    - OpenAI-compatible streaming now assembles `delta.tool_calls`
+      chunks and treats `finish_reason: tool_calls` as successful.
+      This enables KoboldCpp streamed tool calling.
+    - Conversation messages can now serialize assistant `tool_calls`
+      and tool-result `tool_call_id` fields for follow-up chat
+      completion requests.
+    - LLM::Chat::Backend::KoboldCpp.cancel is now non-blocking and
+      failure-proof: the local response stream closes FIRST,
+      synchronously, then the upstream POST /api/extra/abort fires on
+      a worker thread, best-effort, with network failures swallowed.
+      The old ordering awaited the abort before closing locally, so a
+      busy KoboldCpp froze the caller for the full HTTP round-trip
+      (interactive cancels hung the UI) and an unreachable one made
+      cancel throw without ever closing the stream. cancel now
+      returns the background Promise so callers/tests can await the
+      abort attempt. Also fixes the abort URL: stripping the /v1
+      suffix used to leave its leading slash behind, producing
+      //api/extra/abort.
+
 0.5.1  2026-04-29T23:47:12+01:00
     - Bump Github Actions to use node 24+
     - LLM::Chat::Backend::OpenAICommon gains a symmetric

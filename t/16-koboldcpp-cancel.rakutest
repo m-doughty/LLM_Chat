@@ -1,0 +1,136 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend::KoboldCpp;
+use LLM::Chat::Backend::Response;
+use LLM::Chat::Backend::Settings;
+
+# Cancel-path contract for the KoboldCpp backend.
+#
+# cancel() is reached from interactive contexts (TUI keybind handlers)
+# while a generation is streaming. The contract:
+#
+#   * The LOCAL response closes synchronously, before any network
+#     I/O — the user's cancel must take effect immediately and
+#     unconditionally. Observable as .is-cancelled / .is-done on the
+#     Response (its internal tap's quit handler sets both).
+#   * The upstream abort (POST /api/extra/abort) is best-effort and
+#     fire-and-forget on a worker thread. A hung or unreachable
+#     KoboldCpp must neither block the cancelling thread nor throw.
+#
+# The pre-fix ordering (await the abort, then close locally) violated
+# both: a busy backend froze the caller for the full HTTP round-trip,
+# and a dead backend made the awaited POST throw so the local close
+# never ran at all.
+
+plan 4;
+
+sub make-backend(Int $port) {
+    LLM::Chat::Backend::KoboldCpp.new(
+        api_url  => "http://127.0.0.1:$port/v1",
+        settings => LLM::Chat::Backend::Settings.new,
+    );
+}
+
+subtest 'default request timeouts allow long local prompt prefill' => {
+    plan 3;
+
+    my $backend = make-backend(1);
+    my %timeout = $backend._request-timeout;
+
+    is %timeout<connection>, 30,
+        'connection timeout still catches a dead server';
+    is %timeout<headers>, Inf,
+        'headers phase is unbounded for slow KoboldCpp prefill';
+    is %timeout<total>, 1800,
+        'total request guard stays in place';
+};
+
+subtest 'cancel returns without waiting on a hung abort endpoint' => {
+    plan 3;
+    # A listener that accepts the connection and never responds — the
+    # worst case for the old `await $client.post`: not refused, just
+    # silent. Connections are held open so the POST hangs for as long
+    # as the test process lives.
+    my @held;
+    my $listen-tap = IO::Socket::Async.listen('127.0.0.1', 0).tap(
+        -> $conn { @held.push($conn) },
+    );
+    LEAVE { .close for @held; $listen-tap.close }
+    my $port = await $listen-tap.socket-port;
+
+    my $backend = make-backend($port);
+    my $resp = LLM::Chat::Backend::Response.new(id => 'hung-abort');
+
+    my $t0 = now;
+    my $abort-promise = $backend.cancel($resp);
+    my $elapsed = now - $t0;
+
+    # Generous bound: the call does no network I/O inline, so even a
+    # heavily loaded box clears this by three orders of magnitude.
+    ok $elapsed < 5,
+        "cancel returned in {$elapsed.round(0.001)}s, not the HTTP round-trip";
+    isa-ok $abort-promise, Promise,
+        'background abort handle is exposed for callers that care';
+    ok $resp.is-cancelled,
+        'local response is cancelled despite the abort endpoint hanging';
+};
+
+subtest 'cancel closes the local response even when the backend is gone' => {
+    plan 3;
+    # Bind a port, then close it — gives us a port that is genuinely
+    # ours and now refuses connections, without guessing magic numbers.
+    my $probe = IO::Socket::Async.listen('127.0.0.1', 0).tap(-> $ { });
+    my $port = await $probe.socket-port;
+    $probe.close;
+
+    my $backend = make-backend($port);
+    my $resp = LLM::Chat::Backend::Response.new(id => 'dead-backend');
+
+    my $abort-promise;
+    lives-ok { $abort-promise = $backend.cancel($resp) },
+        'cancel does not throw on connection-refused';
+    ok $resp.is-cancelled,
+        'local response is cancelled despite connection-refused on the abort';
+
+    # The background abort attempt must swallow its failure — a broken
+    # Promise here would mean an unhandled exception escaped the
+    # fire-and-forget block.
+    await Promise.anyof($abort-promise, Promise.in(10));
+    ok $abort-promise.status ~~ Kept,
+        'background abort promise is kept (failure swallowed), not broken';
+};
+
+subtest 'abort URL strips the /v1 suffix before appending the abort path' => {
+    plan 1;
+    # The abort endpoint lives at /api/extra/abort on the server root,
+    # not under /v1 — and joining must not leave a double slash (the
+    # old subst kept the slash before v1). Capture the request line.
+    my $path-promise = Promise.new;
+    my $listen-tap = IO::Socket::Async.listen('127.0.0.1', 0).tap(
+        -> $conn {
+            $conn.Supply.tap(-> $data {
+                if $data ~~ / ^ (\w+) \s+ (\S+) / {
+                    $path-promise.keep(~$1) unless $path-promise.status;
+                    # Minimal valid response so the client side completes.
+                    $conn.print("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                    $conn.close;
+                }
+            });
+        },
+    );
+    LEAVE { $listen-tap.close }
+    my $port = await $listen-tap.socket-port;
+
+    my $backend = make-backend($port);
+    my $abort-promise =
+        $backend.cancel(LLM::Chat::Backend::Response.new(id => 'url-check'));
+    await Promise.anyof($abort-promise, Promise.in(10));
+
+    await Promise.anyof($path-promise, Promise.in(5));
+    is $path-promise.status ~~ Kept ?? $path-promise.result !! '(no request seen)',
+        '/api/extra/abort',
+        'abort request targets /api/extra/abort at the server root';
+};
+
+done-testing;

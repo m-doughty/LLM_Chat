@@ -6,7 +6,7 @@ use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 
-plan 6;
+plan 7;
 
 # === Response tool call parsing ===
 
@@ -118,17 +118,58 @@ subtest 'Simulated tool call response parsing' => {
 };
 
 subtest 'Tool result message format' => {
-	plan 3;
+	plan 4;
 	# After executing a tool, you send the result back as a tool message
 	my $tool-result-msg = LLM::Chat::Conversation::Message.new(
 		role => 'tool',
 		content => '{"temperature": "15C", "conditions": "cloudy"}',
+		tool-call-id => 'call_abc123',
 	);
 	is $tool-result-msg.role, 'tool', 'Tool message role';
 	ok $tool-result-msg.content.contains('15C'), 'Tool result content';
 
 	my %hash = $tool-result-msg.to-hash;
 	is %hash<role>, 'tool', 'Tool role in hash';
+	is %hash<tool_call_id>, 'call_abc123', 'Tool call ID in hash';
+};
+
+subtest 'Streaming tool call delta assembly' => {
+	plan 5;
+
+	my $resp = LLM::Chat::Backend::Response.new(id => 'stream-tools');
+	$resp._append-tool-call-deltas([
+		{
+			index => 0,
+			id => 'call_12981',
+			type => 'function',
+			function => {
+				name => 'get_weather',
+				arguments => '',
+			},
+		},
+	]);
+	$resp._append-tool-call-deltas([
+		{
+			index => 0,
+			function => {
+				arguments => '{"location":',
+			},
+		},
+		{
+			index => 0,
+			function => {
+				arguments => '"London"}',
+			},
+		},
+	]);
+	$resp._set-finish-reason('tool_calls');
+
+	ok $resp.has-tool-calls, 'Streaming deltas create tool calls';
+	is $resp.tool-calls.elems, 1, 'One tool call assembled';
+	is $resp.tool-calls[0]<id>, 'call_12981', 'Tool call ID retained';
+	is $resp.tool-calls[0]<function><name>, 'get_weather', 'Function name retained';
+	is $resp.tool-calls[0]<function><arguments>, '{"location":"London"}',
+		'Arguments fragments concatenated';
 };
 
 done-testing;

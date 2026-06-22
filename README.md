@@ -164,6 +164,32 @@ $resp.provider-id;         # Str, provider-assigned request id
 $resp.finish-reason;       # Str ('stop' / 'length' / 'content_filter' / ...)
 ```
 
+Tool Loop
+---------
+
+`LLM::Chat::ToolLoop` wraps a streaming backend and runs OpenAI-style tool-call rounds until the model produces a final answer or the safety limits are reached. It is backend-agnostic: pass tools in OpenAI format and an executor callback that returns `role =` "tool"> result hashes.
+
+```raku
+use LLM::Chat::ToolLoop;
+
+my @tools = $mcp-server.tools-for-llm;
+
+my $loop = LLM::Chat::ToolLoop.new(
+    backend => $backend,
+    tools => @tools,
+    execute-tools => -> @calls {
+        $mcp-server.execute-tool-calls(@calls)
+    },
+    # Defaults: 4 tool rounds, 12 total calls, 2 identical calls.
+);
+
+my $resp = $loop.chat-completion-stream(@messages);
+until $resp.is-done { sleep 0.01 }
+say $resp.msg if $resp.is-success;
+```
+
+For KoboldCpp, use the OpenAI-compatible chat endpoint `http://host:5001/v1`. Streaming tool calls arrive as `delta.tool_calls` chunks and are exposed through `.tool-calls` on the response before the loop executes them.
+
 Conversation Management
 -----------------------
 

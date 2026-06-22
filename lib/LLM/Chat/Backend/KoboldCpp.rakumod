@@ -13,6 +13,16 @@ has Str $.api_url is required;
 has Str $.api_key is rw;
 has Str $.model   is rw;
 
+# Local dense models can spend well over 60s in prompt prefill on long
+# context before the OAI-compatible endpoint sends response headers.
+# Keep the parent's connection and total limits, but do not classify a
+# healthy long-prefill KoboldCpp request as a headers timeout.
+method _request-timeout(--> Hash) {
+	my %timeout = callsame.Hash;
+	%timeout<headers> = Inf if (%timeout<headers> // 60) == 60;
+	%timeout;
+}
+
 #|( KoboldCpp accepts the OAI-spec body fields plus a long tail of
     sampler extras (top_k, min_p, typical_p, DRY, XTC, ...). Override
     of OpenAICommon's hook so the inherited chat / text completion
@@ -51,16 +61,32 @@ method _get-api-headers(--> Hash) {
     return %h;
 }
 
-method cancel(LLM::Chat::Backend::Response $resp) {
-	my $client = Cro::HTTP::Client.new:
-		content-type => 'application/json';
-
-	my $url = $.api_url.subst(/ 'v1' '/'? $/, '');
-	$url ~= "/api/extra/abort";
-
-	await $client.post:
-		$url,
-		headers => self._get-api-headers;
-
+#|( Cancel an in-flight generation. The local response stream closes
+    FIRST, synchronously — the consumer side sees the cancel
+    immediately and unconditionally. The upstream abort
+    (C<POST /api/extra/abort>) then fires on a worker thread,
+    best-effort: a slow, hung, or unreachable KoboldCpp must never
+    block the cancelling thread (this is reached from TUI keybind
+    handlers), and a lost abort costs at most a few wasted tokens
+    server-side since KoboldCpp also stops generating when the SSE
+    connection drops. Network failures are swallowed. The previous
+    ordering — await the abort, then close locally — meant a dead
+    backend made C<cancel> throw before the local close ever ran.
+    Returns the background Promise so tests can await the abort
+    attempt deterministically; production callers may sink it. )
+method cancel(LLM::Chat::Backend::Response $resp --> Promise) {
 	$resp.cancel;
+
+	# Strip the OAI-compat /v1 suffix (and any slashes around it) —
+	# the abort endpoint lives at the server root. The old pattern
+	# left the slash BEFORE v1 in place, producing //api/extra/abort.
+	my $url = $.api_url.subst(/ '/'? 'v1' '/'? $/, '');
+	$url ~= "/api/extra/abort";
+	my %headers = self._get-api-headers;
+
+	start {
+		my $client = Cro::HTTP::Client.new:
+			content-type => 'application/json';
+		try await $client.post: $url, headers => %headers;
+	}
 }

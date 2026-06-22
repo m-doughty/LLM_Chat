@@ -94,6 +94,10 @@ has %.request-timeout = %(
     total      => 1800,
 );
 
+method _request-timeout(--> Hash) {
+	%!request-timeout.Hash;
+}
+
 #|( Best-effort: when a 4xx response triggers an
     X::Cro::HTTP::Error::Client, fetch the response body and write it
     to LLM::Chat::Debug. OpenAI-compatible APIs (OpenRouter included)
@@ -268,7 +272,7 @@ method chat-completion(
 		my $client = Cro::HTTP::Client.new:
 			:http<1.1>,
 			content-type => 'application/json',
-			timeout      => %!request-timeout;
+			timeout      => self._request-timeout;
 
 		my $url = $.api_url.subst(/'/' $/, '');
 		$url ~= "/chat/completions";
@@ -361,7 +365,7 @@ method chat-completion-stream(
 		my $client = Cro::HTTP::Client.new:
 			:http<1.1>,
 			content-type => 'application/json',
-			timeout      => %!request-timeout;
+			timeout      => self._request-timeout;
 
 		my $url = $.api_url.subst(/'/' $/, '');
 		$url ~= "/chat/completions";
@@ -375,6 +379,7 @@ method chat-completion-stream(
 			body             => %settings,
 			headers          => self._get-api-headers;
 
+		$response._touch-activity;
 		LLM::Chat::Debug.log('HEADERS RECEIVED',
 			"+{((now - $start-time) * 1000).Int}ms status={$res.status}");
 
@@ -389,6 +394,7 @@ method chat-completion-stream(
 			my Bool $first-byte-seen = False;
 			my Str  $buffer = '';
 			whenever $res.body-byte-stream -> $data {
+				$response._touch-activity;
 				unless $first-byte-seen {
 					$first-byte-seen = True;
 					LLM::Chat::Debug.log('FIRST BODY BYTE',
@@ -446,23 +452,39 @@ method chat-completion-stream(
 						# override (e.g. OpenRouter) lifts any
 						# provider-specific extras alongside.
 						self._lift-usage($response, $chunk);
-						my $delta = $chunk<choices>[0]<delta><content>:exists
-							?? $chunk<choices>[0]<delta><content>
+						my $choice = $chunk<choices>[0] // {};
+						my $delta-payload = $choice<delta> ~~ Associative
+							?? $choice<delta>
+							!! {};
+
+						if $delta-payload<tool_calls>:exists
+						&& $delta-payload<tool_calls> ~~ Positional {
+							$response._append-tool-call-deltas(
+								$delta-payload<tool_calls>.list
+							);
+						}
+
+						my $delta = $delta-payload<content>:exists
+							?? ($delta-payload<content> // "")
 							!! "";
-						$response.emit($delta);
+						$response.emit($delta) if $delta.chars;
 
 						# Reasoning trace, when the model emits
 						# one. Accumulated separately from the
 						# content supply so consumers that just
 						# want the visible reply still get a
 						# clean stream.
-						my $reasoning = $chunk<choices>[0]<delta><reasoning>:exists
-							?? ($chunk<choices>[0]<delta><reasoning> // '')
-							!! '';
+						my $reasoning = '';
+						if $delta-payload<reasoning>:exists {
+							$reasoning = $delta-payload<reasoning> // '';
+						} elsif $delta-payload<reasoning_content>:exists {
+							$reasoning = $delta-payload<reasoning_content> // '';
+						}
 						$response._append-reasoning($reasoning) if $reasoning.chars;
 
-						my $reason = $chunk<choices>[0]<finish_reason> // Nil;
+						my $reason = $choice<finish_reason> // Nil;
 						if $reason.defined {
+							$response._set-finish-reason($reason);
 							given $reason {
 								when 'stop' {
 									# Don't close yet — `[DONE]` or a
@@ -471,6 +493,12 @@ method chat-completion-stream(
 									# emits a final id/provider chunk
 									# after finish_reason but before
 									# the SSE close.
+								}
+								when 'tool_calls' {
+									# Tool-call deltas are assembled
+									# above. Wait for `[DONE]` so the
+									# stream closes through the same
+									# hook path as normal completions.
 								}
 								when 'length' {
 									$response._set-error-info(class => 'response');
@@ -579,7 +607,7 @@ method text-completion(
 		my $client = Cro::HTTP::Client.new:
 			:http<1.1>,
 			content-type => 'application/json',
-			timeout      => %!request-timeout;
+			timeout      => self._request-timeout;
 
 		my $url = $.api_url.subst(/'/' $/, '');
 		$url ~= "/completions";
@@ -642,7 +670,7 @@ method text-completion-stream(
 		my $client = Cro::HTTP::Client.new:
 			:http<1.1>,
 			content-type => 'application/json',
-			timeout      => %!request-timeout;
+			timeout      => self._request-timeout;
 
 		my $url = $.api_url.subst(/'/' $/, '');
 		$url ~= "/completions";
@@ -652,9 +680,11 @@ method text-completion-stream(
 			body    => %settings,
 			headers => self._get-api-headers;
 
+		$response._touch-activity;
 		react {
 			my Str $buffer = '';
 			whenever $res.body-byte-stream -> $data {
+				$response._touch-activity;
 				$buffer ~= $data.decode('utf-8');
 				my @events = $buffer.split(/\n\n | \r\n\r\n/);
 				$buffer = @events.pop;
