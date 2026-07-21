@@ -193,6 +193,22 @@ method _get-api-settings(--> Hash) {
 	%r<repetition_penalty> = $s.repetition_pen
 		if $s.repetition_pen.defined && $s.repetition_pen != 1.0;
 
+	# Structured outputs: OpenAI-style response_format wrapper around
+	# the caller-supplied JSON Schema. strict => False deliberately —
+	# strict mode demands exhaustive additionalProperties/required
+	# annotations and narrows provider routing; shape guidance plus
+	# caller-side parse validation is the contract here.
+	with $s.json_schema {
+		%r<response_format> = %(
+			type        => 'json_schema',
+			json_schema => %(
+				name   => $s.json_schema_name,
+				strict => False,
+				schema => $s.json_schema,
+			),
+		);
+	}
+
 	return %r;
 }
 

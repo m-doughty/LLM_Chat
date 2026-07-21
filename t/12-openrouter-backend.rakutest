@@ -30,7 +30,7 @@ use LLM::Chat::Backend::Settings;
 #     /generation HTTP fetch is not exercised here — it would need
 #     a mock server — but the early-return guards are.
 
-plan 12;
+plan 13;
 
 sub make-backend(*%args) {
     LLM::Chat::Backend::OpenRouter.new(
@@ -264,4 +264,35 @@ subtest 'reasoning_effort serialises only `effort` (matches ST shape)' => {
         'effort still carries the configured level';
     is %s<include_reasoning>,            True,
         'include_reasoning Boolean True when reasoning_effort set';
+};
+
+subtest 'json_schema settings become an OpenAI response_format block' => {
+    plan 6;
+    my %schema = %(
+        type       => 'object',
+        properties => %( events => %( type => 'array' ) ),
+        required   => ['events'],
+    );
+
+    my $plain = make-backend();
+    nok $plain._get-api-settings<response_format>:exists,
+        'response_format omitted when no json_schema is set';
+
+    my $b = make-backend(settings => LLM::Chat::Backend::Settings.new(
+        json_schema      => %schema,
+        json_schema_name => 'relationship_events',
+    ));
+    my %s = $b._get-api-settings;
+    is %s<response_format><type>, 'json_schema', 'response_format type';
+    is %s<response_format><json_schema><name>, 'relationship_events',
+        'schema name threaded through';
+    is %s<response_format><json_schema><strict>, False,
+        'strict is False (shape guidance, not provider-narrowing)';
+    is-deeply %s<response_format><json_schema><schema>, %schema,
+        'schema passed through verbatim';
+
+    my $mutated = make-backend();
+    $mutated.settings.json_schema = %schema;
+    ok $mutated._get-api-settings<response_format>:exists,
+        'post-construction settings mutation is honoured';
 };

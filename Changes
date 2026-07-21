@@ -2,6 +2,18 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.7.0  2026-07-21T03:09:53+01:00
+    - [2026-07-03] Structured outputs: Backend::Settings gains
+      C<json_schema> (a plain-Hash JSON Schema, default undefined) and
+      C<json_schema_name>. OpenAI-compatible backends (incl.
+      OpenRouter) send it as C<response_format: { type: 'json_schema',
+      json_schema: { name, strict: false, schema } }> — best-effort,
+      provider-dependent enforcement; KoboldCpp sends the native
+      C<json_schema> generate field, which it compiles to a grammar
+      for sampler-level enforcement. Unset schema changes no request
+      bytes. Callers should keep parse validation as the backstop for
+      providers that ignore response_format.
+
 0.6.0  2026-06-22T23:33:11+01:00
     - Add LLM::Chat::ToolLoop, a generic streaming tool-call
       round loop. It sends OpenAI-format tools to any chat backend,

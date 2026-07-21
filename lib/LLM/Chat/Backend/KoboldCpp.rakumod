@@ -52,6 +52,12 @@ method _get-api-settings(--> Hash) {
 	%r<xtc_probability>       = $s.xtc_probability;
 	%r<xtc_threshold>         = $s.xtc_threshold;
 
+	# Structured outputs: KoboldCpp accepts a json_schema generate
+	# field natively and compiles it to a grammar — sampler-level
+	# enforcement, unlike the best-effort OpenAI response_format.
+	# Older KoboldCpp builds ignore unknown fields harmlessly.
+	%r<json_schema> = $s.json_schema with $s.json_schema;
+
 	return %r;
 }
 

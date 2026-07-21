@@ -31,3 +31,26 @@ has Str             @.stop            is rw = ();
     'medium', and 'high' are accepted. )
 has ReasoningEffort $.reasoning_effort is rw;
 
+#|( Optional JSON Schema (as a plain Hash) constraining the model's
+    output shape — structured outputs. Leave undefined (the default)
+    to omit any constraint. How it reaches the wire is per-backend:
+
+    =item OpenAI-compatible / OpenRouter — sent as
+      C<response_format: { type: 'json_schema', json_schema: { name,
+      strict: false, schema } }>. Enforcement depends on the serving
+      provider/model; providers that don't support structured outputs
+      typically ignore the field, so callers should keep their own
+      parse validation as the backstop.
+    =item KoboldCpp — sent as the native C<json_schema> generate
+      field, which KoboldCpp compiles to a grammar and enforces at
+      the sampler (hard guarantee, local).
+
+    The schema Hash is passed through verbatim — build it with plain
+    nested Hashes/Arrays using JSON Schema vocabulary (C<type>,
+    C<properties>, C<required>, C<enum>, ...). )
+has $.json_schema is rw;
+
+#|( Name attached to the schema in OpenAI-style C<response_format>
+    payloads (some providers require it). Ignored by KoboldCpp. )
+has Str $.json_schema_name is rw = 'response';
+

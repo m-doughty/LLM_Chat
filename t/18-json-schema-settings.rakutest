@@ -1,0 +1,38 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend::KoboldCpp;
+use LLM::Chat::Backend::Settings;
+
+# Structured outputs, KoboldCpp side: the caller-supplied JSON Schema
+# rides the native `json_schema` generate field (KoboldCpp compiles it
+# to a grammar — sampler-level enforcement). The OpenAI-style
+# response_format mapping is covered in t/12.
+
+plan 2;
+
+subtest 'json_schema omitted from generate body when unset' => {
+    plan 2;
+    my $b = LLM::Chat::Backend::KoboldCpp.new(
+        settings => LLM::Chat::Backend::Settings.new,
+        api_url  => 'http://127.0.0.1:5001',
+    );
+    my %s = $b._get-api-settings;
+    nok %s<json_schema>:exists, 'no json_schema key by default';
+    ok %s<max_length>:exists, 'kobold-native fields still present';
+};
+
+subtest 'json_schema passed through verbatim when set' => {
+    plan 1;
+    my %schema = %(
+        type       => 'object',
+        properties => %( events => %( type => 'array' ) ),
+        required   => ['events'],
+    );
+    my $b = LLM::Chat::Backend::KoboldCpp.new(
+        settings => LLM::Chat::Backend::Settings.new(json_schema => %schema),
+        api_url  => 'http://127.0.0.1:5001',
+    );
+    is-deeply $b._get-api-settings<json_schema>, %schema,
+        'schema lands as the native kobold json_schema field';
+};
