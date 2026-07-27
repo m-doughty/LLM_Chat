@@ -735,6 +735,14 @@ method text-completion-stream(
 
 						my $reason = $chunk<choices>[0]<finish_reason> // Nil;
 						if $reason.defined {
+							# Stamp the reason on the Response BEFORE
+							# acting on it — the 'length' /
+							# 'content_filter' arms quit the supply,
+							# and a consumer inspecting the quit
+							# Response must still be able to tell
+							# WHICH terminal reason produced it.
+							# Mirrors chat-completion-stream.
+							$response._set-finish-reason($reason);
 							given $reason {
 								when 'stop' {
 									self._on-stream-complete($response);

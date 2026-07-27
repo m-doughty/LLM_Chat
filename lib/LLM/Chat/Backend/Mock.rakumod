@@ -64,6 +64,7 @@ Only the raw text in C<responses> gets returned.
 =item C<$.stream-delay> — seconds between tokens in streaming mode. Default 0 (emit as fast as possible).
 =item C<&.token-splitter> — sub that takes a Str and returns a list of tokens. Default splits on whitespace and preserves spacing by re-appending a space after each token except the last.
 =item C<&.error-producer> — optional C<(Int $call-index --> Hash)> callback. When it returns a defined hash, that call is scripted to fail. Used to exercise the Task fallback policy. See L</SIMULATING FAILURES>.
+=item C<&.finish-reason-producer> — optional C<(Int $call-index --> Str)> callback. A defined Str return is stamped on the Response as its C<finish-reason> while the call still succeeds — the way a real blocking completion reports C<'length'>. See L</SIMULATING TRUNCATION>.
 =item C<$.call-index> — monotonically-increasing per-backend call count, bumped on every completion call whether it succeeded or failed. Distinct from the internal response cursor — tests can read this to assert call counts without reasoning about the response queue.
 =item C<$.response-class> — class minted for non-streaming completion calls. Defaults to L<LLM::Chat::Backend::Response>; pass L<LLM::Chat::Backend::Response::OpenRouter> to exercise the OR-flavoured Response shape.
 =item C<$.stream-response-class> — streaming counterpart to C<$.response-class>. Pair with L<LLM::Chat::Backend::Response::OpenRouter::Stream>.
@@ -98,6 +99,50 @@ C<'response'> (malformed / empty body / finish-reason failure), and
 C<'unknown'>. Failed calls DO NOT consume a slot from C<@.responses>,
 so the queue addresses only the successful calls regardless of where
 failures fire.
+
+=head1 SIMULATING TRUNCATION
+
+A real B<blocking> completion that runs out of completion budget does
+not fail: it returns HTTP 200 with a perfectly well-formed body, a
+partial C<content>, and C<finish_reason> C<'length'>. Callers only
+learn the output was cut off by reading C<$response.finish-reason>.
+C<&.finish-reason-producer> reproduces exactly that shape.
+
+The callback receives the 0-based per-backend call index (the same
+index C<&.error-producer> sees) and returns either a Str — stamped on
+the Response via C<_set-finish-reason> before the emission task starts,
+so it is readable the instant the caller has the Response — or an
+undefined value, which leaves C<finish-reason> unset (the historical
+Mock shape).
+
+=begin code :lang<raku>
+
+# First call comes back truncated, second one is clean.
+my $mock = LLM::Chat::Backend::Mock.new(
+    settings  => LLM::Chat::Backend::Settings.new,
+    responses => ['{"beats": [{"first": 0,', '{"beats": []}'],
+    finish-reason-producer => -> $i { $i == 0 ?? 'length' !! Str },
+);
+
+my $first = $mock.chat-completion(@messages);
+await $first.supply;                 # succeeds — 200 with a partial body
+is $first.finish-reason, 'length';   # ... but the body was cut off
+
+=end code
+
+Two deliberate limits:
+
+=item The truncated call still B<succeeds>. C<is-success> stays True and C<.msg> holds whatever C<@.responses> supplied — that is the point, since it is what a real backend does. Use C<&.error-producer> when you want the call to fail outright.
+=item C<&.error-producer> B<wins>. When both callbacks fire on the same index the call is scripted to fail and no finish reason is stamped, because a failed call never produced a body to have a finish reason for.
+
+The knob is wired into the non-streaming paths only
+(C<chat-completion>, and C<text-completion> through its delegation).
+The streaming paths already surface finish reasons the way the real
+backends do — a C<'length'> chunk quits the stream with error class
+C<'response'> — so scripting one there would contradict the transport
+being modelled. Tests that need a truncated B<stream> should exercise
+C<LLM::Chat::Backend::OpenAICommon> against a canned SSE body instead
+(see C<t/19-length-finish-stream.rakutest>).
 
 =head1 RECORDING CALLS
 
@@ -197,6 +242,27 @@ has &.responder;
     Failed calls DO NOT consume a slot from C<@.responses>, so tests
     can cleanly interleave scripted errors with scripted successes. )
 has &.error-producer;
+
+#|( Optional finish-reason producer for truncation tests. Called with
+    the same 0-based per-backend call index C<&.error-producer> sees.
+    A defined Str return is stamped on the Response via
+    C<_set-finish-reason> BEFORE the emission task is started, so a
+    caller holding the Response can read it without racing the
+    emission; an undefined return leaves C<finish-reason> unset.
+
+    Unlike C<&.error-producer> this does NOT fail the call — it
+    reproduces the shape of a real blocking completion that ran out of
+    completion budget: HTTP 200, a well-formed but partial body, and
+    C<finish_reason> 'length'. The canned response slot is consumed
+    exactly as it would be for any other success, so the queue keeps
+    addressing calls positionally.
+
+    A scripted error WINS over a scripted finish reason: when both
+    producers fire on the same index the call fails and no reason is
+    stamped, because a failed call never produced a body. Wired into
+    the non-streaming paths only — see the SIMULATING TRUNCATION
+    section of the POD for why. )
+has &.finish-reason-producer;
 
 # Serialises cursor advancement + recorded-calls appends so concurrent
 # callers (e.g. a WorkerPool hitting the mock from N threads) can't race
@@ -348,6 +414,17 @@ method chat-completion(
         }
 
         return $resp;
+    }
+
+    # Not an error: a real blocking completion that exhausts its
+    # completion budget returns 200 with a partial body and
+    # finish_reason 'length'. Stamped before the emission task starts
+    # so callers can read it the moment they hold the Response. Only
+    # reached when the error-producer declined this call — a scripted
+    # failure wins.
+    if &!finish-reason-producer.defined {
+        my $reason = &!finish-reason-producer($this-index);
+        $resp._set-finish-reason($reason) if $reason.defined;
     }
 
     my $text;

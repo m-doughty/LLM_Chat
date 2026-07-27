@@ -2,6 +2,32 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.7.1  2026-07-27T15:27:39+01:00
+    - [2026-07-27] LLM::Chat::Backend::Mock gains
+      C<&.finish-reason-producer>, an optional
+      C<(Int $call-index --> Str)> callback mirroring
+      C<&.error-producer>'s per-call indexing. A defined Str return is
+      stamped on the Response via C<_set-finish-reason> before the
+      emission task starts, while the call still SUCCEEDS — the exact
+      shape of a real blocking completion that ran out of completion
+      budget (HTTP 200, well-formed but partial body, finish_reason
+      'length'). Undefined returns leave C<finish-reason> unset, so
+      existing mocks are byte-for-byte unchanged. A scripted error
+      wins over a scripted finish reason (a failed call never produced
+      a body). Wired into the non-streaming paths only —
+      C<chat-completion>, and C<text-completion> by delegation —
+      because the streaming paths already model finish reasons the way
+      the real transports do. Lets downstream consumers
+      (LLM::Data::Inference's truncation policy) test truncation
+      handling without a live model.
+    - [2026-07-27] Fix: OpenAICommon's C<text-completion-stream> acted
+      on a terminal C<finish_reason> without recording it, so a stream
+      cut off by the token budget quit with error class 'response' but
+      an UNDEFINED C<.finish-reason> — consumers could not tell budget
+      exhaustion apart from a content filter or an unknown reason.
+      It now calls C<_set-finish-reason> before dispatching on the
+      reason, matching C<chat-completion-stream>.
+
 0.7.0  2026-07-21T03:09:53+01:00
     - [2026-07-03] Structured outputs: Backend::Settings gains
       C<json_schema> (a plain-Hash JSON Schema, default undefined) and

@@ -110,6 +110,11 @@ my $mock = LLM::Chat::Backend::Mock.new(
                          message => 'bad gateway' } }
         default      { Nil }
     },
+    # Optional: script a truncated-but-successful call by index. The
+    # call still succeeds with its canned body; the Response just
+    # carries finish-reason 'length', the way a real blocking
+    # completion reports an exhausted token budget.
+    finish-reason-producer => -> $i { $i == 0 ?? 'length' !! Str },
 );
 
 my $resp = $mock.chat-completion(@messages);

@@ -7,7 +7,7 @@ use LLM::Chat::Backend::Response::OpenRouter::Stream;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 
-plan 12;
+plan 17;
 
 sub msg($role, $content) {
     LLM::Chat::Conversation::Message.new(:$role, :$content);
@@ -291,4 +291,119 @@ subtest 'error-producer returning Nil falls through to responses queue' => {
     my $r2 = $mock.chat-completion([msg('user', 'q')]);
     await Promise.anyof($r2.supply.Promise, Promise.in(2));
     is $r2.msg, 'b', 'queue advances normally';
+};
+
+# --- finish-reason-producer -------------------------------------------
+#
+# A blocking completion that exhausts its token budget is NOT an error:
+# HTTP 200, well-formed body, partial content, finish_reason 'length'.
+# The knob reproduces that exact shape so Task-level truncation policy
+# has something honest to detect.
+
+subtest 'finish-reason-producer stamps a truncated-but-successful call' => {
+    plan 5;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['{"beats": [{"first": 0,'],
+        finish-reason-producer => -> $i { 'length' },
+    );
+    my $r = $mock.chat-completion([msg('user', 'q')]);
+
+    # Readable BEFORE the emission task has necessarily run — the
+    # stamp happens inline, not inside the start block.
+    is $r.finish-reason, 'length', 'finish-reason readable immediately';
+
+    await Promise.anyof($r.supply.Promise, Promise.in(2));
+    ok $r.is-success,                     'truncated call still succeeds';
+    nok $r.error-class.defined,           'no error class on a truncated success';
+    is $r.msg, '{"beats": [{"first": 0,', 'partial body intact';
+    is $r.finish-reason, 'length',        'finish-reason survives completion';
+};
+
+subtest 'no finish-reason-producer leaves finish-reason unset' => {
+    plan 2;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['plain'],
+    );
+    my $r = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r.supply.Promise, Promise.in(2));
+    nok $r.finish-reason.defined, 'historical shape: finish-reason undefined';
+    is $r.msg, 'plain',           'response unaffected';
+};
+
+subtest 'finish-reason-producer addresses calls by index' => {
+    plan 8;
+    # Undefined return on the odd calls → unset, exactly as if no
+    # producer had been passed. Interleaved with a responder to prove
+    # the two hooks are independent.
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['queued-a', 'queued-b'],
+        responder => -> @messages {
+            @messages[*-1].content eq 'intercept' ?? 'from-responder' !! Str
+        },
+        finish-reason-producer => -> $i { $i %% 2 ?? 'length' !! Str },
+    );
+
+    my @prompts = 'q', 'intercept', 'q', 'intercept';
+    my @resps;
+    for @prompts -> $p {
+        my $r = $mock.chat-completion([msg('user', $p)]);
+        await Promise.anyof($r.supply.Promise, Promise.in(2));
+        @resps.push: $r;
+    }
+
+    is @resps[0].finish-reason, 'length', 'call 0 truncated';
+    nok @resps[1].finish-reason.defined,  'call 1 clean';
+    is @resps[2].finish-reason, 'length', 'call 2 truncated';
+    nok @resps[3].finish-reason.defined,  'call 3 clean';
+
+    # Truncated calls still consume the queue — they succeeded.
+    is @resps[0].msg, 'queued-a',      'call 0 took the first canned slot';
+    is @resps[1].msg, 'from-responder','responder still intercepts';
+    is @resps[2].msg, 'queued-b',      'call 2 took the second canned slot';
+    is $mock.call-index, 4,            'four calls counted';
+};
+
+subtest 'error-producer wins over finish-reason-producer' => {
+    plan 5;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['survivor'],
+        error-producer => -> $i {
+            $i == 0 ?? { class => 'http', status => 502, message => 'bad gateway' } !! Nil
+        },
+        finish-reason-producer => -> $i { 'length' },
+    );
+
+    my $r0 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r0.supply.Promise, Promise.in(2));
+    nok $r0.is-success,          'scripted failure still fails';
+    is $r0.error-class, 'http',  'error info intact';
+    nok $r0.finish-reason.defined,
+        'a failed call never produced a body, so no finish reason';
+
+    # The next call is not scripted to fail — it gets the reason.
+    my $r1 = $mock.chat-completion([msg('user', 'q')]);
+    await Promise.anyof($r1.supply.Promise, Promise.in(2));
+    ok $r1.is-success,                'following call succeeds';
+    is $r1.finish-reason, 'length',   'and carries the scripted finish reason';
+};
+
+subtest 'text-completion inherits the finish-reason knob' => {
+    plan 4;
+    my $mock = LLM::Chat::Backend::Mock.new(
+        settings  => LLM::Chat::Backend::Settings.new,
+        responses => ['cut off here'],
+        finish-reason-producer => -> $i { 'length' },
+    );
+    my $r = $mock.text-completion([msg('user', 'q')], True);
+    await Promise.anyof($r.supply.Promise, Promise.in(2));
+    is $r.finish-reason, 'length',   'delegation carries the stamp through';
+    is $r.msg, 'cut off here',       'body intact';
+    is $mock.recorded-calls[*-1]<kind>, 'text-completion',
+        'recorded as a text-completion';
+    ok $mock.recorded-calls[*-1]<continuation>,
+        'continuation flag still recorded';
 };
