@@ -1,0 +1,278 @@
+use Test;
+use lib 'lib', 't/lib';
+
+use ChatTestKit;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+
+use Cro::HTTP::Router;
+
+# SSE stream decoding across chunk boundaries, against a real HTTP
+# server.
+#
+# The body of a streaming completion arrives as a Supply of byte
+# chunks whose boundaries are chosen by TCP and have nothing to do
+# with where anything in the payload ends. Two different things can
+# therefore be cut in half:
+#
+#   * an SSE event — handled since 0.5.x by holding an unterminated
+#     tail back in $buffer (t/15-streaming-resilience covers the
+#     algorithm directly);
+#   * a multi-byte UTF-8 character — which the held-back-text buffer
+#     CANNOT help with, because `$chunk.decode('utf-8')` throws on the
+#     half that ends mid-sequence, before the text ever reaches the
+#     buffer. The throw landed in the streaming CATCH, which quit the
+#     Response: a generation killed mid-flight, intermittently, and
+#     only for output containing non-ASCII — which for a chat model is
+#     most output.
+#
+# OpenAICommon now feeds the bytes to an incremental decoder
+# (_stream-decoder) that keeps an unfinished sequence to itself until
+# the bytes completing it arrive. This file pins that down end to end,
+# through the public chat-completion-stream / text-completion-stream
+# entry points, by serving the same SSE body split at EVERY byte
+# offset in turn — every one of which must produce byte-identical
+# content.
+
+plan 6;
+
+# Multi-byte from every width UTF-8 has: 2-byte accented latin, 3-byte
+# symbol / CJK / punctuation, and a 4-byte astral-plane emoji. None of
+# these characters needs JSON string escaping, which is what lets the
+# frames below be hand-built (see `frame`).
+constant REASONING = "Réfléchissons — 日本語で ✓";
+constant PART1     = "café ✓ ";
+constant PART2     = "日本語 — “quoted” 🎲";
+constant CONTENT   = PART1 ~ PART2;
+
+#| One SSE frame: a `data:` line and the blank line that ends the
+#| event.
+#|
+#| The JSON is hand-built rather than run through to-json because this
+#| file is about the exact bytes on the wire and JSON::Fast escapes
+#| astral-plane characters into 🎲 surrogate pairs — which
+#| would take the 4-byte sequences the bug bites hardest on off the
+#| wire altogether, leaving the test to pass against the broken code.
+sub frame(Str:D $body, Str:D :$eol = "\n" --> Str:D) {
+    "data: $body$eol$eol";
+}
+
+#| An SSE comment (an OpenRouter-style heartbeat), which carries no
+#| data and must be skipped however it lands in the chunking.
+sub heartbeat(Str:D :$eol = "\n" --> Str:D) {
+    ": OPENROUTER PROCESSING$eol$eol";
+}
+
+sub chat-body(Str:D :$eol = "\n" --> Str:D) {
+    frame('{"id":"gen-stream-1","model":"test/model","choices":[{"delta":{"reasoning":"'
+        ~ REASONING ~ '"}}]}', :$eol)
+    ~ heartbeat(:$eol)
+    ~ frame('{"choices":[{"delta":{"content":"' ~ PART1 ~ '"}}]}', :$eol)
+    ~ frame('{"choices":[{"delta":{"content":"' ~ PART2 ~ '"},"finish_reason":"stop"}]}', :$eol)
+    ~ frame('{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}', :$eol)
+    ~ frame('[DONE]', :$eol);
+}
+
+sub text-body(--> Str:D) {
+    frame('{"choices":[{"text":"' ~ PART1 ~ '"}]}')
+    ~ heartbeat()
+    ~ frame('{"choices":[{"text":"' ~ PART2 ~ '","finish_reason":"stop"}]}')
+    ~ frame('[DONE]');
+}
+
+constant CHAT-SSE      = chat-body().encode('utf-8');
+constant CHAT-SSE-CRLF = chat-body(:eol("\r\n")).encode('utf-8');
+constant TEXT-SSE      = text-body().encode('utf-8');
+
+#| Serve $bytes as a streaming body cut into separate HTTP chunks at
+#| the given byte offsets. Cro emits one chunk per Blob the body
+#| Supply produces and the client's body-byte-stream hands them to the
+#| backend one for one, so a cut here really is a cut the parser has to
+#| survive — no sleeps or flushing tricks needed.
+sub chunked(Blob:D $bytes, *@cuts --> Supply:D) {
+    my @edges = 0, |@cuts.grep({ 0 < $_ < $bytes.elems }).sort.squish, $bytes.elems;
+    supply {
+        for @edges.rotor(2 => -1) -> ($from, $to) {
+            emit $bytes.subbuf($from, $to - $from);
+        }
+        done;
+    }
+}
+
+my $app = route {
+    # ChatTestKit's boot() proves the listener on the port it picked is
+    # ours and not some other process's.
+    get -> 'ping' { content 'text/plain', 'pong' }
+
+    # Two body chunks, split at byte offset $cut.
+    post -> 'split', Int $cut, 'chat', 'completions' {
+        content 'text/event-stream', chunked(CHAT-SSE, $cut);
+    }
+    post -> 'split', Int $cut, 'completions' {
+        content 'text/event-stream', chunked(TEXT-SSE, $cut);
+    }
+    post -> 'crlf', Int $cut, 'chat', 'completions' {
+        content 'text/event-stream', chunked(CHAT-SSE-CRLF, $cut);
+    }
+
+    # The worst case a network can produce: one byte per emission.
+    post -> 'bytewise', 'chat', 'completions' {
+        content 'text/event-stream', chunked(CHAT-SSE, |(1 ..^ CHAT-SSE.elems));
+    }
+
+    # Controls: the whole body in a single chunk.
+    post -> 'whole', 'chat', 'completions' {
+        content 'text/event-stream', chunked(CHAT-SSE);
+    }
+    post -> 'whole', 'completions' {
+        content 'text/event-stream', chunked(TEXT-SSE);
+    }
+};
+
+my ($server, $port) = boot($app);
+LEAVE { try $server.stop with $server }
+
+sub make-backend(Str:D $prefix) {
+    LLM::Chat::Backend::OpenAICommon.new(
+        api_url  => "http://127.0.0.1:$port/$prefix",
+        api_key  => 'test-key',
+        model    => 'test/model',
+        settings => LLM::Chat::Backend::Settings.new,
+        template => LLM::Chat::Template::ChatML.new,
+    );
+}
+
+my @messages = LLM::Chat::Conversation::Message.new(:role<user>, :content('Bonjour ?'));
+
+#| Run one chat stream against $prefix and settle it.
+sub chat-stream(Str:D $prefix, Str:D $what) {
+    stream-settled(make-backend($prefix).chat-completion-stream(@messages), $what);
+}
+
+#| Run one text stream against $prefix and settle it.
+sub text-stream(Str:D $prefix, Str:D $what) {
+    stream-settled(make-backend($prefix).text-completion-stream(@messages), $what);
+}
+
+#| Byte offsets that land exactly on a frame boundary — the split the
+#| held-back-text buffer alone always coped with, kept as the control
+#| that says a failure elsewhere is about characters and not about
+#| framing.
+sub frame-boundaries(Blob:D $bytes, Str:D $eol --> List) {
+    my $text = $bytes.decode('utf-8');
+    my $sep  = $eol ~ $eol;
+    my @at;
+    my $i = 0;
+    while (my $found = $text.index($sep, $i)).defined {
+        # Offsets are in BYTES; the text index has to be converted.
+        @at.push($text.substr(0, $found + $sep.chars).encode('utf-8').elems);
+        $i = $found + $sep.chars;
+    }
+    @at.List;
+}
+
+subtest 'the fixture puts real multi-byte characters on the wire' => {
+    plan 5;
+
+    # If this stops holding, every sweep below goes vacuous: an
+    # all-ASCII body cannot be split mid-character.
+    ok CHAT-SSE.list.grep({ $_ >= 0xF0 }).elems,
+        'the chat body contains a 4-byte UTF-8 lead byte';
+    ok CHAT-SSE.list.grep({ 0xC0 <= $_ < 0xE0 }).elems,
+        'and a 2-byte one';
+    ok CHAT-SSE.elems > CHAT-SSE.decode('utf-8').codes,
+        'the body is longer in bytes than in characters';
+
+    my $response = chat-stream('whole', 'the single-chunk control stream');
+    ok $response.is-success,  'a single-chunk stream succeeds';
+    is $response.msg, CONTENT, 'and its content is byte-identical';
+};
+
+subtest 'chat-completion-stream survives a split at every byte offset' => {
+    plan 4;
+
+    my (@quit, @content, @reasoning, @usage);
+    for 1 ..^ CHAT-SSE.elems -> $cut {
+        my $response = chat-stream("split/$cut", "the stream split at byte $cut");
+        @quit.push($cut)      unless $response.is-success && !$response.err.defined;
+        @content.push($cut)   unless $response.msg eq CONTENT;
+        @reasoning.push($cut) unless ($response.reasoning-text // '') eq REASONING;
+        @usage.push($cut)     unless ($response.completion-tokens // 0) == 22;
+    }
+
+    diag "quit at byte offsets: @quit[]"           if @quit;
+    diag "wrong content at byte offsets: @content[]"     if @content;
+    diag "wrong reasoning at byte offsets: @reasoning[]" if @reasoning;
+    diag "lost usage at byte offsets: @usage[]"          if @usage;
+
+    my $n = CHAT-SSE.elems - 1;
+    is @quit.elems,      0, "all $n splits ran to [DONE] without an error";
+    is @content.elems,   0, "all $n splits produced byte-identical content";
+    is @reasoning.elems, 0, "all $n splits produced byte-identical reasoning";
+    is @usage.elems,     0, "all $n splits still lifted the usage frame";
+};
+
+subtest 'a split on a frame boundary is unaffected' => {
+    my @cuts = frame-boundaries(CHAT-SSE, "\n");
+    plan 1 + @cuts.elems;
+
+    ok @cuts.elems >= 5, "found {@cuts.elems} frame boundaries to cut on";
+    for @cuts -> $cut {
+        is chat-stream("split/$cut", "the stream split on the boundary at $cut").msg,
+            CONTENT, "split between events at byte $cut";
+    }
+};
+
+subtest 'chat-completion-stream survives one byte per chunk' => {
+    plan 5;
+
+    my $response = chat-stream('bytewise', 'the byte-at-a-time stream');
+    ok $response.is-success,       'a stream fed one byte at a time still succeeds';
+    nok $response.err.defined,     'and emitted no error';
+    is $response.msg, CONTENT,     'content is byte-identical';
+    is $response.reasoning-text, REASONING, 'reasoning is byte-identical';
+    is $response.finish-reason, 'stop', 'the finish reason came through';
+};
+
+subtest 'CRLF-framed events survive a split at every byte offset' => {
+    plan 2;
+
+    my (@quit, @content);
+    for 1 ..^ CHAT-SSE-CRLF.elems -> $cut {
+        my $response = chat-stream("crlf/$cut", "the CRLF stream split at byte $cut");
+        @quit.push($cut)    unless $response.is-success && !$response.err.defined;
+        @content.push($cut) unless $response.msg eq CONTENT;
+    }
+
+    diag "quit at byte offsets: @quit[]"             if @quit;
+    diag "wrong content at byte offsets: @content[]" if @content;
+
+    my $n = CHAT-SSE-CRLF.elems - 1;
+    is @quit.elems,    0, "all $n CRLF splits ran to [DONE] without an error";
+    is @content.elems, 0, "all $n CRLF splits produced byte-identical content";
+};
+
+subtest 'text-completion-stream survives a split at every byte offset' => {
+    plan 3;
+
+    my $control = text-stream('whole', 'the single-chunk text stream');
+    is $control.msg, CONTENT, 'the single-chunk control is byte-identical';
+
+    my (@quit, @content);
+    for 1 ..^ TEXT-SSE.elems -> $cut {
+        my $response = text-stream("split/$cut", "the text stream split at byte $cut");
+        @quit.push($cut)    unless $response.is-success && !$response.err.defined;
+        @content.push($cut) unless $response.msg eq CONTENT;
+    }
+
+    diag "quit at byte offsets: @quit[]"             if @quit;
+    diag "wrong content at byte offsets: @content[]" if @content;
+
+    my $n = TEXT-SSE.elems - 1;
+    is @quit.elems,    0, "all $n splits ran to the terminal frame without an error";
+    is @content.elems, 0, "all $n splits produced byte-identical content";
+};
+
+done-testing;

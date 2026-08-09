@@ -1,0 +1,156 @@
+use Test;
+use lib 'lib';
+use LLM::Chat::Retry;
+use LLM::Chat::Retry::Exceptions;
+
+plan 10;
+
+sub attempts(--> List) {
+	(
+		attempt-record(
+			backend-index => 0, model => 'small',
+			error => '[backend 0 small] truncated: budget',
+			raw-text => 'half an ans',
+		),
+		attempt-record(
+			backend-index => 1, model => 'slow',
+			error => '[backend 1 slow] timeout: 300s',
+		),
+	);
+}
+
+subtest 'Exhausted: shape and message' => {
+	plan 5;
+	my @a = attempts();
+	my $ex = X::LLM::Chat::Retry::Exhausted.new(
+		attempts => @a, summary => "all 2 backend(s) exhausted.",
+	);
+	isa-ok $ex, Exception, 'it is an Exception';
+	is $ex.summary, 'all 2 backend(s) exhausted.', 'summary round-trips';
+	is $ex.message, $ex.summary, 'message IS the summary, verbatim';
+	is $ex.attempts.elems, 2, 'attempt records are carried';
+	is $ex.attempts[0]<raw-text>, 'half an ans',
+		'including the raw model output of a parse/truncation failure';
+};
+
+subtest 'Exhausted: summary is required' => {
+	plan 3;
+	dies-ok { X::LLM::Chat::Retry::Exhausted.new },
+		'no summary ⇒ construction dies';
+	dies-ok { X::LLM::Chat::Retry::Truncated.new(attempts => []) },
+		'the requirement is inherited by Truncated';
+	lives-ok { X::LLM::Chat::Retry::Exhausted.new(summary => 'x') },
+		'attempts, on the other hand, is optional';
+};
+
+subtest 'Exhausted: no attempts at all is legal' => {
+	plan 2;
+	my $ex = X::LLM::Chat::Retry::Exhausted.new(summary => 'nothing tried');
+	is $ex.attempts.elems, 0, 'an empty attempt list';
+	is $ex.message, 'nothing tried', 'and a usable message';
+};
+
+subtest 'hierarchy: Truncated and TimedOut ARE Exhausteds' => {
+	plan 6;
+	my $tr = X::LLM::Chat::Retry::Truncated.new(summary => 's');
+	my $to = X::LLM::Chat::Retry::TimedOut.new(summary => 's');
+	ok $tr ~~ X::LLM::Chat::Retry::Truncated, 'Truncated matches itself';
+	ok $tr ~~ X::LLM::Chat::Retry::Exhausted,
+		'Truncated matches Exhausted — existing handlers keep catching it';
+	ok $to ~~ X::LLM::Chat::Retry::TimedOut, 'TimedOut matches itself';
+	ok $to ~~ X::LLM::Chat::Retry::Exhausted, 'TimedOut matches Exhausted';
+	nok $tr ~~ X::LLM::Chat::Retry::TimedOut, 'the siblings do not match';
+	nok $to ~~ X::LLM::Chat::Retry::Truncated, '...in either direction';
+};
+
+subtest 'hierarchy: Cancelled is NOT an Exhausted' => {
+	plan 4;
+	my $c = X::LLM::Chat::Retry::Cancelled.new;
+	isa-ok $c, Exception, 'it is an Exception';
+	nok $c ~~ X::LLM::Chat::Retry::Exhausted,
+		'a user cancel must never be swallowed by an exhaustion handler';
+	nok $c ~~ X::LLM::Chat::Retry::Truncated, 'nor by a Truncated arm';
+	nok $c ~~ X::LLM::Chat::Retry::TimedOut, 'nor by a TimedOut arm';
+};
+
+subtest 'Cancelled: message names the attempt count' => {
+	plan 4;
+	is X::LLM::Chat::Retry::Cancelled.new.message,
+		'LLM call cancelled by caller',
+		'no attempts ⇒ bare message, no empty suffix';
+	is X::LLM::Chat::Retry::Cancelled.new(attempts => []).message,
+		'LLM call cancelled by caller',
+		'an explicitly empty list behaves the same';
+	is X::LLM::Chat::Retry::Cancelled.new(attempts => attempts()).message,
+		'LLM call cancelled by caller after 2 recorded attempt(s)',
+		'two attempts are counted in the message';
+	is X::LLM::Chat::Retry::Cancelled.new(attempts => attempts()[0,]).message,
+		'LLM call cancelled by caller after 1 recorded attempt(s)',
+		'and one is too (the plural is deliberately not conjugated)';
+};
+
+subtest 'Cancelled: carries whatever was recorded before the withdrawal' => {
+	plan 2;
+	my $c = X::LLM::Chat::Retry::Cancelled.new(attempts => attempts());
+	is $c.attempts.elems, 2, 'attempt records survive the cancel';
+	is $c.attempts[1]<model>, 'slow', 'in order, unaltered';
+};
+
+subtest 'the item-retryable advice contract' => {
+	plan 5;
+	# Consumers read it as `.?item-retryable // True` — absent means
+	# "go ahead and re-run the item".
+	is X::LLM::Chat::Retry::Truncated.new(summary => 's').?item-retryable,
+		False, 'Truncated declares it False: a re-roll overruns identically';
+	nok X::LLM::Chat::Retry::TimedOut.new(summary => 's').?item-retryable.defined,
+		'TimedOut abstains — a deadline miss is genuinely transient';
+	nok X::LLM::Chat::Retry::Exhausted.new(summary => 's').?item-retryable.defined,
+		'plain Exhausted abstains too';
+	nok X::LLM::Chat::Retry::Cancelled.new.?item-retryable.defined,
+		'Cancelled abstains (the caller withdrew; nothing to advise)';
+	is (X::LLM::Chat::Retry::TimedOut.new(summary => 's').?item-retryable // True),
+		True, 'the documented consumer idiom defaults an absent method to True';
+};
+
+subtest 'a when-chain catches the subclasses before the base' => {
+	plan 4;
+	my sub classify($ex) {
+		my $seen;
+		{
+			CATCH {
+				when X::LLM::Chat::Retry::Cancelled { $seen = 'cancelled' }
+				when X::LLM::Chat::Retry::Truncated { $seen = 'truncated' }
+				when X::LLM::Chat::Retry::TimedOut  { $seen = 'timed-out' }
+				when X::LLM::Chat::Retry::Exhausted { $seen = 'exhausted' }
+			}
+			$ex.throw;
+		}
+		$seen;
+	}
+	is classify(X::LLM::Chat::Retry::Truncated.new(summary => 's')),
+		'truncated', 'Truncated reaches its own arm';
+	is classify(X::LLM::Chat::Retry::TimedOut.new(summary => 's')),
+		'timed-out', 'TimedOut reaches its own arm';
+	is classify(X::LLM::Chat::Retry::Exhausted.new(summary => 's')),
+		'exhausted', 'the base lands on the base arm';
+	is classify(X::LLM::Chat::Retry::Cancelled.new),
+		'cancelled', 'and a cancel is caught separately';
+};
+
+subtest 'a bare Exhausted handler still catches every chain failure' => {
+	plan 3;
+	# The backwards-compatibility promise: code that never heard of the
+	# subclasses keeps working.
+	for X::LLM::Chat::Retry::Exhausted, X::LLM::Chat::Retry::Truncated,
+		X::LLM::Chat::Retry::TimedOut -> $type
+	{
+		my $caught = False;
+		{
+			CATCH {
+				when X::LLM::Chat::Retry::Exhausted { $caught = True }
+			}
+			$type.new(summary => 'boom').throw;
+		}
+		ok $caught, "{$type.^name} is caught by a bare Exhausted arm";
+	}
+};

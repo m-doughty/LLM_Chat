@@ -1,0 +1,291 @@
+use Test;
+use lib 'lib', 't/lib';
+
+use ChatTestKit;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::OpenRouter;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+
+use Cro::HTTP::Client;
+use Cro::HTTP::Router;
+use Cro::HTTP::Server;
+use JSON::Fast;
+
+# Response-body decoding, against a real HTTP server.
+#
+# Cro's Cro::HTTP::Message.body-text-encoding returns the LIST
+# ('utf-8', 'latin-1') whenever the Content-Type names no charset, and
+# Cro::MessageWithBody.body-text loops that list with no `last` — so the
+# latin-1 attempt, which cannot fail whatever the bytes are, always
+# overwrites the correct utf-8 decode. Plenty of OpenAI-compatible
+# servers answer `Content-Type: application/json` with no charset, and
+# model output is full of non-ASCII, so anything routed through
+# body-text came back as mojibake: café -> cafÃ©.
+#
+# LLM::Chat now decodes response bytes itself (_blob-text / _body-text /
+# _decode-json-body on OpenAICommon). This file pins that down end to
+# end: every fixture route below answers charset-less bytes, and every
+# assertion is that the text survived the round trip byte for byte.
+#
+# The SSE streaming paths are deliberately not covered here — they never
+# went through body-text, decoding each body-byte-stream chunk as utf-8
+# themselves. t/15-streaming-resilience.rakutest owns that path.
+
+plan 9;
+
+# Non-ASCII from every corner that bites a latin-1 decode: 2-byte
+# accented latin, 3-byte symbol, 3-byte CJK, curly punctuation, and a
+# 4-byte astral-plane emoji.
+constant SAMPLE   = "café ✓ 日本語 — “quoted” 🎲";
+constant PROVIDER = "Ünïcødé Provider ✓";
+constant OOPS     = "clé d'API refusée — 日本語";
+
+sub json-blob(%payload --> Blob) {
+    to-json(%payload, :!pretty).encode('utf-8');
+}
+
+# === The fixture server ===
+#
+# Every route answers bytes with a Content-Type carrying NO charset
+# parameter — the shape that trips Cro's fallback. The path prefix
+# selects the behaviour under test, because the backends build their
+# URLs as "$api_url/chat/completions" and friends.
+
+my $app = route {
+    # ChatTestKit's boot() proves the listener on the port it picked is
+    # ours and not some other process's.
+    get -> 'ping' { content 'text/plain', 'pong' }
+
+    # Well-behaved server: JSON labelled application/json, no charset.
+    post -> 'v1', 'chat', 'completions' {
+        content 'application/json', json-blob({
+            id      => 'gen-test-1',
+            model   => 'test/model',
+            # Trailing comma is load-bearing: `[ %h ]` hits the single-arg
+            # rule and flattens the Hash into one array element per Pair.
+            choices => [ { message => { content => SAMPLE }, finish_reason => 'stop' }, ],
+            usage   => { prompt_tokens => 11, completion_tokens => 22, total_tokens => 33 },
+        });
+    }
+
+    post -> 'v1', 'completions' {
+        content 'application/json', json-blob({
+            id      => 'gen-test-2',
+            choices => [ { text => SAMPLE, finish_reason => 'stop' }, ],
+        });
+    }
+
+    # OpenRouter's post-completion metadata lookup.
+    get -> 'v1', 'generation' {
+        content 'application/json', json-blob({
+            data => {
+                total_cost        => 0.0042,
+                provider_name     => PROVIDER,
+                tokens_prompt     => 11,
+                tokens_completion => 22,
+            },
+        });
+    }
+
+    # Server that mislabels its JSON. Pre-fix this reached Cro's
+    # TextFallback body parser, which both mojibakes the text and hands
+    # back a Str where the completion path indexes a Hash.
+    post -> 'plain', 'chat', 'completions' {
+        content 'text/plain', json-blob({
+            # Trailing comma is load-bearing: `[ %h ]` hits the single-arg
+            # rule and flattens the Hash into one array element per Pair.
+            choices => [ { message => { content => SAMPLE }, finish_reason => 'stop' }, ],
+        });
+    }
+
+    # Rejection with a JSON error body, the shape !log-error-body reads.
+    post -> 'boom', 'chat', 'completions' {
+        response.status = 401;
+        content 'application/json', json-blob({
+            error => { message => OOPS, code => 'invalid_api_key' },
+        });
+    }
+
+    # Well-formed HTTP, malformed payload.
+    post -> 'junk', 'chat', 'completions' {
+        content 'application/json', "this is not JSON — café".encode('utf-8');
+    }
+};
+
+my ($server, $port) = boot($app);
+LEAVE { try $server.stop with $server }
+
+sub base(Str:D $prefix = 'v1' --> Str:D) { "http://127.0.0.1:$port/$prefix" }
+
+sub make-backend(Str:D $prefix = 'v1', :$class = LLM::Chat::Backend::OpenAICommon) {
+    $class.new(
+        api_url  => base($prefix),
+        api_key  => 'test-key',
+        model    => 'test/model',
+        settings => LLM::Chat::Backend::Settings.new,
+        template => LLM::Chat::Template::ChatML.new,
+    );
+}
+
+my @messages = LLM::Chat::Conversation::Message.new(:role<user>, :content('Bonjour ?'));
+
+# === 1-2: the decode helper in isolation ===
+
+subtest 'decodes UTF-8 bytes' => {
+    plan 3;
+    my $backend = make-backend;
+
+    is $backend._blob-text(SAMPLE.encode('utf-8')), SAMPLE,
+        'multi-byte UTF-8 survives the round trip';
+    is $backend._blob-text("plain ascii".encode('utf-8')), 'plain ascii',
+        'ASCII is unchanged';
+    is $backend._blob-text(SAMPLE.encode('utf-8')).chars, SAMPLE.chars,
+        'no latin-1 expansion into one character per byte';
+}
+
+subtest 'decode failure paths' => {
+    plan 4;
+    my $backend = make-backend;
+
+    # 0xE9 alone is 'é' in latin-1 and an invalid UTF-8 lead byte, so it
+    # can only come back via the fallback.
+    is $backend._blob-text(Blob.new(0xE9, 0x21)), "é!",
+        'undecodable UTF-8 falls back to latin-1';
+    is $backend._blob-text(Blob.new), '',
+        'an empty body reads as the empty string';
+    is $backend._blob-text(Blob), '',
+        'an undefined body reads as the empty string';
+    is $backend._body-text(Nil), '',
+        'an unreadable message reads as the empty string rather than throwing';
+}
+
+# === 3: the fixture's own premise ===
+
+subtest 'the fixture really does omit the charset' => {
+    plan 2;
+
+    # If this ever stops holding, every round-trip assertion below goes
+    # vacuous: Cro's body-text is correct when a charset is declared.
+    my $res = timed(
+        Cro::HTTP::Client.new(:!persistent, :http<1.1>).post(
+            base() ~ '/chat/completions',
+            content-type => 'application/json',
+            body         => '{}',
+        ),
+        'the charset probe',
+    ).result;
+
+    my $type = $res.header('content-type') // '';
+    like $type, /^ 'application/json' /, 'served as application/json';
+    unlike $type, /:i 'charset'/, 'with no charset parameter';
+}
+
+# === 4-6: the blocking completion paths ===
+
+subtest 'chat-completion round-trips non-ASCII content' => {
+    plan 4;
+    my $backend  = make-backend;
+    my $response = settled($backend.chat-completion(@messages), 'chat-completion');
+
+    ok $response.is-done,    'call completed';
+    ok $response.is-success, 'call succeeded';
+    is $response.msg, SAMPLE, 'content survived the round trip byte for byte';
+    is $response.prompt-tokens, 11, 'usage still lifted off the decoded body';
+}
+
+subtest 'chat-completion survives JSON mislabelled as text/plain' => {
+    plan 3;
+    # Pre-fix this went through Cro's parser selector, landed on
+    # TextFallback, and produced a mojibaked Str that the completion
+    # path then indexed as a Hash. Decoding the bytes ourselves makes
+    # the parse depend on the payload rather than on a header.
+    my $backend  = make-backend('plain');
+    my $response = settled($backend.chat-completion(@messages), 'mislabelled chat-completion');
+
+    ok $response.is-done,    'call completed';
+    ok $response.is-success, 'a lying Content-Type did not fail the call';
+    is $response.msg, SAMPLE, 'content survived the round trip byte for byte';
+}
+
+subtest 'text-completion round-trips non-ASCII content' => {
+    plan 3;
+    my $backend  = make-backend;
+    my $response = settled($backend.text-completion(@messages), 'text-completion');
+
+    ok $response.is-done,    'call completed';
+    ok $response.is-success, 'call succeeded';
+    is $response.msg, SAMPLE, 'content survived the round trip byte for byte';
+}
+
+# === 7: OpenRouter's /generation metadata lookup ===
+
+subtest 'OpenRouter generation lookup round-trips non-ASCII metadata' => {
+    plan 4;
+    my $backend  = make-backend(:class(LLM::Chat::Backend::OpenRouter));
+    my $response = settled($backend.chat-completion(@messages), 'OpenRouter chat-completion');
+
+    ok $response.is-success, 'call succeeded';
+    is $response.msg, SAMPLE, 'completion content survived the round trip';
+    is $response.provider-name, PROVIDER,
+        'provider name from /generation survived the round trip';
+    is-approx $response.cost, 0.0042, 'cost still lifted off the decoded body';
+}
+
+# === 8-9: failure paths ===
+
+subtest 'error bodies decode as UTF-8' => {
+    plan 6;
+    my $backend = make-backend('boom');
+    my $err;
+
+    try {
+        await Cro::HTTP::Client.new(:!persistent, :http<1.1>).post(
+            base('boom') ~ '/chat/completions',
+            content-type => 'application/json',
+            body         => '{}',
+        );
+        CATCH { default { $err = $_ } }
+    }
+
+    ok $err.defined, 'the fixture rejected the call';
+    my $text = $backend._body-text($err.response);
+    ok $text.contains(OOPS), 'the error message survived the round trip';
+    ok $text.contains('invalid_api_key'), 'the rest of the error body came through too';
+
+    # And now the real production path: a rejected call writes the
+    # response body to LLM::Chat::Debug, which is where an operator
+    # actually reads it. This is the read that used Cro's body-text.
+    my $log = $*TMPDIR.add("llm-chat-body-encoding-{$*PID}-{(^1_000_000).pick}.log");
+    my ($response, $logged);
+    {
+        # %*ENV is process-wide, so this reaches the backend's start
+        # block on its own thread. Scoped tightly and removed again so
+        # nothing else in the file logs.
+        %*ENV<LLM_CHAT_DEBUG> = $log.absolute;
+        LEAVE { %*ENV<LLM_CHAT_DEBUG>:delete }
+
+        $response = settled($backend.chat-completion(@messages), 'rejected chat-completion');
+        $logged   = $log.e ?? $log.slurp(:enc<utf8>) !! '';
+    }
+    try $log.unlink;
+
+    is $response.error-class, 'http', 'reading the error body did not disturb classification';
+    is $response.error-status, 401, 'the status came through';
+    ok $logged.contains(OOPS),
+        'the logged error body is readable text, not latin-1 mojibake';
+}
+
+subtest 'a malformed body quits the response instead of crashing' => {
+    plan 3;
+    my $backend  = make-backend('junk');
+    my $response = settled($backend.chat-completion(@messages), 'malformed chat-completion');
+
+    ok $response.is-done,       'call completed';
+    nok $response.is-success,   'call did not report success';
+    is $response.error-class, 'unknown',
+        'a parse failure is classified, not leaked out of the tap';
+}
+
+done-testing;

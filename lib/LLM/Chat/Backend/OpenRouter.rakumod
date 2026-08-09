@@ -255,7 +255,7 @@ method !fetch-generation-metadata(LLM::Chat::Backend::Response $response) {
 		timeout      => $.request-timeout;
 
 	my $res  = await $client.get($url, headers => %hdrs);
-	my $data = await $res.body;
+	my $data = self._decode-json-body($res);
 
 	LLM::Chat::Debug.log-json('GENERATION RESPONSE', $data);
 

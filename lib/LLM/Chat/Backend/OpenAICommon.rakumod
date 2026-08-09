@@ -56,6 +56,16 @@ override them:
 
 L<LLM::Chat::Backend::OpenRouter> overrides all of these.
 
+C<_blob-text>, C<_body-text>, C<_decode-json-body> and
+C<_stream-decoder> are also underscore-prefixed, but as shared
+I<internals> rather than override points: they exist so subclasses
+making their own HTTP calls (such as OpenRouter's C</generation>
+lookup) read response bodies the same way the completion paths do. See
+their declarations for why LLM::Chat decodes response bytes itself
+instead of using Cro's C<body-text> / C<await .body>, and why a
+streamed body needs an incremental decoder rather than a
+C<.decode> per chunk.
+
 C<!classify-exception> stays private — it's pure Raku/Cro mapping
 with no provider-specific behaviour.
 
@@ -98,6 +108,89 @@ method _request-timeout(--> Hash) {
 	%!request-timeout.Hash;
 }
 
+#|( Decode response bytes as text ourselves rather than letting Cro
+    do it.
+
+    Cro asks C<body-text-encoding> for an encoding, and when the
+    Content-Type names no charset that method returns the LIST
+    C<('utf-8', 'latin-1')> (Cro::HTTP::Message). C<body-text> in
+    Cro::MessageWithBody then loops over that list with no C<last>, so
+    the latin-1 attempt — which cannot fail, whatever the bytes are —
+    always overwrites the successful utf-8 decode. Plenty of
+    OpenAI-compatible servers answer C<Content-Type: application/json>
+    with no charset parameter, and model output is full of non-ASCII
+    (names, curly quotes, emoji, CJK), so every one of those responses
+    came back as mojibake: café -> cafÃ©.
+
+    JSON is UTF-8 by definition (RFC 8259 §8.1), so utf-8 is the only
+    correct reading of a JSON body. latin-1 survives only as a
+    fallback for the non-JSON page a proxy sitting in front of the API
+    might answer with, and is reached only when the utf-8 decode
+    throws — never in preference to a decode that worked. )
+method _blob-text($blob --> Str:D) {
+	# Untyped on purpose: C<_body-text>'s caller-side C<try> hands us
+	# Nil when the body could not be drained at all, and this is the
+	# helper that must never be the thing that throws.
+	return '' unless $blob ~~ Blob:D;
+	(try $blob.decode('utf-8')) // (try $blob.decode('latin-1')) // '';
+}
+
+#|( C<_blob-text> over a whole message, for callers that want text and
+    cannot afford to throw. Drains the body stream and decodes it;
+    an already-drained, empty, or undecodable body reads as '', so
+    callers can test C<.chars> without guarding. )
+method _body-text($message --> Str:D) {
+	self._blob-text(try await $message.body-blob);
+}
+
+#|( Parse a JSON response body, decoding the bytes via C<_blob-text>
+    instead of going through C<await $response.body>.
+
+    C<await .body> routes through Cro's response body-parser selector,
+    which reaches the correct parser (Cro::HTTP::BodyParser::JSON,
+    which decodes utf-8 itself) only while the server labels the body
+    C<application/json>. A server that answers JSON as C<text/plain>
+    falls through to TextFallback and its mojibake-producing
+    C<body-text>; one that sends no Content-Type at all falls through
+    to BlobFallback and hands back a Buf that the completion paths
+    would then index as a Hash. Reading the bytes here makes the parse
+    depend on the payload rather than on a header.
+
+    C<await .body-blob> is left to propagate: a connection dropped
+    mid-body must still surface as the transport exception
+    C<!classify-exception> can recognise, not as a JSON parse failure.
+    A malformed body throws from C<from-json>, exactly as
+    C<await .body> did. Both land in the caller's CATCH. )
+method _decode-json-body($message) {
+	from-json(self._blob-text(await $message.body-blob));
+}
+
+#|( A fresh incremental UTF-8 decoder, one per streamed response body.
+
+    The SSE paths cannot use C<_blob-text>: they see the body as a
+    Supply of byte chunks whose boundaries are chosen by TCP, and a
+    multi-byte character (an emoji, a CJK glyph, a curly quote — model
+    output is full of them) is routinely split across two of them.
+    C<$chunk.decode('utf-8')> on the half that ends mid-sequence
+    THROWS, and since the streaming CATCH classifies and quits, that
+    killed the generation mid-flight — intermittently, and only for
+    non-ASCII output.
+
+    An C<Encoding::Decoder> is fed bytes and asked for whatever
+    characters are complete; an unfinished trailing sequence stays
+    inside the decoder until the bytes that finish it arrive. Bytes
+    that are not merely incomplete but genuinely invalid still throw,
+    exactly as C<.decode> did, and land in the caller's CATCH — a body
+    that isn't UTF-8 at all is not a stream we can parse.
+
+    C<:translate-nl(False)> is load-bearing: SSE framing is defined in
+    terms of the line endings on the wire (events end at C<\n\n> or
+    C<\r\n\r\n>), so a decoder that quietly rewrote CRLF to LF would be
+    editing the very bytes the framing reads. )
+method _stream-decoder(--> Encoding::Decoder:D) {
+	Encoding::Registry.find('utf-8').decoder(:translate-nl(False));
+}
+
 #|( Best-effort: when a 4xx response triggers an
     X::Cro::HTTP::Error::Client, fetch the response body and write it
     to LLM::Chat::Debug. OpenAI-compatible APIs (OpenRouter included)
@@ -112,7 +205,7 @@ method _request-timeout(--> Hash) {
 method !log-error-body($exception) {
 	return unless $exception ~~ X::Cro::HTTP::Error::Client;
 	my $status = try { $exception.response.status.Int } // 0;
-	my $body   = try { await $exception.response.body-text };
+	my $body   = try { self._body-text($exception.response) };
 	if $body.defined && $body.chars {
 		LLM::Chat::Debug.log("HTTP $status BODY", $body);
 	}
@@ -302,7 +395,7 @@ method chat-completion(
 			body    => %settings,
 			headers => self._get-api-headers;
 
-		my $data = await $res.body;
+		my $data = self._decode-json-body($res);
 		LLM::Chat::Debug.log-json('RESPONSE BODY (chat-completion)', $data);
 
 		# Usage + routed-model metadata lifted before touching
@@ -400,15 +493,21 @@ method chat-completion-stream(
 			"+{((now - $start-time) * 1000).Int}ms status={$res.status}");
 
 		react {
-			# Buffer SSE bytes across TCP chunk boundaries. SSE events
-			# end with a blank line ("\n\n" / "\r\n\r\n"); a single
-			# `data: {...}` JSON object can be split across multiple
-			# body-byte-stream emissions. Decoding+parsing each chunk
-			# independently (the previous behaviour) caused from-json
-			# to throw on the truncated half whenever a JSON object
-			# straddled a TCP packet, terminating the entire stream.
-			my Bool $first-byte-seen = False;
-			my Str  $buffer = '';
+			# Buffer SSE bytes across TCP chunk boundaries, at two
+			# levels. SSE events end with a blank line ("\n\n" /
+			# "\r\n\r\n"); a single `data: {...}` JSON object can be
+			# split across multiple body-byte-stream emissions, so
+			# $buffer holds an incomplete event back until it is whole
+			# (parsing each emission independently made from-json throw
+			# on the truncated half). The split can just as easily land
+			# inside a multi-byte character, which no amount of
+			# character-level buffering can recover from — the decode
+			# throws before $buffer ever sees the text — so the bytes
+			# go through an incremental decoder that holds the
+			# unfinished sequence itself. See _stream-decoder.
+			my Bool              $first-byte-seen = False;
+			my Str               $buffer          = '';
+			my Encoding::Decoder $decoder         = self._stream-decoder;
 			whenever $res.body-byte-stream -> $data {
 				$response._touch-activity;
 				unless $first-byte-seen {
@@ -416,7 +515,8 @@ method chat-completion-stream(
 					LLM::Chat::Debug.log('FIRST BODY BYTE',
 						"+{((now - $start-time) * 1000).Int}ms bytes={$data.elems}");
 				}
-				$buffer ~= $data.decode('utf-8');
+				$decoder.add-bytes($data);
+				$buffer ~= $decoder.consume-available-chars;
 				my @events = $buffer.split(/\n\n | \r\n\r\n/);
 				$buffer = @events.pop;   # incomplete tail held back
 
@@ -633,7 +733,7 @@ method text-completion(
 			body    => %settings,
 			headers => self._get-api-headers;
 
-		my $data = await $res.body;
+		my $data = self._decode-json-body($res);
 
 		my $msg  = $data<choices>[0]<text>;
 
@@ -698,10 +798,16 @@ method text-completion-stream(
 
 		$response._touch-activity;
 		react {
-			my Str $buffer = '';
+			# Same two-level buffering as chat-completion-stream:
+			# $buffer holds an incomplete SSE event back, the decoder
+			# holds an incomplete UTF-8 sequence back. See
+			# _stream-decoder.
+			my Str               $buffer  = '';
+			my Encoding::Decoder $decoder = self._stream-decoder;
 			whenever $res.body-byte-stream -> $data {
 				$response._touch-activity;
-				$buffer ~= $data.decode('utf-8');
+				$decoder.add-bytes($data);
+				$buffer ~= $decoder.consume-available-chars;
 				my @events = $buffer.split(/\n\n | \r\n\r\n/);
 				$buffer = @events.pop;
 

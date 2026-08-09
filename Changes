@@ -2,6 +2,89 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.8.0  2026-08-09T19:41:06+01:00
+    - [2026-08-09] New C<LLM::Chat::Retry> and
+      C<LLM::Chat::Retry::Exceptions>: the retry/fallback policy that
+      has run inside C<LLM::Data::Inference::Task> since 0.5, factored
+      out so a second executor can share it instead of copying it.
+      C<LLM::Chat::Retry> exports five pure subs — C<classify-error>
+      (the abort / retry-same / advance bucket table),
+      C<retry-backoff> (C<min(2 ** (n - 1) + jitter, cap)>, with the
+      anti-thundering-herd jitter suppressible via C<:jitter(0e0)> for
+      deterministic tests), C<sleep-with-cancel> (chunked sleep that
+      consults a cancel hook before EVERY chunk including the first,
+      and returns a Bool rather than throwing, because only the caller
+      knows which exception type its layer promises),
+      C<attempt-record> and C<telemetry-payload> (which duck-types the
+      response with C<.?> and therefore does not import
+      C<LLM::Chat::Backend::Response>).
+      C<LLM::Chat::Retry::Exceptions> provides
+      C<X::LLM::Chat::Retry::Exhausted> and its C<Truncated> /
+      C<TimedOut> subclasses plus C<Cancelled> (deliberately NOT an
+      C<Exhausted>, so a user cancel can never be swallowed by a
+      dead-letter handler), and is now the canonical home of the
+      C<item-retryable> advice contract. Those four are plain global
+      classes rather than C<is export>ed ones on purpose: C<is export>
+      on a nested-name class also exports its LEAF name, so two
+      modules declaring an C<X::Something::Exhausted> cannot be
+      imported into the same scope at all — which would have made the
+      shared hierarchy unusable next to a subclassing one.
+      Deliberately NOT shared: the
+      retry loop itself, the abort bucket's C<die> message, hook
+      payloads and hook shielding — those are shaped by the layer that
+      owns them. B<No existing module changed>: this release is purely
+      additive, every previous test file is untouched, and
+      C<LLM::Data::Inference> 0.9.0 migrates onto it (its exception
+      types become subclasses of these, so both hierarchies keep
+      matching).
+    - [2026-08-08] Fix: a streamed completion could be KILLED MID-
+      GENERATION by non-ASCII output. Both SSE loops in OpenAICommon
+      (C<chat-completion-stream> and C<text-completion-stream>) did
+      C<$buffer ~= $data.decode('utf-8')> per body-byte-stream chunk,
+      but TCP splits a body wherever it likes — including through the
+      middle of a multi-byte UTF-8 sequence. C<.decode> on the half
+      that ends mid-sequence throws "Malformed termination of UTF-8
+      string", which landed in the streaming CATCH and quit the
+      Response with error class 'unknown', discarding everything
+      generated so far. Buffering text could not fix it: the throw
+      happened before the text reached the buffer. The bytes now go
+      through an incremental C<Encoding::Decoder> (new shared internal
+      C<_stream-decoder>, C<:translate-nl(False)> so SSE framing still
+      sees the line endings that are actually on the wire), which
+      keeps an unfinished sequence to itself until the bytes
+      completing it arrive. Framing, heartbeat skipping, C<[DONE]>
+      handling, malformed-chunk tolerance and reasoning/content
+      accumulation are untouched. Emoji, CJK and curly quotes are
+      ordinary in model output, so this was an intermittent
+      production crash for anything but plain ASCII.
+    - [2026-08-08] Fix: non-ASCII in a response body could come back as
+      mojibake (café -> cafÃ©). Cro's C<body-text-encoding> returns the
+      LIST C<('utf-8', 'latin-1')> whenever the Content-Type names no
+      charset, and C<Cro::MessageWithBody.body-text> loops that list
+      with no C<last> — so the latin-1 attempt, which cannot fail
+      whatever the bytes are, always overwrote the correct utf-8
+      decode. Many OpenAI-compatible servers answer
+      C<Content-Type: application/json> with no charset parameter, and
+      model output is full of non-ASCII (names, curly quotes, emoji,
+      CJK). OpenAICommon now decodes response bytes itself via new
+      internals C<_blob-text> / C<_body-text> / C<_decode-json-body>:
+      utf-8 first (JSON is UTF-8 by definition, RFC 8259 §8.1), with
+      latin-1 kept only as a fallback for when the utf-8 decode
+      actually throws — a proxy's non-JSON error page, say. Affected
+      the 4xx error-body read that feeds LLM::Chat::Debug, which is
+      where an operator reads a rejection reason.
+    - [2026-08-08] The blocking C<chat-completion> / C<text-completion>
+      paths and OpenRouter's C</generation> metadata lookup now parse
+      their JSON from the raw bytes instead of C<await $res.body>.
+      Cro's response body-parser selector reaches the correct parser
+      only while the server labels the body C<application/json>; a
+      server that answers JSON as C<text/plain> fell through to
+      TextFallback and produced a mojibaked Str, which the completion
+      path then indexed as a Hash and SILENTLY emitted as empty
+      content. Well-behaved servers see no change. Transport failures
+      still propagate as transport exceptions, so error classification
+      is unchanged.
+
 0.7.1  2026-07-27T15:27:39+01:00
     - [2026-07-27] LLM::Chat::Backend::Mock gains
       C<&.finish-reason-producer>, an optional

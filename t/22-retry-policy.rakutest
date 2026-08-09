@@ -1,0 +1,341 @@
+use Test;
+use lib 'lib';
+use LLM::Chat::Retry;
+
+plan 23;
+
+# --- classify-error ---------------------------------------------------
+
+subtest 'classify-error: 4xx config/account codes abort' => {
+	plan 5;
+	for 400, 401, 402, 403, 404 -> $s {
+		is classify-error(error-class => 'http', error-status => $s),
+		   'abort', "HTTP $s → abort";
+	}
+};
+
+subtest 'classify-error: 429 + timeout + response + parser → advance' => {
+	plan 4;
+	is classify-error(error-class => 'http', error-status => 429),
+	   'advance', '429 → advance';
+	is classify-error(error-class => 'timeout'),
+	   'advance', 'timeout → advance';
+	is classify-error(error-class => 'response'),
+	   'advance', 'response (malformed/empty/quit) → advance';
+	is classify-error(parser-failed => True),
+	   'advance', 'parser-failed → advance';
+};
+
+subtest 'classify-error: 5xx + connection + unknown → retry-same' => {
+	plan 5;
+	is classify-error(error-class => 'http', error-status => 500),
+	   'retry-same', '500 → retry-same';
+	is classify-error(error-class => 'http', error-status => 503),
+	   'retry-same', '503 → retry-same';
+	is classify-error(error-class => 'http', error-status => 599),
+	   'retry-same', '599 → retry-same';
+	is classify-error(error-class => 'connection'),
+	   'retry-same', 'connection → retry-same';
+	is classify-error(error-class => 'unknown'),
+	   'retry-same', 'unknown → retry-same';
+};
+
+subtest 'classify-error: unlisted http codes advance' => {
+	plan 3;
+	is classify-error(error-class => 'http', error-status => 418),
+	   'advance', "418 (an unlisted 4xx) → advance, not abort";
+	is classify-error(error-class => 'http', error-status => 302),
+	   'advance', '302 → advance';
+	is classify-error(error-class => 'http'),
+	   'advance', 'http with no status at all → advance';
+};
+
+subtest 'classify-error: an absent error-class is retry-same' => {
+	plan 3;
+	is classify-error(), 'retry-same',
+	   'no arguments at all → retry-same (the conservative default)';
+	is classify-error(error-class => Str), 'retry-same',
+	   'an explicitly undefined class behaves like an absent one';
+	is classify-error(error-class => 'weird-new-class'), 'retry-same',
+	   'a class this version has never heard of → retry-same';
+};
+
+subtest 'classify-error: parser-failed outranks every class' => {
+	plan 4;
+	# The transport succeeded; what came back was unusable. That must
+	# never be spent out of the transient-retry budget, whatever the
+	# (stale) error fields say.
+	is classify-error(:parser-failed, error-class => 'http', error-status => 401),
+	   'advance', 'parser-failed beats an abort-class 401';
+	is classify-error(:parser-failed, error-class => 'http', error-status => 500),
+	   'advance', 'parser-failed beats a retry-same 500';
+	is classify-error(:parser-failed, error-class => 'connection'),
+	   'advance', 'parser-failed beats connection';
+	is classify-error(parser-failed => False, error-class => 'connection'),
+	   'retry-same', 'parser-failed => False leaves classification alone';
+};
+
+# --- retry-backoff ----------------------------------------------------
+
+subtest 'retry-backoff: exact exponential with jitter suppressed' => {
+	plan 5;
+	my @expected = 1e0, 2e0, 4e0, 8e0, 16e0;
+	for @expected.kv -> $idx, $want {
+		my $n = $idx + 1;
+		is-approx retry-backoff($n, jitter => 0e0), $want, 1e-9,
+			"retry-n $n → {$want}s";
+	}
+};
+
+subtest 'retry-backoff: default jitter stays inside [0, 0.5)' => {
+	plan 3;
+	my @draws = (^50).map({ retry-backoff(1) });
+	is @draws.grep({ $_ < 1e0 }).elems, 0,
+		'every draw is at least the un-jittered 1s';
+	is @draws.grep({ $_ >= 1.5e0 }).elems, 0,
+		'every draw is below base + 0.5s';
+	# 50 draws colliding on one value would mean the jitter is dead,
+	# which is the actual bug this guards (thundering-herd retries).
+	ok @draws.unique.elems > 1, 'the draws actually vary';
+};
+
+subtest 'retry-backoff: caps' => {
+	plan 5;
+	is-approx retry-backoff(6, jitter => 0e0), 30e0, 1e-9,
+		'retry-n 6 (32s raw) is capped at 30s';
+	is-approx retry-backoff(20, jitter => 0e0), 30e0, 1e-9,
+		'a runaway retry-n stays at the cap';
+	is-approx retry-backoff(3, jitter => 0e0, cap => 2e0), 2e0, 1e-9,
+		'an explicit lower :cap wins';
+	is-approx retry-backoff(3, jitter => 0e0, cap => 100e0), 4e0, 1e-9,
+		'a higher :cap leaves an uncapped value alone';
+	ok retry-backoff(6) <= 30e0, 'the cap bounds the jittered value too';
+};
+
+subtest 'retry-backoff: coercions and the guard on retry-n' => {
+	plan 4;
+	is-approx retry-backoff(2, jitter => 0, cap => 30), 2e0, 1e-9,
+		'Int :jitter / :cap coerce to Num';
+	is-approx retry-backoff(2, jitter => 1/4), 2.25e0, 1e-9,
+		'a Rat :jitter coerces too';
+	isa-ok retry-backoff(1, jitter => 0e0), Num, 'returns a Num';
+	dies-ok { retry-backoff(0) }, 'retry-n 0 is rejected (it is 1-based)';
+};
+
+# --- sleep-with-cancel ------------------------------------------------
+
+subtest 'sleep-with-cancel: serves the full duration and returns True' => {
+	plan 3;
+	my $t0 = now;
+	my $ok = sleep-with-cancel(0.4e0, chunk => 0.1e0);
+	my $elapsed = now - $t0;
+	ok $ok, 'returns True when nothing cancelled it';
+	ok $elapsed >= 0.4, "slept at least the requested 0.4s (was {$elapsed})";
+	ok sleep-with-cancel(0.05e0, cancelled => -> { False }),
+		'a hook that never fires is equivalent to no hook';
+};
+
+subtest 'sleep-with-cancel: a cancel before the first chunk returns at once' => {
+	plan 3;
+	my Int $calls = 0;
+	my $t0 = now;
+	my $ok = sleep-with-cancel(10e0, cancelled => -> { $calls++; True });
+	my $elapsed = now - $t0;
+	nok $ok, 'returns False';
+	is $calls, 1, 'the hook was consulted exactly once — before any sleep';
+	# The point of the chunking: a 10s backoff must not be sat out.
+	ok $elapsed < 2, "returned promptly ({$elapsed}s), not after 10s";
+};
+
+subtest 'sleep-with-cancel: a mid-sleep flip is noticed within one chunk' => {
+	plan 3;
+	my Int $calls = 0;
+	my $t0 = now;
+	my $ok = sleep-with-cancel(
+		10e0,
+		chunk     => 0.1e0,
+		cancelled => -> { ++$calls >= 3 },
+	);
+	my $elapsed = now - $t0;
+	nok $ok, 'returns False once the flag flips';
+	is $calls, 3, 'stopped on the third consultation';
+	ok $elapsed < 5, "stopped early ({$elapsed}s) instead of serving 10s";
+};
+
+subtest 'sleep-with-cancel: the final chunk is the fractional remainder' => {
+	plan 2;
+	# 0.55s in 0.25s chunks is 0.25 + 0.25 + 0.05 — three consultations,
+	# never four, and never an overshoot past the requested duration.
+	my Int $calls = 0;
+	my $t0 = now;
+	my $ok = sleep-with-cancel(
+		0.55e0, chunk => 0.25e0, cancelled => -> { $calls++; False },
+	);
+	ok $ok, 'completed';
+	is $calls, 3, 'exactly ceil(0.55 / 0.25) chunks were taken';
+};
+
+subtest 'sleep-with-cancel: degenerate durations' => {
+	plan 4;
+	my Int $calls = 0;
+	ok sleep-with-cancel(0e0, cancelled => -> { $calls++; True }),
+		'zero seconds returns True without sleeping';
+	is $calls, 0, '...and without consulting the hook at all';
+	my $t0 = now;
+	ok sleep-with-cancel(-5e0), 'a negative duration returns True';
+	ok now - $t0 < 1, 'and does not sleep (least of all backwards)';
+};
+
+subtest 'sleep-with-cancel: a throwing hook propagates' => {
+	plan 2;
+	# Deliberate: the hook is the caller's code, and swallowing its
+	# exception would silently mean "this run can never be cancelled".
+	throws-like { sleep-with-cancel(1e0, cancelled => -> { die 'hook is broken' }) },
+		Exception, message => /'hook is broken'/,
+		'the exception reaches the caller';
+	ok sleep-with-cancel(0.05e0), 'the module is still usable afterwards';
+};
+
+# --- attempt-record ---------------------------------------------------
+
+subtest 'attempt-record: raw-text is absent, not undefined' => {
+	plan 6;
+	my %bare = attempt-record(
+		backend-index => 2, model => 'gpt-4o', error => 'boom',
+	);
+	is %bare<backend-index>, 2, 'backend-index kept';
+	is %bare<model>, 'gpt-4o', 'model kept';
+	is %bare<error>, 'boom', 'error kept';
+	nok %bare<raw-text>:exists,
+		'no :raw-text ⇒ the key is ABSENT (a network failure has no body)';
+	is %bare.keys.sort.join(','), 'backend-index,error,model',
+		'and nothing else was invented';
+
+	my %with = attempt-record(
+		backend-index => 0, model => 'm', error => 'parser: bad json',
+		raw-text => '{"a": 1',
+	);
+	is %with<raw-text>, '{"a": 1', 'a passed raw-text is kept verbatim';
+};
+
+subtest 'attempt-record: an empty raw-text is still present' => {
+	plan 2;
+	my %rec = attempt-record(
+		backend-index => 0, model => 'm', error => 'truncated', raw-text => '',
+	);
+	ok %rec<raw-text>:exists, 'an empty string is a real answer, not an absence';
+	is %rec<raw-text>, '', 'and it round-trips';
+};
+
+# --- telemetry-payload ------------------------------------------------
+
+# Duck-typed stand-ins: telemetry-payload must never require a real
+# LLM::Chat::Backend::Response (it does not even import one).
+class UsageOnlyResponse {
+	has $.prompt-tokens     = 11;
+	has $.completion-tokens = 22;
+	has $.total-tokens      = 33;
+	has $.model-used        = 'routed/model';
+	has $.finish-reason     = 'stop';
+}
+
+class ExtrasResponse is UsageOnlyResponse {
+	has $.cost          = 0.0042;
+	has $.generation-id = 'gen-123';
+	has $.provider-name = 'Together';
+	has $.is-byok       = False;
+}
+
+class SilentResponse {
+	has $.prompt-tokens;      # defined accessor, undefined value
+	has $.finish-reason;
+}
+
+subtest 'telemetry-payload: the always-present keys' => {
+	plan 10;
+	my %p = telemetry-payload(
+		attempt => 3, backend-index => 1, model-name => 'mock',
+		latency-ms => 120, success => False, error => 'LLM call failed: nope',
+		error-class => 'http', error-status => 503,
+	);
+	is %p<attempt>, 3, 'attempt';
+	is %p<backend-index>, 1, 'backend-index';
+	is %p<model-name>, 'mock', 'model-name';
+	is %p<latency-ms>, 120, 'latency-ms';
+	is %p<success>, False, 'success';
+	is %p<stage>, 'network', 'stage defaults to network';
+	is %p<error>, 'LLM call failed: nope', 'error';
+	is %p<error-class>, 'http', 'error-class';
+	is %p<error-status>, 503, 'error-status';
+	is %p.keys.elems, 9, 'no response ⇒ no response-derived keys at all';
+};
+
+subtest 'telemetry-payload: undefined-but-present error fields' => {
+	plan 6;
+	my %p = telemetry-payload(
+		attempt => 1, backend-index => 0, model-name => 'mock',
+		latency-ms => 4, success => True,
+	);
+	ok %p<error>:exists, 'error key is present on the success path';
+	nok %p<error>.defined, '...but undefined';
+	ok %p<error-class>:exists && !%p<error-class>.defined, 'error-class ditto';
+	ok %p<error-status>:exists && !%p<error-status>.defined, 'error-status ditto';
+	is %p<success>, True, 'success is the Bool that was passed';
+	my %empty = telemetry-payload(
+		attempt => 1, backend-index => 0, model-name => 'm', error => '',
+	);
+	nok %empty<error>.defined,
+		'an empty-string error is normalised to an undefined Str';
+};
+
+subtest 'telemetry-payload: response-derived keys are presence-gated' => {
+	plan 14;
+	my %usage = telemetry-payload(
+		attempt => 1, backend-index => 0, model-name => 'm',
+		latency-ms => 9, success => True, response => UsageOnlyResponse.new,
+	);
+	is %usage<prompt-tokens>, 11, 'prompt-tokens lifted';
+	is %usage<completion-tokens>, 22, 'completion-tokens lifted';
+	is %usage<total-tokens>, 33, 'total-tokens lifted';
+	is %usage<model-used>, 'routed/model', 'model-used lifted';
+	is %usage<finish-reason>, 'stop', 'finish-reason lifted';
+	nok %usage<cost>:exists,
+		'a Response without .cost contributes no cost key';
+	nok %usage<generation-id>:exists, 'nor generation-id';
+	nok %usage<provider-name>:exists, 'nor provider-name';
+	nok %usage<is-byok>:exists, 'nor is-byok';
+
+	my %extras = telemetry-payload(
+		attempt => 1, backend-index => 0, model-name => 'm',
+		latency-ms => 9, success => True, response => ExtrasResponse.new,
+	);
+	is-approx %extras<cost>, 0.0042, 1e-9, 'cost lifted off an OpenRouter-ish Response';
+	is %extras<generation-id>, 'gen-123', 'generation-id lifted';
+	is %extras<provider-name>, 'Together', 'provider-name lifted';
+	# False is a value, not an absence — the gate is .defined, not truth.
+	is %extras<is-byok>, False, 'is-byok False is still reported';
+	ok %extras<is-byok>:exists, '...and its key exists';
+};
+
+subtest 'telemetry-payload: undefined accessors contribute nothing' => {
+	plan 3;
+	my %p = telemetry-payload(
+		attempt => 1, backend-index => 0, model-name => 'm',
+		response => SilentResponse.new,
+	);
+	nok %p<prompt-tokens>:exists,
+		'an accessor that exists but is undefined stays out of the payload';
+	nok %p<finish-reason>:exists, 'ditto finish-reason';
+	is %p.keys.elems, 9, 'so the payload is exactly the always-present set';
+};
+
+subtest 'telemetry-payload: :stage overrides the default' => {
+	plan 2;
+	my %p = telemetry-payload(
+		attempt => 1, backend-index => 0, model-name => 'm',
+		stage => 'compaction',
+	);
+	is %p<stage>, 'compaction', 'a caller-supplied stage is kept';
+	dies-ok { telemetry-payload(backend-index => 0, model-name => 'm') },
+		'the required keys really are required';
+};

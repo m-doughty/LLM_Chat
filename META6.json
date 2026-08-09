@@ -32,6 +32,8 @@
     "LLM::Chat::Conversation": "lib/LLM/Chat/Conversation.rakumod",
     "LLM::Chat::Conversation::Message": "lib/LLM/Chat/Conversation/Message.rakumod",
     "LLM::Chat::Debug": "lib/LLM/Chat/Debug.rakumod",
+    "LLM::Chat::Retry": "lib/LLM/Chat/Retry.rakumod",
+    "LLM::Chat::Retry::Exceptions": "lib/LLM/Chat/Retry/Exceptions.rakumod",
     "LLM::Chat::Template": "lib/LLM/Chat/Template.rakumod",
     "LLM::Chat::Template::ChatML": "lib/LLM/Chat/Template/ChatML.rakumod",
     "LLM::Chat::Template::Gemma2": "lib/LLM/Chat/Template/Gemma2.rakumod",
@@ -55,6 +57,8 @@
     "ai"
   ],
   "test-depends": [
+    "Cro::HTTP::Router",
+    "Cro::HTTP::Server"
   ],
-  "version": "0.7.1"
+  "version": "0.8.0"
 }

@@ -195,6 +195,48 @@ say $resp.msg if $resp.is-success;
 
 For KoboldCpp, use the OpenAI-compatible chat endpoint `http://host:5001/v1`. Streaming tool calls arrive as `delta.tool_calls` chunks and are exposed through `.tool-calls` on the response before the loop executes them.
 
+Retry Policy
+------------
+
+`LLM::Chat::Retry` is the shared retry/fallback policy: five pure subs that classify a failure, decide how long to wait, sleep without ignoring a cancel, and build the attempt/telemetry records. Pair it with `LLM::Chat::Retry::Exceptions` for the typed failures a chain throws when it gives up.
+
+```raku
+use LLM::Chat::Retry;
+use LLM::Chat::Retry::Exceptions;
+
+my @attempts;
+my Int $retries-left = 2;
+
+given classify-error(
+    error-class  => $resp.error-class,
+    error-status => $resp.error-status,
+) {
+    when 'abort'      { die "config/account error: {$resp.err}" }
+    when 'retry-same' {
+        my Num $wait = retry-backoff(3 - $retries-left);   # 1s, 2s, 4s ...
+        $retries-left--;
+        # Returns False the moment &cancelled flips — a cancelled run
+        # never sits out a 16-second backoff.
+        last unless sleep-with-cancel($wait, :&cancelled);
+    }
+    default { }   # 'advance' — try the next backend at once
+}
+
+@attempts.push: attempt-record(
+    backend-index => 0, model => $backend.model, error => "{$resp.err}",
+);
+
+X::LLM::Chat::Retry::Exhausted.new(
+    :@attempts, summary => 'all backends exhausted',
+).throw;
+```
+
+Buckets: `'abort'` (HTTP 400/401/402/403/404 — config, account or access errors that repeat identically), `'retry-same'` (5xx, connection drops, anything unclassifiable — usually one upstream provider having a bad minute), `'advance'` (timeout, 429, malformed response, parser failure — model-specific pathologies).
+
+The exception types are `Exhausted`, its subclasses `Truncated` (cut off by `max_tokens`) and `TimedOut` (missed a deadline), and `Cancelled` — which is deliberately **not** an `Exhausted`, so a user pressing Ctrl-C never lands in a dead-letter queue. `Truncated` declares `item-retryable` `False`, the duck-typed advice an orchestration layer reads as `$ex.?item-retryable // True ` before re-running failed work.
+
+[LLM::Data::Inference::Task](https://raku.land/zef:apogee/LLM::Data::Inference) runs on this module, and its own exception types subclass these — so handlers written against either hierarchy match.
+
 Conversation Management
 -----------------------
 
