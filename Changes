@@ -2,6 +2,15 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.8.1  2026-08-09T20:57:18+01:00
+    - META fix: Response::OpenRouter and Response::OpenRouter::Stream were
+      missing from provides and listed under DEPENDS instead. On a machine
+      without install history, zef resolved those module names to the fossil
+      LLM::Chat::Backend 0.2.1 dist, whose exact Digest::SHA256::Native 1.0.0
+      pin only builds with nmake — breaking every fresh Windows install
+      (caught by LLM-Agent's Windows CI lane). No code change; 0.8.0 as
+      published carries the broken META and should not be depended on.
+
 0.8.0  2026-08-09T19:41:06+01:00
     - [2026-08-09] New C<LLM::Chat::Retry> and
       C<LLM::Chat::Retry::Exceptions>: the retry/fallback policy that

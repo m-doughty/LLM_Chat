@@ -9,8 +9,6 @@
     "Cro::HTTP::Client",
     "Digest::SHA256::Native",
     "JSON::Fast",
-    "LLM::Chat::Backend::Response::OpenRouter",
-    "LLM::Chat::Backend::Response::OpenRouter::Stream",
     "Template::Jinja2",
     "Tokenizers",
     "UUID::V4"
@@ -26,7 +24,9 @@
     "LLM::Chat::Backend::OpenAICommon": "lib/LLM/Chat/Backend/OpenAICommon.rakumod",
     "LLM::Chat::Backend::OpenRouter": "lib/LLM/Chat/Backend/OpenRouter.rakumod",
     "LLM::Chat::Backend::Response": "lib/LLM/Chat/Backend/Response.rakumod",
+    "LLM::Chat::Backend::Response::OpenRouter": "lib/LLM/Chat/Backend/Response/OpenRouter.rakumod",
     "LLM::Chat::Backend::Response::OpenRouter::Augment": "lib/LLM/Chat/Backend/Response/OpenRouter.rakumod",
+    "LLM::Chat::Backend::Response::OpenRouter::Stream": "lib/LLM/Chat/Backend/Response/OpenRouter/Stream.rakumod",
     "LLM::Chat::Backend::Response::Stream": "lib/LLM/Chat/Backend/Response/Stream.rakumod",
     "LLM::Chat::Backend::Settings": "lib/LLM/Chat/Backend/Settings.rakumod",
     "LLM::Chat::Conversation": "lib/LLM/Chat/Conversation.rakumod",
@@ -60,5 +60,5 @@
     "Cro::HTTP::Router",
     "Cro::HTTP::Server"
   ],
-  "version": "0.8.0"
+  "version": "0.8.1"
 }
