@@ -5,6 +5,7 @@ use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::OpenRouter;
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Settings;
+use LLM::Chat::Retry;
 
 use Cro::HTTP::Client;
 
@@ -23,36 +24,27 @@ use Cro::HTTP::Client;
 #   * Error classification: only X::Cro::HTTP::Client::Timeout sets
 #     class => 'timeout'. Substring matching on "timeout" / "timed
 #     out" was masking unrelated errors and was removed.
+#   * ...and a Cro timeout is split BY PHASE: a connection-phase one
+#     is 'connection' (transient infra, retry the same backend), while
+#     headers/body-phase ones stay 'timeout' (advance). On a
+#     one-backend chain the old lumping meant one flaky connect
+#     exhausted the chain with zero retries.
 
-plan 4;
+plan 5;
 
-# A minimal subclass that exposes the !classify-exception machinery
+# A minimal subclass that reaches the !classify-exception machinery
 # for direct testing without spinning up a full HTTP stack.
+#
+# `classify` calls THE REAL private method rather than restating it:
+# an earlier version of this file re-implemented the classifier here
+# and could only ever prove that the copy agreed with itself.
 class TestBackend is LLM::Chat::Backend::OpenRouter {
+    # NB one line: a leading-dot continuation of a `.^` metamethod call
+    # is a "malformed postfix call" at compile time.
+    my $CLASSIFY = LLM::Chat::Backend::OpenAICommon.^find_private_method('classify-exception');
+
     method classify($exception, $response) {
-        # Indirect call through the public chat-completion path is
-        # too heavy for a unit test; we proxy by re-implementing the
-        # public surface of !classify-exception. Kept tight so we
-        # detect drift between this stub and the real classifier.
-        given $exception {
-            when X::Cro::HTTP::Error {
-                my $status = try { .response.status.Int };
-                $response._set-error-info(class => 'http', status => $status);
-            }
-            when X::Cro::HTTP::Client::Timeout {
-                $response._set-error-info(class => 'timeout');
-            }
-            default {
-                my $msg = (.message // '').lc;
-                if $msg ~~ / :i [ 'connection' | 'refused' | 'reset'
-                                | 'unreachable' | 'could not' \s+ 'resolve'
-                                | 'dns' | 'network is' | 'no route' ] / {
-                    $response._set-error-info(class => 'connection');
-                } else {
-                    $response._set-error-info(class => 'unknown');
-                }
-            }
-        }
+        $CLASSIFY(self, $exception, $response);
     }
 }
 
@@ -218,4 +210,44 @@ subtest 'Error classification only treats X::Cro::HTTP::Client::Timeout as timeo
     );
     is $r5.error-class, 'timeout',
         'X::Cro::HTTP::Client::Timeout → timeout';
+};
+
+subtest 'a Cro timeout is classified by the PHASE it expired in' => {
+    plan 4;
+
+    my $b = make-backend();
+
+    # THE FIX. A connection-phase timeout is Cro's 30s connect budget
+    # running out: nothing was sent, the endpoint said nothing, and the
+    # only evidence is a network that was unwell. That is transient
+    # infrastructure — 'connection', the retry-same bucket — and NOT a
+    # property of the backend worth advancing away from. Filing it as
+    # 'timeout' made a one-backend chain die on a single flaky connect
+    # with no retry at all.
+    my $connect = LLM::Chat::Backend::Response.new(id => 'c1');
+    $b.classify(
+        X::Cro::HTTP::Client::Timeout.new(
+            phase => 'connection', uri => 'https://example.com',
+        ),
+        $connect,
+    );
+    is $connect.error-class, 'connection',
+        'a connection-phase timeout is a connection failure, not a timeout';
+    is classify-error(error-class => $connect.error-class), 'retry-same',
+        'and the policy therefore retries the same backend after a backoff';
+
+    # The other side of the split: the endpoint DID accept the
+    # connection and then failed to answer. That is a statement about
+    # this backend, and the next one answers sooner than a backoff ends.
+    for <headers body> -> $phase {
+        my $late = LLM::Chat::Backend::Response.new(id => "l-$phase");
+        $b.classify(
+            X::Cro::HTTP::Client::Timeout.new(
+                :$phase, uri => 'https://example.com',
+            ),
+            $late,
+        );
+        is $late.error-class, 'timeout',
+            "a {$phase}-phase timeout stays in the advance bucket";
+    }
 };

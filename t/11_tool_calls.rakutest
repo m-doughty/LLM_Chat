@@ -6,7 +6,7 @@ use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 
-plan 7;
+plan 12;
 
 # === Response tool call parsing ===
 
@@ -170,6 +170,139 @@ subtest 'Streaming tool call delta assembly' => {
 	is $resp.tool-calls[0]<function><name>, 'get_weather', 'Function name retained';
 	is $resp.tool-calls[0]<function><arguments>, '{"location":"London"}',
 		'Arguments fragments concatenated';
+};
+
+# === Streaming deltas that carry no `index` ===
+#
+# The OAI streaming spec puts an `index` on every tool_calls fragment,
+# but providers omit it, and the fallback used to be "index = number of
+# builders so far". That got the FIRST fragment of a call right and
+# then sent every argument fragment after it to a brand-new builder: a
+# single tool call arrived shattered into N calls, each holding an
+# unparseable slice of the JSON. Downstream that is a tool invocation
+# with truncated arguments — the failure mode that motivated all of
+# this.
+#
+# What actually distinguishes the two cases is `id`. The spec sends it
+# (with `type`, and the function `name`) only on a call's FIRST
+# fragment; argument fragments carry nothing but function.arguments.
+
+subtest 'index-less deltas: id starts a call, the rest continue it' => {
+	plan 4;
+
+	my $resp = LLM::Chat::Backend::Response.new(id => 'no-index-one');
+	$resp._append-tool-call-deltas([
+		{
+			id => 'call_a1',
+			type => 'function',
+			function => { name => 'task', arguments => '' },
+		},
+	]);
+	$resp._append-tool-call-deltas([
+		{ function => { arguments => '{"prompt":"write' } },
+	]);
+	$resp._append-tool-call-deltas([
+		{ function => { arguments => ' it in full"}' } },
+	]);
+
+	is $resp.tool-calls.elems, 1,
+		'an id-bearing delta plus two continuations is ONE call';
+	is $resp.tool-calls[0]<id>, 'call_a1', 'the id is retained';
+	is $resp.tool-calls[0]<function><name>, 'task', 'the name is retained';
+	is $resp.tool-calls[0]<function><arguments>, '{"prompt":"write it in full"}',
+		'and the argument fragments concatenate into parseable JSON';
+};
+
+subtest 'index-less deltas: each id is a new call' => {
+	plan 5;
+
+	my $resp = LLM::Chat::Backend::Response.new(id => 'no-index-two');
+	$resp._append-tool-call-deltas([
+		{ id => 'call_b1', type => 'function',
+		  function => { name => 'search', arguments => '{"q":"raku"}' } },
+	]);
+	$resp._append-tool-call-deltas([
+		{ id => 'call_b2', type => 'function',
+		  function => { name => 'fetch', arguments => '{"url":"x"}' } },
+	]);
+
+	is $resp.tool-calls.elems, 2, 'two id-bearing deltas make two calls';
+	is $resp.tool-calls[0]<id>, 'call_b1', 'first call keeps its id';
+	is $resp.tool-calls[1]<id>, 'call_b2', 'second call keeps its id';
+	is $resp.tool-calls[0]<function><arguments>, '{"q":"raku"}',
+		'first call keeps its own arguments';
+	is $resp.tool-calls[1]<function><arguments>, '{"url":"x"}',
+		'and the second call did not inherit them';
+};
+
+subtest 'index-less deltas: an id after an explicit index starts a call' => {
+	plan 4;
+
+	# The mixed case: a provider that indexes its opening fragment and
+	# then stops. The id says "new call" whatever came before it, so it
+	# lands one past the highest builder rather than appending to it.
+	my $resp = LLM::Chat::Backend::Response.new(id => 'no-index-mixed');
+	$resp._append-tool-call-deltas([
+		{ index => 0, id => 'call_c1', type => 'function',
+		  function => { name => 'first', arguments => '{"a":1}' } },
+	]);
+	$resp._append-tool-call-deltas([
+		{ id => 'call_c2', type => 'function',
+		  function => { name => 'second', arguments => '{"b":' } },
+	]);
+	$resp._append-tool-call-deltas([
+		{ function => { arguments => '2}' } },
+	]);
+
+	is $resp.tool-calls.elems, 2, 'the id-bearing delta opened a second call';
+	is $resp.tool-calls[0]<function><arguments>, '{"a":1}',
+		'the indexed call is untouched';
+	is $resp.tool-calls[1]<id>, 'call_c2', 'the new call keeps its id';
+	is $resp.tool-calls[1]<function><arguments>, '{"b":2}',
+		'and the index-less continuation went to it, not back to index 0';
+};
+
+subtest 'explicit indices still win, interleaved' => {
+	plan 4;
+
+	# The regression pin for the path that always worked: parallel calls
+	# streamed interleaved, which is the ONLY thing `index` can express
+	# and the reason it is authoritative when present.
+	my $resp = LLM::Chat::Backend::Response.new(id => 'indexed');
+	$resp._append-tool-call-deltas([
+		{ index => 0, id => 'call_d1', type => 'function',
+		  function => { name => 'alpha', arguments => '{"x":' } },
+		{ index => 1, id => 'call_d2', type => 'function',
+		  function => { name => 'beta', arguments => '{"y":' } },
+	]);
+	$resp._append-tool-call-deltas([
+		{ index => 1, function => { arguments => '2}' } },
+		{ index => 0, function => { arguments => '1}' } },
+	]);
+
+	is $resp.tool-calls.elems, 2, 'two interleaved calls stay two calls';
+	is $resp.tool-calls[0]<function><name>, 'alpha',
+		'calls come back in index order';
+	is $resp.tool-calls[0]<function><arguments>, '{"x":1}',
+		'index 0 assembled from its own fragments only';
+	is $resp.tool-calls[1]<function><arguments>, '{"y":2}',
+		'index 1 assembled from its own fragments only';
+};
+
+subtest 'an index-less continuation with no call open opens one' => {
+	plan 2;
+
+	# Degenerate, but a provider can lead with an arguments-only
+	# fragment. There is nothing to continue, so it starts index 0
+	# rather than being dropped or exploding on an empty builder set.
+	my $resp = LLM::Chat::Backend::Response.new(id => 'no-index-cold');
+	$resp._append-tool-call-deltas([
+		{ function => { arguments => '{"orphan":true}' } },
+	]);
+
+	is $resp.tool-calls.elems, 1, 'a cold continuation still lands somewhere';
+	is $resp.tool-calls[0]<function><arguments>, '{"orphan":true}',
+		'with its arguments intact';
 };
 
 done-testing;

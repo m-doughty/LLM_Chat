@@ -35,9 +35,30 @@ use LLM::Chat::Template::Llama3;
 use LLM::Chat::Template::Llama4;
 use LLM::Chat::Template::MistralV7;
 use LLM::Chat::Template::Gemma2;
+use LLM::Chat::Template::DeepSeekV4;
 
 my $template = LLM::Chat::Template::ChatML.new;
 ```
+
+### DeepSeek V4
+
+DeepSeek V4 publishes a Python message encoder instead of a Jinja chat template. `LLM::Chat::Template::DeepSeekV4` implements the prompt-encoding half of that protocol (not completion parsing):
+
+```raku
+use LLM::Chat::Template::DeepSeekV4;
+
+my $template = LLM::Chat::Template::DeepSeekV4.new;
+my $prompt = $template.render(@messages);
+
+# Full upstream message shape, retaining JSON member order:
+my $prompt = $template.encode-json(
+    $messages-json,
+    thinking-mode    => 'thinking',
+    reasoning-effort => 'high',
+);
+```
+
+`encode-messages` accepts associative structures and supports context, thinking removal, tools, DSML calls/results, response formats, developer and latest-reminder roles, and quick tasks. `encode-json` is preferable when the exact JSON wire-member order must be reflected in the rendered prompt.
 
 ### Jinja2 Templates (HuggingFace)
 
@@ -163,11 +184,32 @@ Provider-reported usage is also available on the Response when the backend emits
 $resp.prompt-tokens;       # Int, undefined on backends that don't emit usage
 $resp.completion-tokens;   # Int
 $resp.total-tokens;        # Int
+$resp.cached-prompt-tokens;# Int, the cached SLICE of prompt-tokens; undefined
+                           # when the provider says nothing about caching
+                           # (which is not the same as nothing cached)
 $resp.cost;                # Num (credits)
 $resp.model-used;          # Str, provider-reported routed model
 $resp.provider-id;         # Str, provider-assigned request id
 $resp.finish-reason;       # Str ('stop' / 'length' / 'content_filter' / ...)
 ```
+
+### How a stream ends
+
+A streamed generation ends in one of three ways, and every backend built on `LLM::Chat::Backend::OpenAICommon` settles the Response the same way for each:
+
+  * **The provider says it is finished** — `[DONE]`, or a `stop` / `tool_calls` finish reason and then a closed body. `.is-done` and `.is-success` are both true.
+
+  * **The provider names a terminal failure** — `length`, `content_filter`, or a reason this library doesn't know. `.is-success` is false, `.error-class` is `'response'`, and `.finish-reason` says which. Note that `length` is a failure: a generation stopped by the completion budget is a truncated one, and it never arrives labelled as a complete answer. The partial text is still on `.latest` / `.msg`.
+
+  * **The body just stops** — no `[DONE]`, no finish reason. A dropped connection, a killed upstream worker, a proxy that gave up. `.is-success` is false with `.error-class` `'response'`; there is no way to tell a reply that was cut off from one that ended.
+
+A streamed `data:` line that doesn't parse is skipped rather than fatal, but counted on `.dropped-frames`:
+
+```raku
+$resp.dropped-frames;      # Int, 0 unless frames were unparseable
+```
+
+If any frames were dropped **while tool calls were being assembled**, the stream fails whatever else happened — tool-call `arguments` are streamed as JSON fragments concatenated blind, so a hole in them can produce valid JSON saying something the model never asked for, and nothing downstream could detect it. Prose-only streams keep their success and leave the counter for the caller to judge.
 
 Tool Loop
 ---------
@@ -259,12 +301,23 @@ Token Counting
 use LLM::Chat::TokenCounter;
 
 my $counter = LLM::Chat::TokenCounter.new(
-    tokenizer-path => 'path/to/tokenizer.json',
-    template       => $template,
+    tokenizer => $tokenizer,
+    template  => $template,
 );
 
-my $count = $counter.count-messages(@messages);
+my $conversation-tokens = $counter.get-conversation-count(@messages);
+
+# Exact selected-model request: [context head, messages, context tail],
+# including the tool catalogue rendered by the model template.
+my $request-tokens = $counter.get-request-count(
+    @messages,
+    :@tools,
+    context-head => $run-context.head-message,
+    context-tail => $run-context.tail-message,
+);
 ```
+
+`get-conversation-count` remains useful for stored-conversation and compaction accounting. Use `get-request-count` for a preflight that must match the complete wire prompt for one selected model. Undefined context ends and an empty tool catalogue are omitted without changing template bytes.
 
 Dependencies
 ------------

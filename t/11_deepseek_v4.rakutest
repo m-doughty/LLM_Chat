@@ -1,0 +1,202 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::DeepSeekV4;
+
+my $template = LLM::Chat::Template::DeepSeekV4.new;
+my $fixture-dir = $?FILE.IO.parent.add('fixtures/deepseek-v4');
+
+is $template.name, 'deepseek-v4', 'template has the public DeepSeek V4 name';
+
+for 1..4 -> $case {
+	my $mode = $case == 4 ?? 'chat' !! 'thinking';
+	my $actual = $template.encode-json(
+		$fixture-dir.add("test-input-$case.json").slurp,
+		thinking-mode => $mode,
+	);
+	my $expected = $fixture-dir.add("test-output-$case.txt").slurp;
+	is $actual, $expected, "official pinned Python encoder golden $case is byte exact";
+}
+
+my @simple = LLM::Chat::Conversation::Message.new(role => 'user', content => 'Hello 🌍');
+is $template.render(@simple),
+	'<｜begin▁of▁sentence｜><｜User｜>Hello 🌍<｜Assistant｜></think>',
+	'simple Conversation::Message renders exactly in chat mode';
+is $template.render(@simple, True),
+	'<｜begin▁of▁sentence｜><｜User｜>Hello 🌍',
+	'continuation suppresses the generation prompt';
+
+my $ordered-tools = q:to/JSON/.chomp;
+[
+  {"role":"assistant","tool_calls":[
+    {"id":"first","type":"function","function":{"name":"one","arguments":"{\"text\":\"café\",\"n\":2}"}},
+    {"id":"second","type":"function","function":{"name":"two","arguments":"{\"ok\":true}"}}
+  ]},
+  {"role":"tool","tool_call_id":"second","content":"second result"},
+  {"role":"tool","tool_call_id":"first","content":"first result"}
+]
+JSON
+my $ordered = $template.encode-json($ordered-tools, thinking-mode => 'chat');
+ok $ordered.index('<tool_result>first result</tool_result>')
+	< $ordered.index('<tool_result>second result</tool_result>'),
+	'tool results follow assistant call order rather than arrival order';
+ok $ordered.contains('<｜DSML｜parameter name="text" string="true">café</｜DSML｜parameter>'),
+	'ordered JSON arguments retain Unicode and string typing';
+ok $ordered.contains('<｜DSML｜parameter name="n" string="false">2</｜DSML｜parameter>'),
+	'ordered JSON arguments retain scalar typing';
+
+my $numbers = q:to/JSON/.chomp;
+[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"numbers","arguments":"{\"whole\":1.0,\"fraction\":1.2,\"large\":1e3,\"small\":1e-3,\"negative_zero\":-0.0}"}}]}]
+JSON
+my $number-prompt = $template.encode-json($numbers, thinking-mode => 'chat');
+for 'whole' => '1.0', 'fraction' => '1.2', 'large' => '1000.0', 'small' => '0.001', 'negative_zero' => '-0.0' -> $case {
+	ok $number-prompt.contains(
+		'<｜DSML｜parameter name="' ~ $case.key ~ '" string="false">' ~ $case.value ~ '</｜DSML｜parameter>'
+	), "Python-compatible JSON number {$case.key}={$case.value}";
+}
+
+my $duplicate-arguments = q:to/JSON/.chomp;
+[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"duplicates","arguments":"{\"same\":1,\"same\":2}"}}]}]
+JSON
+my $duplicate-prompt = $template.encode-json($duplicate-arguments,
+	thinking-mode => 'chat');
+nok $duplicate-prompt.contains('>1</｜DSML｜parameter>'),
+	'duplicate JSON argument keys follow Python last-value-wins semantics';
+ok $duplicate-prompt.contains('name="same" string="false">2</｜DSML｜parameter>'),
+	'the surviving duplicate retains its original insertion position';
+
+my $malformed = q:to/JSON/.chomp;
+[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"broken","arguments":"not-json"}}]}]
+JSON
+ok $template.encode-json($malformed, thinking-mode => 'chat').contains(
+	'<｜DSML｜parameter name="arguments" string="true">not-json</｜DSML｜parameter>'
+), 'invalid JSON arguments use the upstream raw-arguments fallback';
+
+my $scalar = q:to/JSON/.chomp;
+[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"bad-shape","arguments":"[1,2]"}}]}]
+JSON
+throws-like { $template.encode-json($scalar, thinking-mode => 'chat') },
+	LLM::Chat::Template::DeepSeekV4::Invalid,
+	'valid JSON with an invalid argument shape is rejected explicitly',
+	message => 'Tool-call arguments must decode to a JSON object';
+
+throws-like {
+	$template.encode-json('[{"role":"developer","content":""}]', thinking-mode => 'chat')
+}, LLM::Chat::Template::DeepSeekV4::Invalid,
+	'empty developer content is rejected like the Python assertion';
+
+throws-like {
+	$template.encode-json('[1]', thinking-mode => 'chat')
+}, LLM::Chat::Template::DeepSeekV4::Invalid,
+	'non-object message elements get the public typed error',
+	message => 'Messages[0] must be an associative message object';
+
+throws-like {
+	$template.encode-json('[{"role":"unknown","content":"nope"}]',
+		thinking-mode => 'chat')
+}, LLM::Chat::Template::DeepSeekV4::Invalid,
+	'unknown roles get the public typed error';
+
+my $effort = $template.encode-json(
+	'[{"role":"user","content":"Think"}]',
+	thinking-mode => 'thinking',
+	reasoning-effort => 'high',
+);
+ok $effort.starts-with('<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum'),
+	'high reasoning effort prefix follows BOS';
+
+my $without-bos = $template.encode-json(
+	'[{"role":"user","content":"No prefix"}]',
+	thinking-mode => 'chat', add-default-bos-token => False,
+);
+is $without-bos, '<｜User｜>No prefix<｜Assistant｜></think>',
+	'BOS insertion can be disabled explicitly';
+
+my $with-context = $template.encode-json(
+	'[{"role":"user","content":"new"}]',
+	thinking-mode => 'chat',
+	context-json => '[{"role":"system","content":"already encoded"}]',
+);
+is $with-context, '<｜User｜>new<｜Assistant｜></think>',
+	'context suppresses BOS and only the new suffix is rendered';
+
+my $kept-reasoning = $template.encode-json(q:to/JSON/.chomp,
+[
+  {"role":"user","content":"old"},
+  {"role":"assistant","reasoning_content":"kept reasoning","content":"old answer"},
+  {"role":"user","content":"new"}
+]
+JSON
+	thinking-mode => 'thinking', drop-thinking => False,
+);
+ok $kept-reasoning.contains('kept reasoning</think>old answer'),
+	'drop-thinking can be disabled explicitly';
+
+my $without-eos = $template.encode-json(
+	'[{"role":"assistant","content":"unfinished","wo_eos":true}]',
+	thinking-mode => 'chat',
+);
+nok $without-eos.contains('<｜end▁of▁sentence｜>'),
+	'wo_eos suppresses the assistant terminator';
+
+is $template.encode-json(
+	'[{"role":"user","content":"one","task":null},{"role":"user","content":"two"}]',
+	thinking-mode => 'chat',
+), "<｜begin▁of▁sentence｜><｜User｜>one\n\ntwo<｜Assistant｜></think>",
+	'a null task is absent, matching Python dict.get semantics';
+
+my @only-user = LLM::Chat::Conversation::Message.new(
+	role => 'user', content => 'Use a tool');
+my $tools-without-system = $template.render(@only-user, tools => [{
+	type => 'function', function => {
+		name => 'lookup', description => 'look up a value',
+		parameters => { type => 'object' },
+	},
+}]);
+ok $tools-without-system.contains('### Available Tool Schemas'),
+	'render retains tool declarations when no system/developer turn exists';
+
+my $formatted = $template.encode-json(q:to/JSON/.chomp,
+[
+  {"role":"system","content":"format it","response_format":{"type":"object","required":["answer"]}},
+  {"role":"user","content":"go"}
+]
+JSON
+	thinking-mode => 'chat',
+);
+ok $formatted.contains(
+	'## Response Format:' ~ "\n\n" ~
+	'You MUST strictly adhere to the following schema to reply:' ~ "\n" ~
+	'{"type": "object", "required": ["answer"]}'
+), 'response formats use Python-compatible ordered JSON';
+
+my %task-tokens =
+	action    => '<｜Assistant｜></think><｜action｜>',
+	query     => '<｜query｜>',
+	authority => '<｜authority｜>',
+	domain    => '<｜domain｜>',
+	title     => '<｜title｜>',
+	read_url  => '<｜read_url｜>';
+for %task-tokens.pairs -> $case {
+	my $prompt = $template.encode-json(
+		'[{"role":"user","content":"classify","task":"' ~ $case.key ~ '"}]',
+		thinking-mode => 'chat',
+	);
+	ok $prompt.ends-with($case.value), "quick task {$case.key} has its protocol token";
+}
+
+my @unmutated = (
+	{ role => 'assistant', tool_calls => [
+		{ id => 'one', function => { name => 'first', arguments => '{}' } },
+		{ id => 'two', function => { name => 'second', arguments => '{}' } },
+	] },
+	{ role => 'tool', tool_call_id => 'two', content => 'two' },
+	{ role => 'tool', tool_call_id => 'one', content => 'one' },
+);
+my @before = @unmutated.deepmap(*.clone);
+$template.encode-messages(@unmutated, thinking-mode => 'chat');
+is-deeply @unmutated, @before,
+	'merge, sort and thinking transforms never mutate caller messages';
+
+done-testing;

@@ -4,7 +4,7 @@ use LLM::Chat::Conversation::Message;
 use LLM::Chat::Template::Jinja2;
 use JSON::Fast;
 
-plan 6;
+plan 12;
 
 # Helper to create messages
 sub msg(Str:D $role, Str:D $content --> LLM::Chat::Conversation::Message) {
@@ -79,7 +79,244 @@ subtest 'Jinja2: bos_token' => {
 	ok $result.starts-with('<s>'), 'bos_token passed through';
 };
 
+# === tools ===
+
+# The shape a provider takes tool declarations in, and the shape every
+# HuggingFace template that mentions `tools` is written against.
+sub tool-decl(Str:D $name, Str:D $description --> Hash:D) {
+	{
+		type => 'function',
+		function => {
+			:$name, :$description,
+			parameters => {
+				type => 'object',
+				properties => { path => { type => 'string' } },
+				required => ['path',],
+			},
+		},
+	};
+}
+
+# A template that reports on `tools` three ways: whether it is DEFINED at
+# all (the branch an empty list would wrongly take), what is in it, and
+# the nested access real templates use.
+my $tools-jinja = q:to/END/.chomp;
+{%- if tools is defined -%}
+[tools-defined]
+{%- endif -%}
+{%- if tools -%}
+{%- for tool in tools -%}
+[tool:{{ tool.function.name }}:{{ tool['function']['description'] }}]
+{%- endfor -%}
+{%- endif -%}
+{%- for message in messages -%}
+<|im_start|>{{ message.role }}
+{{ message.content }}<|im_end|>
+{%- endfor -%}
+END
+
+subtest 'Jinja2: tools reach the template' => {
+	plan 4;
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($tools-jinja));
+	my @messages = (msg('user', 'read the file'),);
+	my @tools = (
+		tool-decl('fs_read', 'Read a file'),
+		tool-decl('fs_write', 'Write a file'),
+	);
+
+	my $result = $tmpl.render(@messages, :@tools);
+
+	ok $result.contains('[tools-defined]'),
+		'the template sees a defined tools variable';
+	ok $result.contains('[tool:fs_read:Read a file]'),
+		'dotted access reaches the nested function object';
+	ok $result.contains('[tool:fs_write:Write a file]'),
+		'every declaration is rendered, in order';
+	ok $result.contains('read the file'),
+		'and the messages still render alongside them';
+};
+
+subtest 'Jinja2: no tools renders exactly as it always did' => {
+	plan 5;
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($tools-jinja));
+	my @messages = (msg('user', 'Hi'), msg('assistant', 'Hello'));
+
+	# THE PIN. `tools` is passed to the Jinja render only when there is
+	# something to pass, so a caller that names no tools — and a caller
+	# that names an empty list — gets the render this method produced
+	# before the parameter existed, byte for byte.
+	my $bare  = $tmpl.render(@messages);
+	my $empty = $tmpl.render(@messages, tools => []);
+
+	is $empty, $bare,
+		'an empty tools list renders byte-identically to no tools at all';
+	nok $bare.contains('[tools-defined]'),
+		'and the variable is not even defined — an empty list would have '
+			~ 'been, and templates branch on that';
+	nok $bare.contains('[tool:'), 'so no tool block is rendered';
+
+	# The continuation flag still works alongside the new named parameter,
+	# in both positions it can be written.
+	my $chatml = LLM::Chat::Template::Jinja2.new(:template($chatml-jinja));
+	ok $chatml.render(@messages, False).ends-with('<|im_start|>assistant'),
+		'the positional continuation argument is unaffected';
+	nok $chatml.render(@messages, True, tools => []).ends-with('<|im_start|>assistant'),
+		'and it still governs the generation prompt with tools named';
+};
+
 # === from-tokenizer-config ===
+
+# === tool-call arguments ===
+#
+# On the OpenAI wire a tool call's `function.arguments` is a JSON
+# STRING, and Message.to-hash carries it that way because that is what
+# the request body needs. Chat templates are written against what
+# Python's transformers hands them, where it is a DICT: GLM-family
+# templates iterate `tc.function.arguments.items()`, others index it by
+# key. Given a string, `.items()` renders nothing at all — for a token
+# counter, an undercount of exactly the part of the prompt most likely
+# to be large, and for a hand-rendered text-completion prompt, a tool
+# call with its arguments deleted.
+#
+# So the render decodes them, and NOTHING else changes: the Message
+# objects — and therefore every request body built from them — keep the
+# string.
+
+sub tool-call-message(*@arguments --> LLM::Chat::Conversation::Message) {
+	LLM::Chat::Conversation::Message.new(
+		role => 'assistant',
+		content => '',
+		tool-calls => @arguments.kv.map(-> $i, $args {
+			item {
+				id => "call_$i",
+				type => 'function',
+				function => { name => "tool_$i", arguments => $args },
+			}
+		}).Array,
+	);
+}
+
+# Reports what shape `arguments` arrived in, so a test can tell a
+# decoded object from a passed-through string without guessing at
+# rendering rules. `mapping` is checked first: a Str is also a
+# `sequence` in Jinja, and an Associative is neither.
+my $shape-jinja = q:to/END/.chomp;
+{%- for message in messages -%}
+{%- if message.tool_calls -%}
+{%- for tc in message.tool_calls -%}
+{%- if tc.function.arguments is mapping -%}
+[MAP:{{ tc.function.arguments | tojson(separators=(',', ':')) }}]
+{%- elif tc.function.arguments is string -%}
+[STR:{{ tc.function.arguments }}]
+{%- else -%}
+[OTHER:{{ tc.function.arguments | tojson(separators=(',', ':')) }}]
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+END
+
+subtest 'Jinja2: tool-call arguments render as an object' => {
+	plan 5;
+	# A real template in the GLM idiom: it walks the arguments dict and
+	# emits a key/value block per entry. Against a JSON string it
+	# renders nothing between the tags.
+	my $tmpl = LLM::Chat::Template::Jinja2.new(
+		template => 't/fixtures/glm-style-items.jinja'.IO.slurp,
+	);
+	my @messages = (
+		msg('user', 'write the brief'),
+		tool-call-message(
+			'{"prompt":"write it in full","reason":"the brief was clipped"}',
+		),
+	);
+
+	my $result = $tmpl.render(@messages);
+
+	ok $result.contains('<arg_key>prompt</arg_key>'),
+		'the template iterates the arguments as a dict';
+	ok $result.contains('<arg_value>write it in full</arg_value>'),
+		'and each value reaches the render';
+	ok $result.contains('<arg_key>reason</arg_key>')
+		&& $result.contains('<arg_value>the brief was clipped</arg_value>'),
+		'every argument, not just the first';
+	nok $result.contains('<raw_args>'),
+		'the string fallback branch is not taken';
+	ok $result.contains('<tool_call>tool_0'),
+		'and the call itself still renders around them';
+};
+
+subtest 'Jinja2: rendering never touches the message' => {
+	plan 4;
+	# to-hash SHARES the live @!tool-calls — the array, the call hashes
+	# and the function hashes are the Message's own objects. Decoding
+	# in place would rewrite the conversation, and the next request
+	# built from it would put a JSON object where the wire format
+	# requires a string.
+	my $tmpl = LLM::Chat::Template::Jinja2.new(
+		template => 't/fixtures/glm-style-items.jinja'.IO.slurp,
+	);
+	my $message = tool-call-message('{"path":"lib/Thing.rakumod"}');
+	my @messages = (msg('user', 'read it'), $message);
+
+	my $before = $message.tool-calls.raku;
+	$tmpl.render(@messages);
+	$tmpl.render(@messages, True);
+
+	isa-ok $message.tool-calls[0]<function><arguments>, Str,
+		'the arguments on the message are still a string after rendering';
+	is $message.tool-calls[0]<function><arguments>, '{"path":"lib/Thing.rakumod"}',
+		'byte for byte the string that went in';
+	is $message.to-hash<tool_calls>[0]<function><arguments>,
+		'{"path":"lib/Thing.rakumod"}',
+		'and to-hash — the wire path — still carries the string';
+	is $message.tool-calls.raku, $before,
+		'nothing else in the call was disturbed either';
+};
+
+subtest 'Jinja2: arguments that are not a JSON object pass through' => {
+	plan 7;
+	# Narrow on purpose. Anything this cannot decode into an object is
+	# handed to the template exactly as it arrived, so a template that
+	# stringifies whatever it is given still gets something sensible.
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($shape-jinja));
+
+	is $tmpl.render([tool-call-message('{"a":1}'),]), '[MAP:{"a":1}]',
+		'a JSON object is decoded';
+	is $tmpl.render([tool-call-message('{"prompt":"write the'),]),
+		'[STR:{"prompt":"write the]',
+		'a fragment cut short mid-stream is left as it is, not repaired';
+	is $tmpl.render([tool-call-message(''),]), '[STR:]',
+		'an empty string stays an empty string';
+	is $tmpl.render([tool-call-message('[1,2]'),]), '[STR:[1,2]]',
+		'a JSON array is not an object and is left alone';
+	is $tmpl.render([tool-call-message('42'),]), '[STR:42]',
+		'nor is a bare scalar';
+	# `$(...)` so the slurpy takes them as one value each rather than
+	# flattening the Hash into a Pair and the Array into two Ints.
+	is $tmpl.render([tool-call-message($(%(a => 1))),]), '[MAP:{"a":1}]',
+		'arguments a caller already supplied as a Hash are passed straight through';
+	is $tmpl.render([tool-call-message($([1, 2])),]), '[OTHER:[1,2]]',
+		'and a value that is neither a string nor a mapping is untouched too';
+};
+
+subtest 'Jinja2: mixed and multiple tool calls' => {
+	plan 3;
+	my $tmpl = LLM::Chat::Template::Jinja2.new(:template($shape-jinja));
+
+	is $tmpl.render([tool-call-message('{"a":1}', 'not json', '{"b":2}'),]),
+		'[MAP:{"a":1}][STR:not json][MAP:{"b":2}]',
+		'each call in a message is judged on its own arguments';
+
+	# Messages without tool calls take the early return, and the
+	# rendered conversation is unaffected by any of this.
+	my $chatml = LLM::Chat::Template::Jinja2.new(:template($chatml-jinja));
+	my @plain = (msg('system', 'Be brief.'), msg('user', 'Hi'));
+	ok $chatml.render(@plain).contains('Be brief.'),
+		'plain conversations render as they always did';
+	is $tmpl.render(@plain), '',
+		'and produce no tool-call output at all';
+};
 
 subtest 'from-tokenizer-config: Command A' => {
 	plan 3;

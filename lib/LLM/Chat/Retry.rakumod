@@ -112,6 +112,10 @@ anything else (incl. no class)    | retry-same
 
 =end table
 
+The two classes worth reading closely are C<'timeout'> and
+C<'connection'>, because the same Cro exception can produce either and
+the difference is B<which phase> it expired in — see below.
+
 The reasoning behind the less obvious rows:
 
 =item B<parser-failed wins over everything.> The transport succeeded;
@@ -135,6 +139,20 @@ a hiccup than a permanent property of the model.
 =item B<An C<'http'> class with no status advances.> There is no
 evidence for a retry, and no evidence it will abort either; moving on
 is the cheap, safe move.
+
+=item B<A C<'timeout'> advances, but a failed I<connect> is not one.>
+C<'timeout'> means the endpoint accepted the connection and then did
+not answer inside the deadline. That is a statement about I<that>
+backend, and the next one in the chain will answer sooner than a
+backoff would end — so, advance.
+
+A connect that never completed is a different animal, and
+L<LLM::Chat::Backend::OpenAICommon> files it as C<'connection'>
+accordingly: nothing was sent, the endpoint said nothing, and all that
+is known is that the network was unwell for thirty seconds. Retrying
+the same backend after a backoff is the correct response, and on a
+B<one-backend chain> it is the only one that is not "give up" — which
+is exactly what filing it under C<'timeout'> used to mean there.
 
 =head2 Backoff
 

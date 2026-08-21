@@ -6,12 +6,12 @@
   "build-depends": [
   ],
   "depends": [
-    "Cro::HTTP::Client",
-    "Digest::SHA256::Native",
-    "JSON::Fast",
-    "Template::Jinja2",
-    "Tokenizers",
-    "UUID::V4"
+    "Cro::HTTP::Client:ver<0.8.11+>:auth<zef:cro>",
+    "Digest::SHA256::Native:ver<1.0.0+>:auth<zef:bduggan>",
+    "JSON::Fast:ver<0.19+>:auth<cpan:TIMOTIMO>",
+    "Template::Jinja2:ver<0.3.0+>:auth<zef:apogee>",
+    "Tokenizers:ver<0.3.0+>:auth<zef:apogee>",
+    "UUID::V4:ver<1.0.0+>:auth<zef:masukomi>"
   ],
   "description": "Simple framework for LLM inferencing",
   "license": "Artistic-2.0",
@@ -36,6 +36,7 @@
     "LLM::Chat::Retry::Exceptions": "lib/LLM/Chat/Retry/Exceptions.rakumod",
     "LLM::Chat::Template": "lib/LLM/Chat/Template.rakumod",
     "LLM::Chat::Template::ChatML": "lib/LLM/Chat/Template/ChatML.rakumod",
+    "LLM::Chat::Template::DeepSeekV4": "lib/LLM/Chat/Template/DeepSeekV4.rakumod",
     "LLM::Chat::Template::Gemma2": "lib/LLM/Chat/Template/Gemma2.rakumod",
     "LLM::Chat::Template::Jinja2": "lib/LLM/Chat/Template/Jinja2.rakumod",
     "LLM::Chat::Template::Llama3": "lib/LLM/Chat/Template/Llama3.rakumod",
@@ -57,8 +58,8 @@
     "ai"
   ],
   "test-depends": [
-    "Cro::HTTP::Router",
-    "Cro::HTTP::Server"
+    "Cro::HTTP::Router:ver<0.8.11+>:auth<zef:cro>",
+    "Cro::HTTP::Server:ver<0.8.11+>:auth<zef:cro>"
   ],
-  "version": "0.8.1"
+  "version": "0.10.0"
 }

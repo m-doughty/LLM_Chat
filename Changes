@@ -2,6 +2,160 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.10.0  2026-08-21T22:05:38+01:00
+    - [2026-08-21] Require Template::Jinja2 0.3.0. The byte-identical
+      rendering of upstream GLM and Kimi chat templates leans on its Python
+      method-call dispatch and Jinja2-faithful filters; an older renderer
+      would produce silently different prompts.
+    - [2026-08-20] The OpenRouter backend marks `cache_control`
+      breakpoints on outgoing chat bodies, so providers that only
+      cache a prompt prefix when the request says where it ends
+      (Anthropic, Qwen, Gemini) can actually cache one. Markers go on
+      the head message and on the last two `user` / `assistant` turns
+      — the trailing pair is what makes the marker written one round
+      ago still cover what the next request shares with it — with
+      tool results and tool-calling assistants stepped over, and
+      never more than OpenRouter's ceiling of four. Implicit-caching
+      routes ignore the annotation, so the new `cache-breakpoints`
+      attribute defaults to On across a mixed fleet; set it to False
+      to send the plain string shape. Conversation state is untouched
+      either way: the rewrite happens on the serialized body, so
+      `Message.to-hash` and `Message.get-checksum` read the same
+      after a request as before it.
+      Placing them needed a seam, so `OpenAICommon` gained one:
+      `_finalize-request-body` is called on all four completion paths
+      with the assembled body, after messages / prompt / tools /
+      stream are attached and before the POST. The default returns
+      its argument, so nothing changes for backends that don't
+      override it.
+    - [2026-08-20] New `Response.cached-prompt-tokens`: the slice of
+      the prompt a provider served out of its own cache rather than
+      processing fresh, which is what tells a caller whether the
+      input it is paying full price for is actually being reused.
+      Lifted from the OAI-spec `usage.prompt_tokens_details.
+      cached_tokens` on any OpenAI-compatible backend, and on
+      OpenRouter also from the `/generation` poll — the only place
+      the streaming path can pick it up, since that backend
+      deliberately asks for no inline usage frame. A value the
+      response body reported always wins over the poll's. Undefined
+      means the provider said nothing about caching, which is not the
+      same as nothing having been cached, so a reported zero stays a
+      reported zero.
+    - [2026-08-19] A streamed response now always reaches a terminal
+      state. Both streaming paths route every ending through one
+      place, so `[DONE]`, a `stop` / `tool_calls` finish reason
+      followed by the body closing, and a body that closes with
+      neither all settle the Response — the last of those as a
+      failure with error-class `response`, since a reply cut off in
+      transit cannot be told from a reply that ended. Previously that
+      third case left the Response neither done nor quit: a consumer
+      polling `.is-done` waited out its own timeout, minutes at a
+      time, for a stream that had been over from the start. Providers
+      that close on the finish_reason chunk without ever sending
+      `[DONE]` are common, and they now complete promptly and
+      successfully instead. The `length` / `content_filter` /
+      unknown-reason failures are unchanged.
+      Fixes a hook-ordering bug on the way: text-completion-stream's
+      `[DONE]` arm completed the supply BEFORE `_on-stream-complete`,
+      so a subclass's post-stream metadata landed after consumers had
+      been told the response was finished. Both paths now fire the
+      hook first, as the hook has always documented.
+    - [2026-08-19] New `Response.dropped-frames`: streamed `data:`
+      lines that fail to parse are still skipped — providers
+      interleave junk into healthy streams — but they are now counted,
+      and a stream that dropped frames while assembling tool calls
+      FAILS instead of succeeding. A hole in prose costs a few words
+      and is visible to whoever reads the reply; a hole in a tool
+      call's `arguments` is spliced out of a JSON string that is then
+      concatenated blind, and what comes out can be valid JSON saying
+      something the model never asked for. Nothing downstream can
+      detect that, so it no longer reaches `is-success`. Prose-only
+      streams keep their success and expose the counter. SSE
+      heartbeats and empty `data:` lines are not counted.
+    - [2026-08-19] Streaming tool-call deltas that carry no `index`
+      are assembled correctly. The OAI spec puts an `index` on every
+      fragment and it is still authoritative when present, but some
+      providers omit it, and the old fallback used the number of calls
+      seen so far — which sent every argument fragment to a fresh
+      call. One tool call arrived shattered into N, each holding an
+      unparseable slice of the JSON. The fallback now reads `id`,
+      which the spec sends only on a call's first fragment: an `id`
+      starts a new call, an arguments-only fragment continues the one
+      in flight.
+    - [2026-08-19] `LLM::Chat::Template::Jinja2.render` presents
+      tool-call `function.arguments` to the template as a decoded
+      object when they are a JSON object, matching what HuggingFace
+      chat templates are written against (transformers passes a dict).
+      GLM-family templates iterate `arguments.items()` and rendered
+      nothing at all against the JSON string the OpenAI wire format
+      uses — a silently truncated prompt, and for a token counter an
+      undercount of the largest part of it. The messages themselves
+      are untouched: the render works on a copy, so `to-hash` and
+      every request body built from a conversation still carry the
+      string. Arguments that are not a JSON object — empty, a fragment
+      cut short mid-stream, an array, a bare scalar, or a Hash a
+      caller supplied directly — are passed through exactly as they
+      are.
+    - [2026-08-13] `LLM::Chat::TokenCounter.get-request-count` counts a
+      complete selected-model request: optional runtime context head, stored
+      conversation, optional runtime context tail, and tool catalogue rendered
+      through the model's actual template, then tokenized without a second
+      special-token pass. This is the exact-counting seam for models such as
+      Kimi K2.7 whose tool declarations live in the chat template. Existing
+      `get-conversation-count` remains conversation-only and unchanged.
+      Kimi's published Jinja fallback serializes ordinary OpenAI tool
+      declarations with compact `tojson`; `tools_ts_str` is an optional
+      preformatted override, so no model-specific duplicate renderer is used.
+      Runtime context may be supplied as its natural string halves or as
+      prebuilt system messages. Rendered prompts opt into declared special
+      tokens explicitly, which is required by deny-by-default tiktoken
+      backends and harmless for Hugging Face JSON tokenizers.
+    - [2026-08-13] Add `LLM::Chat::Template::DeepSeekV4`, a byte-compatible
+      Raku port of the full prompt-encoding half of DeepSeek's pinned DSV4
+      reference implementation. It supports chat/thinking modes, reasoning
+      effort, context and thinking removal, developer/latest-reminder turns,
+      quick tasks, response formats, OpenAI-format tools/calls, DSML argument
+      encoding, and merged/call-ordered tool results. `encode-json` preserves
+      JSON object order for differential goldens; `encode-messages` accepts
+      ordinary associative message structures; `render` adapts existing
+      `Conversation::Message` objects. Completion parsing is intentionally not
+      included. The four official Python outputs are pinned as offline golden
+      tests with DeepSeek's MIT attribution.
+    - [2026-08-12] A Cro timeout is now classified BY THE PHASE it
+      expired in. `X::Cro::HTTP::Client::Timeout` carries a `phase` of
+      `connection`, `headers` or `body`, and OpenAICommon's classifier
+      used to file all three as error-class `timeout` — the ADVANCE
+      bucket. A connection-phase timeout is Cro's 30-second connect
+      budget running out: nothing was sent, the endpoint said nothing,
+      and the only evidence is a network that was unwell. That is now
+      error-class `connection`, the RETRY-SAME bucket. Headers- and
+      body-phase timeouts keep `timeout`: a backend that accepted the
+      connection and then would not answer has said something about
+      itself, and the next backend answers sooner than a backoff ends.
+      The lumping was fatal on a ONE-BACKEND chain, where `advance`
+      means the chain is exhausted: a single flaky connect ended the
+      run having made exactly one call. `classify-error`'s own bucket
+      table is unchanged — the split is at the source, which is where
+      the information is.
+      The classification test no longer re-implements the classifier
+      it is testing; it calls the real private method through
+      `^find_private_method`, so the two cannot drift.
+    - [2026-08-12] `LLM::Chat::Template::Jinja2.render` takes an
+      optional `:@tools` — the tool declarations the request will
+      carry, in the provider's own shape — and passes them to the
+      template as its `tools` variable. Real HuggingFace chat
+      templates render a tools block when they are given one, so a
+      render meant to match what the server sees needs them.
+      Passed ONLY when non-empty: `tools => []` and no tools at all
+      both render exactly as they did before the parameter existed
+      (pinned by a test, because a template asking
+      `{% if tools is defined %}` would otherwise take a different
+      branch for a caller who named nothing). Deliberately NOT wired
+      into `LLM::Chat::TokenCounter`: the declarations are a
+      per-request constant that provider-reported usage has already
+      been charged for, and counting them per message would bill them
+      twice.
+
 0.8.1  2026-08-09T20:57:18+01:00
     - META fix: Response::OpenRouter and Response::OpenRouter::Stream were
       missing from provides and listed under DEPENDS instead. On a machine

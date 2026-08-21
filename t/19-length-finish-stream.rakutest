@@ -24,7 +24,7 @@ use LLM::Chat::Template::ChatML;
 # canned, so the SSE framing, chunked transfer decoding and the
 # backend's own react loop all take part.
 
-plan 4;
+plan 5;
 
 # Minimal canned SSE endpoint. Answers any request whose headers have
 # arrived with the supplied event bodies, chunk-encoded, then closes.
@@ -98,6 +98,17 @@ my @chat-events =
     '{"choices":[{"delta":{"content":" a time"},"finish_reason":null}]}',
     '{"choices":[{"delta":{"content":""},"finish_reason":"length"}]}';
 
+# The same cut-off, but mid tool call. A provider that runs out of
+# completion budget while streaming tool_calls arguments leaves a
+# fragment of JSON behind — sometimes a fragment that happens to close
+# into valid JSON saying something the model never asked for. `length`
+# still means truncated, and truncated still means failure, whatever
+# is sitting in the assembled arguments.
+my @tool-length-events =
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x1","type":"function","function":{"name":"task","arguments":""}}]},"finish_reason":null}]}',
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"prompt\":\"write the brief in"}}]},"finish_reason":null}]}',
+    '{"choices":[{"delta":{},"finish_reason":"length"}]}';
+
 my @text-events =
     '{"choices":[{"text":"Once upon","finish_reason":null}]}',
     '{"choices":[{"text":" a time","finish_reason":null}]}',
@@ -152,6 +163,28 @@ subtest 'chat-completion-stream keeps the partial generation' => {
         'tokens emitted before the cut-off are retained';
     is $server.paths[0], '/v1/chat/completions',
         'request went to the chat-completions endpoint';
+};
+
+subtest 'a tool call cut off by the budget still fails' => {
+    plan 5;
+    my $server = SSEServer.new.start(@tool-length-events);
+    LEAVE { $server.stop }
+
+    my $backend = make-backend($server.port);
+    my $resp = $backend.chat-completion-stream(
+        [LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
+        tools => [{ type => 'function', function => { name => 'task' } },],
+    );
+    my $p = await-quit($resp);
+
+    ok $p.status ~~ Kept, 'stream terminated';
+    nok $resp.is-success,
+        'a tool call truncated by the completion budget is not a success';
+    is $resp.error-class, 'response', 'and classifies as a response error';
+    is $resp.finish-reason, 'length', 'finish-reason names the terminal cause';
+    is $resp.tool-calls[0]<function><arguments>,
+        '{"prompt":"write the brief in',
+        'the partial arguments are preserved for diagnosis, not repaired';
 };
 
 subtest 'text-completion-stream records finish_reason length' => {

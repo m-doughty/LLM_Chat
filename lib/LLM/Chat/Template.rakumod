@@ -8,6 +8,7 @@ method name(--> Str) {
 method render(
 	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
 	Bool $continuation = False,
+	*%options,
 	--> Str
 ) {
 	die "render must be implemented by the concrete class";

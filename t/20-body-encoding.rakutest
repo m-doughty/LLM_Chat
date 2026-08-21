@@ -32,8 +32,15 @@ use JSON::Fast;
 # The SSE streaming paths are deliberately not covered here — they never
 # went through body-text, decoding each body-byte-stream chunk as utf-8
 # themselves. t/15-streaming-resilience.rakutest owns that path.
+#
+# The last two subtests are about the body going the OTHER way: the
+# _finalize-request-body hook every completion path calls just before
+# the POST. They are here because they need the same thing this file
+# already has — a real server that can be asked what actually arrived.
+# (A stream is served on those routes only so the streaming paths reach
+# a clean terminal state; nothing about SSE decoding is under test.)
 
-plan 9;
+plan 11;
 
 # Non-ASCII from every corner that bites a latin-1 decode: 2-byte
 # accented latin, 3-byte symbol, 3-byte CJK, curly punctuation, and a
@@ -44,6 +51,27 @@ constant OOPS     = "clé d'API refusée — 日本語";
 
 sub json-blob(%payload --> Blob) {
     to-json(%payload, :!pretty).encode('utf-8');
+}
+
+# Request bodies recorded by the `hook` routes, oldest first.
+my $requests = Channel.new;
+
+#| The two SSE frames a streaming path needs to settle successfully:
+#| one delta, then the sentinel.
+sub sse-body(Str:D $frame --> Blob) {
+    ("data: $frame\n\n" ~ "data: [DONE]\n\n").encode('utf-8');
+}
+
+constant CHAT-SSE = sse-body(
+    '{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}');
+constant TEXT-SSE = sse-body(
+    '{"choices":[{"text":"ok","finish_reason":"stop"}]}');
+
+sub streamed(Blob:D $bytes --> Supply:D) {
+    supply {
+        emit $bytes;
+        done;
+    }
 }
 
 # === The fixture server ===
@@ -112,7 +140,53 @@ my $app = route {
     post -> 'junk', 'chat', 'completions' {
         content 'application/json', "this is not JSON — café".encode('utf-8');
     }
+
+    # Records what the completion paths actually posted. One pair of
+    # routes serves all four paths; the body's own `stream` flag says
+    # which reply shape the caller is waiting for.
+    post -> 'hook', 'chat', 'completions' {
+        request-body-blob -> $blob {
+            my $text = $blob.decode('utf-8');
+            $requests.send($text);
+            if from-json($text)<stream> {
+                content 'text/event-stream', streamed(CHAT-SSE);
+            }
+            else {
+                content 'application/json', json-blob({
+                    # Trailing comma is load-bearing: `[ %h ]` hits the
+                    # single-arg rule and flattens the Hash.
+                    choices => [ { message => { content => 'ok' }, finish_reason => 'stop' }, ],
+                });
+            }
+        }
+    }
+
+    post -> 'hook', 'completions' {
+        request-body-blob -> $blob {
+            my $text = $blob.decode('utf-8');
+            $requests.send($text);
+            if from-json($text)<stream> {
+                content 'text/event-stream', streamed(TEXT-SSE);
+            }
+            else {
+                content 'application/json', json-blob({
+                    choices => [ { text => 'ok', finish_reason => 'stop' }, ],
+                });
+            }
+        }
+    }
 };
+
+#| A subclass that rewrites every body it is handed. The marker names
+#| the path shape the hook saw, so a captured body proves both that the
+#| override fired and that its return value is what got posted.
+class HookBackend is LLM::Chat::Backend::OpenAICommon {
+    method _finalize-request-body(%settings --> Hash) {
+        my %out = %settings;
+        %out<hook-saw> = %settings<messages>:exists ?? 'chat' !! 'text';
+        %out;
+    }
+}
 
 my ($server, $port) = boot($app);
 LEAVE { try $server.stop with $server }
@@ -286,6 +360,77 @@ subtest 'a malformed body quits the response instead of crashing' => {
     nok $response.is-success,   'call did not report success';
     is $response.error-class, 'unknown',
         'a parse failure is classified, not leaked out of the tap';
+}
+
+# === 10-11: the _finalize-request-body hook ===
+
+#| The body the fixture recorded, parsed. Waits with a deadline rather
+#| than blocking the suite on a call that never reached the server.
+sub posted(Str:D $what --> Hash) {
+    my $received = start { $requests.receive };
+    timed($received, $what);
+    from-json($received.result);
+}
+
+#| Drive all four completion paths of $backend against the `hook`
+#| routes and return the four bodies that arrived, in call order.
+sub four-paths($backend --> List) {
+    my @posted;
+
+    settled($backend.chat-completion(@messages), 'hook chat-completion');
+    @posted.push: posted('the chat-completion body');
+
+    stream-settled($backend.chat-completion-stream(@messages), 'hook chat stream');
+    @posted.push: posted('the chat-completion-stream body');
+
+    settled($backend.text-completion(@messages), 'hook text-completion');
+    @posted.push: posted('the text-completion body');
+
+    stream-settled($backend.text-completion-stream(@messages), 'hook text stream');
+    @posted.push: posted('the text-completion-stream body');
+
+    @posted.List;
+}
+
+subtest 'the default _finalize-request-body changes nothing on any path' => {
+    plan 8;
+    my @posted = four-paths(make-backend('hook'));
+
+    for @posted.kv -> $i, %body {
+        nok %body<hook-saw>:exists,
+            "path $i posted no hook marker (the default returns its argument)";
+    }
+
+    ok  @posted[0]<messages>.defined, 'chat-completion still sends messages';
+    nok @posted[0]<stream>:exists,    'and no stream flag';
+    ok  @posted[1]<stream>,           'chat-completion-stream still sets stream';
+    ok  @posted[2]<prompt>.defined,   'text-completion still sends a rendered prompt';
+}
+
+subtest 'a subclass override fires on all four request paths' => {
+    plan 8;
+    my @posted = four-paths(make-backend('hook', :class(HookBackend)));
+
+    # The hook runs after messages / prompt / tools / stream are
+    # attached, so what it saw tells the paths apart — and its return
+    # value is what went on the wire.
+    is @posted[0]<hook-saw>, 'chat', 'chat-completion ran the override';
+    is @posted[1]<hook-saw>, 'chat', 'chat-completion-stream ran the override';
+    is @posted[2]<hook-saw>, 'text', 'text-completion ran the override';
+    is @posted[3]<hook-saw>, 'text', 'text-completion-stream ran the override';
+
+    # Same-signature dispatch is the trap this subtest exists for: a
+    # divergent signature would be a separate method, the parent's
+    # no-op would answer instead, and every assertion above would fail
+    # with no error raised anywhere.
+    ok @posted[0]<messages>.defined,
+        'the rewritten chat body kept its messages';
+    ok @posted[1]<stream>,
+        'the rewritten streaming body kept its stream flag';
+    ok @posted[3]<prompt>.defined,
+        'the rewritten text body kept its prompt';
+    is @posted[3]<hook-saw>, 'text',
+        'and a text body is never mistaken for a chat one';
 }
 
 done-testing;

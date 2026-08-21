@@ -47,6 +47,10 @@ OpenAI-compatible code path:
       C<usage: { include: true }> or C<stream_options: { include_usage: true }>
       — those caused intermittent header-phase hangs against some
       upstream providers (DeepSeek-V3.2 mostly fine, others ~80 % fail).
+=item Marks up to three C<cache_control> breakpoints on outgoing chat
+      bodies (controlled by C<$.cache-breakpoints>, on by default) so
+      providers that cache explicitly can reuse the prompt prefix
+      between rounds — see B<Prompt caching> below.
 =item Adds C<HTTP-Referer> / C<X-Title> attribution headers when
       C<:http-referer> / C<:x-title> are configured. (See
       L<https://openrouter.ai/docs/api-reference/overview#headers>.)
@@ -72,6 +76,54 @@ Everything else — request shape, error classification, fallback /
 retry interaction, streaming mechanics, cancel — is inherited
 unchanged from C<OpenAICommon>.
 
+=head2 Prompt caching
+
+A long-running conversation re-sends its whole history every round,
+and the input bill is the bulk of what that costs. Providers will
+serve a repeated prefix out of cache at a fraction of the price —
+some (OpenAI, DeepSeek, Moonshot, Z.AI, Grok) do it implicitly, and
+some (Anthropic, Qwen, Gemini) only when the request says where the
+reusable prefix ends, with a C<cache_control> marker on a
+content-parts block.
+
+This backend places those markers itself, on the head message and on
+the last two C<user> / C<assistant> turns, so the marker written one
+round ago still covers everything the next request shares with it:
+
+=begin code :lang<raku>
+
+# On by default — nothing to configure for the common case.
+my $backend = LLM::Chat::Backend::OpenRouter.new(
+    api_key => %*ENV<OPENROUTER_API_KEY>,
+    model   => 'anthropic/claude-opus-4-7',
+);
+
+# Off: messages go on the wire as plain `content => 'text'` strings,
+# byte for byte what earlier releases sent.
+my $plain = LLM::Chat::Backend::OpenRouter.new(
+    api_key           => %*ENV<OPENROUTER_API_KEY>,
+    model             => 'anthropic/claude-opus-4-7',
+    cache-breakpoints => False,
+);
+
+=end code
+
+Implicit-caching routes ignore the markers, so the flag can stay on
+across a mixed model fleet. Conversation state is untouched either
+way — the rewrite happens on the serialized request body, so
+C<Message.get-checksum> is unaffected by where a breakpoint landed.
+
+Read the payoff back off the Response: C<.cached-prompt-tokens> is
+the cached slice of C<.prompt-tokens> when the provider reports one.
+
+=begin code :lang<raku>
+
+with $resp.cached-prompt-tokens -> $cached {
+    say "cache: $cached / {$resp.prompt-tokens} prompt tokens";
+}
+
+=end code
+
 =head1 ATTRIBUTES
 
 =item C<$.api_url>     — base URL. Defaults to C<https://openrouter.ai/api/v1>.
@@ -79,6 +131,7 @@ unchanged from C<OpenAICommon>.
 =item C<$.model>       — model id (e.g. C<anthropic/claude-opus-4-7>).
 =item C<$.http-referer> — optional. Sent as the C<HTTP-Referer> header.
 =item C<$.x-title>     — optional. Sent as the C<X-Title> header.
+=item C<$.cache-breakpoints> — C<Bool>, default C<True>. Whether chat bodies carry C<cache_control> breakpoints. Text-completion bodies are never annotated.
 
 =head1 RESPONSE FIELDS
 
@@ -92,6 +145,15 @@ subclass) and carry, in addition to the inherited OAI-spec fields:
 =item C<$.is-byok>        — True when the call used the user's BYOK keys.
 
 All four are presence-gated — read with C<.cost.defined> etc.
+
+The inherited C<$.cached-prompt-tokens> is filled in on this backend
+from either end of the call: from the completion body's
+C<usage.prompt_tokens_details.cached_tokens> when the route reports
+it inline, and otherwise from the C</generation> poll that also
+carries cost. The body's number always wins — the poll only fills a
+field the body left unreported, which is what makes the streaming
+path (no inline usage frame under this backend's request shape)
+report cache hits at all.
 
 =end pod
 
@@ -114,6 +176,24 @@ has Str $.http-referer;
 #|( Optional C<X-Title> attribution header. Human-readable name of
     the client app, paired with C<$.http-referer>. )
 has Str $.x-title;
+
+#|( Whether to annotate outgoing chat requests with OpenRouter
+    C<cache_control> breakpoints. On by default: providers that need
+    explicit breakpoints (Anthropic, Qwen, Gemini) cannot cache a
+    prompt without them, and providers that cache implicitly (OpenAI,
+    DeepSeek, Moonshot, Z.AI, Grok) ignore the annotation entirely —
+    so leaving it on costs nothing on any route and saves most of the
+    input bill on some. Turn it off to send the plain-string message
+    shape, e.g. when pinning a request's bytes for a diff or when a
+    new route rejects the content-parts form. )
+has Bool $.cache-breakpoints = True;
+
+# OpenRouter's hard ceiling on `cache_control` markers in one
+# request. The placement in _finalize-request-body can only ever
+# reach three, but a body that exceeds this is rejected outright, so
+# the walk enforces the ceiling rather than relying on the arithmetic
+# staying true as the placement rules change.
+constant MAX-CACHE-BREAKPOINTS = 4;
 
 #|( Default C<api_url> to OpenRouter's production endpoint when the
     caller didn't supply one. The parent's C<api_url> attr is
@@ -152,6 +232,129 @@ method _get-api-settings(--> Hash) {
 		);
 	}
 	%settings;
+}
+
+#|( Place C<cache_control> breakpoints on the assembled chat body.
+
+    OpenRouter's caching contract: a provider that does not cache
+    implicitly only reuses a prompt prefix when the request marks
+    where the reusable part ends, and the marker has to sit on a
+    content-I<parts> block rather than on a plain string. So a
+    marked message goes from
+
+        { role => 'system', content => 'You are ...' }
+
+    to
+
+        {
+            role    => 'system',
+            content => [ {
+                type          => 'text',
+                text          => 'You are ...',
+                cache_control => { type => 'ephemeral' },
+            }, ],
+        }
+
+    Where the markers go is the whole design. A breakpoint says
+    "everything up to and including this message is a cacheable
+    prefix", so we mark:
+
+      * the head message — a caller's system prompt, in every
+        conversation shape we see. It is the same bytes on every
+        round, which makes it the one prefix always worth a marker.
+      * the last two C<user> / C<assistant> turns, found by walking
+        backwards. Round N+1 re-sends round N's conversation with new
+        turns appended, so the marker one round old covers everything
+        the new request shares with the old one — a single trailing
+        marker would only ever match a prefix that had already
+        stopped growing.
+
+    The backward walk skips two shapes on its own, which is why it
+    tests content rather than only role: C<tool>-role results (whose
+    text is a transient the next turn subsumes) and C<assistant>
+    messages whose content C<to-hash> nulled because they carry
+    C<tool_calls> instead. Widening to those — Anthropic does accept
+    a marker on a tool result — waits on live verification against
+    the providers that need markers at all; the conservative set
+    already covers the expensive prefix.
+
+    Inert unless C<$.cache-breakpoints> is on and the body is a chat
+    body: a text-completion body carries C<prompt>, has no messages
+    to annotate, and is passed straight back.
+
+    The Message objects behind those hashes are never touched. Each
+    promotion builds a fresh hash, so a message's C<to-hash> and
+    C<get-checksum> read the same after a request as before it —
+    which matters because breakpoints move every round and a checksum
+    that moved with them would invalidate caller-side caches on every
+    turn. )
+method _finalize-request-body(%settings --> Hash) {
+	return %settings unless $!cache-breakpoints;
+	return %settings unless %settings<messages>:exists;
+
+	my @out;
+	@out.push($_) for %settings<messages>.list;
+	return %settings unless @out.elems;
+
+	my $placed = 0;
+
+	# (a) The head message — a system prompt in every conversation
+	# shape we see, and the longest-lived prefix either way.
+	if self!cacheable(@out[0]) {
+		@out[0] = self!promote-cache-block(@out[0]);
+		$placed++;
+	}
+	my $head-promoted = $placed > 0;
+
+	# (b) The tail — the last two turns that can carry a marker.
+	my $tail = 0;
+	for (^@out.elems).reverse -> $i {
+		last if $tail >= 2;
+		last if $placed >= MAX-CACHE-BREAKPOINTS;
+		next if $i == 0 && $head-promoted;
+		next unless @out[$i] ~~ Associative;
+
+		my $role = @out[$i]<role>;
+		next unless $role.defined && ($role eq 'user' || $role eq 'assistant');
+		next unless self!cacheable(@out[$i]);
+
+		@out[$i] = self!promote-cache-block(@out[$i]);
+		$placed++;
+		$tail++;
+	}
+
+	return %settings unless $placed;
+
+	my %out = %settings;
+	%out<messages> = @out;
+	%out;
+}
+
+#|( Whether a serialized message hash can carry a breakpoint: it has
+    to have text for the marker to sit on. False for the
+    C«content => Any» shape C<to-hash> produces for a tool-calling
+    assistant, for a message already promoted to a parts array, and
+    for empty content (which providers reject as a cache block). )
+method !cacheable($message --> Bool:D) {
+	return False unless $message ~~ Associative;
+	my $content = $message<content>;
+	$content ~~ Str:D && $content.chars > 0;
+}
+
+#|( Build the content-parts form of one serialized message, with the
+    breakpoint on its single text part. Returns a NEW hash — the
+    input belongs to the request body the caller assembled from the
+    conversation's Messages, and nothing here may write through it. )
+method !promote-cache-block(%message --> Hash) {
+	my %promoted = %message;
+	%promoted<content> = [
+		%(
+			type          => 'text',
+			text          => %message<content>,
+			cache_control => %( type => 'ephemeral' ),
+		),
+	];
+	%promoted;
 }
 
 #|( Add the OpenRouter attribution headers when configured.
@@ -294,6 +497,30 @@ method !fetch-generation-metadata(LLM::Chat::Backend::Response $response) {
 		if %payload<tokens_completion>:exists
 		&& %payload<tokens_completion>.defined
 		&& !$response.completion-tokens.defined;
+
+	# Cache-hit telemetry, same never-overwrite-a-body-value rule as
+	# the token counts above: a `usage.prompt_tokens_details` block on
+	# the completion body is the provider's own number and always wins.
+	#
+	# Which key the metadata endpoint uses for it is the one thing here
+	# we cannot pin from the docs, so the lift probes an ordered
+	# candidate list and takes the first defined numeric value:
+	# OpenRouter's own `native_tokens_*` family first, then the plain
+	# `tokens_cached` that matches the `tokens_prompt` naming beside
+	# it, then the OAI-spec nesting in case the payload passes the
+	# upstream usage block straight through. Order awaits live
+	# verification against a generation that actually hit a cache;
+	# until then a wrong guess costs nothing — every candidate is
+	# absent and the field simply stays unreported.
+	unless $response.cached-prompt-tokens.defined {
+		my @candidates = %payload<native_tokens_cached>, %payload<tokens_cached>;
+		@candidates.push(%payload<prompt_tokens_details><cached_tokens>)
+			if %payload<prompt_tokens_details> ~~ Associative;
+
+		with @candidates.first({ .defined && $_ ~~ Numeric }) -> $cached {
+			%oai-args<cached-prompt> = $cached;
+		}
+	}
 
 	$response._set-usage(|%oai-args) if %oai-args.elems;
 

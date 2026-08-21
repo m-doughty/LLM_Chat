@@ -3,7 +3,7 @@ use lib 'lib';
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Response::Stream;
 
-plan 39;
+plan 47;
 
 my $resp = LLM::Chat::Backend::Response.new(id => "1");
 
@@ -57,8 +57,9 @@ is-deeply @stream_events, ["Hel", "lo,", " Wo", "rld!"], "Correct events";
 # Response objects — see t/13-or-response.rakutest for that coverage.
 
 my $u = LLM::Chat::Backend::Response.new(id => "u");
-nok $u.prompt-tokens.defined,     "prompt-tokens undefined by default";
-nok $u.model-used.defined,        "model-used undefined by default";
+nok $u.prompt-tokens.defined,        "prompt-tokens undefined by default";
+nok $u.model-used.defined,           "model-used undefined by default";
+nok $u.cached-prompt-tokens.defined, "cached-prompt-tokens undefined by default";
 
 $u._set-usage(
     prompt     => 120,
@@ -71,10 +72,33 @@ is $u.completion-tokens, 37,               "completion-tokens populated";
 is $u.total-tokens,      157,              "total-tokens populated";
 is $u.model-used,        'z-ai/glm-5.1',   "model-used populated";
 
+# A provider that says nothing about caching leaves the field
+# unreported — the whole point of "undefined isn't zero".
+nok $u.cached-prompt-tokens.defined,
+    "cached-prompt-tokens untouched by a usage update that omits it";
+
 # Presence-guarded: later partial update must not clear prior values.
 $u._set-usage(completion => 42);   # bumps completion only
 is $u.completion-tokens, 42,       "completion updated";
 is $u.prompt-tokens,     120,      "prompt unchanged by partial update";
+
+# Cache telemetry arrives on its own (OpenRouter's /generation poll
+# fills it in after the body's counts already landed).
+$u._set-usage(cached-prompt => 96);
+is $u.cached-prompt-tokens, 96,    "cached-prompt-tokens populated";
+is $u.prompt-tokens,        120,   "prompt unchanged by a cache-only update";
+is $u.completion-tokens,    42,    "completion unchanged by a cache-only update";
+
+$u._set-usage(prompt => 130);
+is $u.cached-prompt-tokens, 96,    "cached-prompt-tokens survives a later partial update";
+
+# Zero is a report, not an absence: "this call cached nothing" and
+# "this provider never mentions caching" have to stay distinguishable.
+my $u0 = LLM::Chat::Backend::Response.new(id => "u0");
+$u0._set-usage(prompt => 400, cached-prompt => 0);
+is $u0.cached-prompt-tokens, 0,    "a reported zero is recorded as 0, not dropped";
+ok  $u0.cached-prompt-tokens.defined,
+    "a reported zero reads as defined";
 
 # --- Structured error info (Task fallback classification) ------------
 

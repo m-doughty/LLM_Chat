@@ -1,0 +1,23 @@
+{%- for message in messages -%}
+<|{{ message.role }}|>
+{%- if message.content %}
+{{ message.content }}
+{%- endif -%}
+{%- if message.tool_calls -%}
+{%- for tc in message.tool_calls %}
+<tool_call>{{ tc.function.name }}
+{%- if tc.function.arguments is mapping -%}
+{%- for arg_key, arg_value in tc.function.arguments.items() %}
+<arg_key>{{ arg_key }}</arg_key>
+<arg_value>{{ arg_value }}</arg_value>
+{%- endfor %}
+{%- else %}
+<raw_args>{{ tc.function.arguments }}</raw_args>
+{%- endif %}
+</tool_call>
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt %}
+<|assistant|>
+{%- endif -%}

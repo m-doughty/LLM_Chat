@@ -1,6 +1,7 @@
 use Test;
-use lib 'lib';
+use lib 'lib', 't/lib';
 
+use ChatTestKit;
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::OpenRouter;
@@ -8,6 +9,12 @@ use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Response::OpenRouter;
 use LLM::Chat::Backend::Response::OpenRouter::Stream;
 use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+
+use Cro::HTTP::Router;
+use Cro::HTTP::Server;
+use JSON::Fast;
 
 # Unit coverage for the OpenRouter backend's overrides. The HTTP
 # transport is inherited verbatim from OpenAICommon and exercised
@@ -26,11 +33,15 @@ use LLM::Chat::Backend::Settings;
 #   * Presence-gating across partial bodies + stream chunk shapes
 #   * _on-blocking-complete / _on-stream-complete defensive guards
 #     (no network call when the response has no generation-id, and
-#     no crash when the response isn't OR-augmented). The actual
-#     /generation HTTP fetch is not exercised here — it would need
-#     a mock server — but the early-return guards are.
+#     no crash when the response isn't OR-augmented)
+#   * _finalize-request-body placing cache_control breakpoints, and
+#     leaving conversation state alone while it does
+#
+# The last two need bytes on a socket rather than a method call, so a
+# fixture server answers the completion / generation pairs the lifts
+# read and records the request bodies the breakpoint walk produces.
 
-plan 13;
+plan 20;
 
 sub make-backend(*%args) {
     LLM::Chat::Backend::OpenRouter.new(
@@ -39,6 +50,166 @@ sub make-backend(*%args) {
         api_key  => 'test-key',
         |%args,
     );
+}
+
+# === The fixture server ===
+#
+# One prefix per behaviour under test, because the backend builds its
+# URLs as "$api_url/chat/completions" and "$api_url/generation":
+#
+#   poll/     — completion body reports no cache; the /generation poll
+#               does. This is the streaming-shaped case (the only place
+#               a cache hit can come from) exercised on the blocking
+#               path so the lift itself is what's under test.
+#   body/     — completion body reports a cache hit AND the poll
+#               reports a different one. The body has to win.
+#   nocache/  — neither end mentions caching.
+#   capture/  — records the request body and answers with a completion
+#               carrying no top-level id, so no /generation poll fires
+#               and the channel below holds exactly one body per call.
+
+my $bodies = Channel.new;
+
+sub json-blob(%payload --> Blob) {
+    to-json(%payload, :!pretty).encode('utf-8');
+}
+
+sub chat-reply(%usage?, :$id --> Hash) {
+    my %r =
+        model   => 'anthropic/claude-opus-4-7',
+        # Trailing comma is load-bearing: `[ %h ]` hits the single-arg
+        # rule and flattens the Hash into one array element per Pair.
+        choices => [ { message => { content => 'ok' }, finish_reason => 'stop' }, ];
+    %r<id>    = $id     if $id.defined;
+    %r<usage> = %usage  if %usage.elems;
+    %r;
+}
+
+my $app = route {
+    # ChatTestKit's boot() proves the listener on the port it picked is
+    # ours and not some other process's.
+    get -> 'ping' { content 'text/plain', 'pong' }
+
+    post -> 'poll', 'chat', 'completions' {
+        content 'application/json', json-blob(chat-reply(
+            %( prompt_tokens => 4096, completion_tokens => 64, total_tokens => 4160 ),
+            id => 'gen-poll',
+        ));
+    }
+    get -> 'poll', 'generation' {
+        content 'application/json', json-blob({
+            data => {
+                total_cost           => 0.0042,
+                provider_name        => 'Anthropic',
+                # Deliberately disagrees with the body: the poll may
+                # only fill fields the body left unreported.
+                tokens_prompt        => 9,
+                tokens_completion    => 9,
+                native_tokens_cached => 1536,
+            },
+        });
+    }
+
+    post -> 'body', 'chat', 'completions' {
+        content 'application/json', json-blob(chat-reply(
+            %(
+                prompt_tokens         => 4096,
+                completion_tokens     => 64,
+                total_tokens          => 4160,
+                prompt_tokens_details => { cached_tokens => 2048 },
+            ),
+            id => 'gen-body',
+        ));
+    }
+    get -> 'body', 'generation' {
+        content 'application/json', json-blob({
+            data => {
+                total_cost           => 0.0042,
+                native_tokens_cached => 7,
+            },
+        });
+    }
+
+    post -> 'nocache', 'chat', 'completions' {
+        content 'application/json', json-blob(chat-reply(
+            %( prompt_tokens => 4096, completion_tokens => 64, total_tokens => 4160 ),
+            id => 'gen-nocache',
+        ));
+    }
+    get -> 'nocache', 'generation' {
+        content 'application/json', json-blob({
+            data => { total_cost => 0.0042, provider_name => 'Anthropic' },
+        });
+    }
+
+    post -> 'capture', 'chat', 'completions' {
+        request-body-blob -> $blob {
+            $bodies.send($blob.decode('utf-8'));
+            content 'application/json', json-blob(chat-reply());
+        }
+    }
+    post -> 'capture', 'completions' {
+        request-body-blob -> $blob {
+            $bodies.send($blob.decode('utf-8'));
+            content 'application/json', json-blob({
+                choices => [ { text => 'ok', finish_reason => 'stop' }, ],
+            });
+        }
+    }
+};
+
+my ($server, $port) = boot($app);
+LEAVE { try $server.stop with $server }
+
+sub make-http-backend(Str:D $prefix, *%args) {
+    make-backend(
+        api_url  => "http://127.0.0.1:$port/$prefix",
+        template => LLM::Chat::Template::ChatML.new,
+        |%args,
+    );
+}
+
+#| The one request body the fixture recorded, as raw text. Waits with
+#| a deadline rather than blocking the suite forever on a call that
+#| never reached the server.
+sub captured(Str:D $what --> Str:D) {
+    my $received = start { $bodies.receive };
+    timed($received, $what);
+    $received.result;
+}
+
+#| A conversation with every message shape the breakpoint walk has to
+#| tell apart: a system head, an old turn, a recent assistant turn, an
+#| assistant that holds tool calls instead of text, a tool result, and
+#| the latest user turn.
+sub breakpoint-convo(--> List) {
+    (
+        LLM::Chat::Conversation::Message.new(:role<system>,
+            :content('You are a careful assistant.')),
+        LLM::Chat::Conversation::Message.new(:role<user>,
+            :content('First question')),
+        LLM::Chat::Conversation::Message.new(:role<assistant>,
+            :content('Here is the answer.')),
+        LLM::Chat::Conversation::Message.new(:role<assistant>, :content(''),
+            # Trailing comma again — a bare `[ %h ]` would flatten.
+            :tool-calls([ %(
+                id       => 'call-1',
+                type     => 'function',
+                function => %( name => 'lookup', arguments => '{}' ),
+            ), ])),
+        LLM::Chat::Conversation::Message.new(:role<tool>,
+            :content('{"ok":true}'), :tool-call-id('call-1')),
+        LLM::Chat::Conversation::Message.new(:role<user>,
+            :content('Latest question')),
+    );
+}
+
+#| Every cache_control marker in a serialized body, across all
+#| messages — the number OpenRouter caps at four.
+sub breakpoints-in(%body --> Int:D) {
+    %body<messages>.grep({ $_<content> ~~ Positional })
+                   .map({ $_<content>.grep({ $_<cache_control>.defined }).elems })
+                   .sum;
 }
 
 subtest 'class hierarchy' => {
@@ -295,4 +466,175 @@ subtest 'json_schema settings become an OpenAI response_format block' => {
     $mutated.settings.json_schema = %schema;
     ok $mutated._get-api-settings<response_format>:exists,
         'post-construction settings mutation is honoured';
+};
+
+# === Cache telemetry ===
+
+subtest 'the /generation poll supplies cached prompt tokens' => {
+    plan 5;
+    my @convo = breakpoint-convo();
+    my $resp  = settled(
+        make-http-backend('poll').chat-completion(@convo),
+        'the polled completion',
+    );
+
+    ok $resp.is-success, 'the completion succeeded';
+    is $resp.cached-prompt-tokens, 1536,
+        'native_tokens_cached from /generation lands on the Response';
+    # The poll disagrees with the body about the token counts on
+    # purpose: a field the body already reported is never overwritten.
+    is $resp.prompt-tokens,     4096, 'body-reported prompt tokens survive the poll';
+    is $resp.completion-tokens, 64,   'body-reported completion tokens survive the poll';
+    is $resp.provider-name, 'Anthropic',
+        'the poll still filled in the fields the body left out';
+};
+
+subtest 'a body-reported cache hit outranks the /generation poll' => {
+    plan 3;
+    my @convo = breakpoint-convo();
+    my $resp  = settled(
+        make-http-backend('body').chat-completion(@convo),
+        'the body-reported completion',
+    );
+
+    ok $resp.is-success, 'the completion succeeded';
+    is $resp.cached-prompt-tokens, 2048,
+        'usage.prompt_tokens_details.cached_tokens wins';
+    isnt $resp.cached-prompt-tokens, 7,
+        'the poll did not overwrite it with its own (rounded) number';
+};
+
+subtest 'no cache field anywhere leaves cached-prompt-tokens undefined' => {
+    plan 3;
+    my @convo = breakpoint-convo();
+    my $resp  = settled(
+        make-http-backend('nocache').chat-completion(@convo),
+        'the cache-less completion',
+    );
+
+    ok $resp.is-success, 'the completion succeeded';
+    nok $resp.cached-prompt-tokens.defined,
+        'unreported caching stays undefined rather than defaulting to 0';
+    is $resp.provider-name, 'Anthropic',
+        'and the poll ran regardless — the field is absent, not the payload';
+};
+
+# === cache_control breakpoints ===
+
+subtest 'cache-breakpoints off sends the pre-breakpoint body' => {
+    plan 4;
+    my @convo    = breakpoint-convo();
+    my @expected = @convo.map(*.to-hash).Array;
+
+    my $resp = settled(
+        make-http-backend('capture', cache-breakpoints => False)
+            .chat-completion(@convo),
+        'the unannotated completion',
+    );
+    ok $resp.is-success, 'the completion succeeded';
+
+    my $raw = captured('the unannotated request body');
+    nok $raw.contains('cache_control'),
+        'nothing on the wire mentions cache_control';
+
+    my %body = from-json($raw);
+    is-deeply %body<messages>.Array, @expected,
+        'messages are byte-for-byte what to-hash produced';
+    nok %body<stream>:exists, 'and the rest of the body is the usual shape';
+};
+
+subtest 'cache-breakpoints on marks the head and the last two turns' => {
+    plan 10;
+    my @convo = breakpoint-convo();
+
+    my $resp = settled(
+        make-http-backend('capture').chat-completion(@convo),
+        'the annotated completion',
+    );
+    ok $resp.is-success, 'the completion succeeded';
+
+    my %body = from-json(captured('the annotated request body'));
+    my @msgs = %body<messages>.list;
+    is @msgs.elems, 6, 'every message still reached the wire';
+
+    is-deeply @msgs[0]<content>,
+        [ %(
+            type          => 'text',
+            text          => 'You are a careful assistant.',
+            cache_control => %( type => 'ephemeral' ),
+        ), ],
+        'the head message is promoted to a marked content-parts block';
+    is @msgs[0]<role>, 'system', 'and keeps its role';
+
+    is @msgs[1]<content>, 'First question',
+        'an older turn keeps the plain string shape';
+
+    is-deeply @msgs[2]<content>,
+        [ %(
+            type          => 'text',
+            text          => 'Here is the answer.',
+            cache_control => %( type => 'ephemeral' ),
+        ), ],
+        'the second-newest eligible turn is marked';
+    is-deeply @msgs[5]<content>,
+        [ %(
+            type          => 'text',
+            text          => 'Latest question',
+            cache_control => %( type => 'ephemeral' ),
+        ), ],
+        'the newest turn is marked';
+
+    # The two shapes the backward walk has to step over to reach that
+    # second marker: an assistant whose content to-hash nulled because
+    # it carries tool calls, and a tool result.
+    nok @msgs[3]<content>.defined,
+        'a tool-calling assistant is left with its null content';
+    is @msgs[4]<content>, '{"ok":true}',
+        'a tool result is left as a plain string';
+
+    is breakpoints-in(%body), 3,
+        'three markers placed, inside OpenRouter\'s ceiling of four';
+};
+
+subtest 'text-completion bodies are never annotated' => {
+    plan 4;
+    my @convo = breakpoint-convo();
+
+    my $resp = settled(
+        make-http-backend('capture').text-completion(@convo),
+        'the text completion',
+    );
+    ok $resp.is-success, 'the completion succeeded';
+
+    my $raw = captured('the text-completion request body');
+    nok $raw.contains('cache_control'),
+        'a prompt body carries no markers — there are no messages to mark';
+
+    my %body = from-json($raw);
+    ok %body<prompt>.defined,       'the rendered prompt is there';
+    nok %body<messages>:exists,     'and no messages key was invented';
+};
+
+subtest 'annotating a request leaves the conversation untouched' => {
+    plan 3;
+    my @convo  = breakpoint-convo();
+    my @before = @convo.map(*.to-hash).Array;
+
+    my $resp = settled(
+        make-http-backend('capture').chat-completion(@convo),
+        'the checksum-invariance completion',
+    );
+    ok $resp.is-success, 'the completion succeeded';
+    captured('the request body of the checksum-invariance call');
+
+    is-deeply @convo.map(*.to-hash).Array, @before,
+        'to-hash reads the same after the request as before it';
+
+    # get-checksum memoises on first call, so asking the messages we
+    # just sent is only meaningful against a pristine twin built from
+    # the same inputs — if a breakpoint had leaked into Message state,
+    # the digests would diverge here.
+    is-deeply @convo.map(*.get-checksum).Array,
+              breakpoint-convo().map(*.get-checksum).Array,
+        'checksums match a conversation that was never sent anywhere';
 };

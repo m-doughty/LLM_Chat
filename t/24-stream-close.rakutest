@@ -1,0 +1,324 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend::KoboldCpp;
+use LLM::Chat::Backend::Response::Stream;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+
+# What happens when a streamed body just STOPS.
+#
+# `[DONE]` is a convention, not a guarantee. Plenty of OpenAI-compatible
+# servers close the connection on the finish_reason chunk and never send
+# it; a proxy, a killed worker or a dropped connection produces the same
+# thing with no finish reason at all. Both streaming loops used to walk
+# out of their `react` block in that case and simply stop — the Response
+# was never completed and never quit, so every consumer polling
+# `.is-done` (or awaiting a Promise derived from it) waited out its own
+# timeout instead. Two minutes of nothing, per occurrence, for a stream
+# that had been over the whole time.
+#
+# OpenAICommon now routes every terminal state through !settle-stream:
+#
+#   * `[DONE]`, or a stop / tool_calls finish reason then a close
+#     => hook, then done, then success;
+#   * a close with neither => quit, error-class 'response'.
+#
+# The transport is real Cro over a real socket, so the SSE framing,
+# chunked transfer decoding, body-close detection and the backend's own
+# react loop all take part. The fixture server ends the chunked body and
+# nothing else — exactly what a server that never says [DONE] looks
+# like from the client's side.
+
+plan 8;
+
+# Canned SSE endpoint: answers any request whose headers have arrived
+# with the supplied event bodies, chunk-encoded, then ends the body.
+# Returns the bound port; the tap and every accepted connection are
+# closed by the caller's LEAVE.
+class SSEServer {
+    has $.tap;
+    has $.port;
+    has @.conns;
+    has @.paths;
+    has Lock $!lock = Lock.new;
+
+    method start(*@events) {
+        my @body = @events;
+        $!tap = IO::Socket::Async.listen('127.0.0.1', 0).tap(-> $conn {
+            $!lock.protect: { @!conns.push($conn) };
+            my Str $seen    = '';
+            my Bool $served = False;
+            # No `return` in here: the tap block is a Block, not a
+            # Routine, and its enclosing method is long gone by the
+            # time bytes arrive.
+            $conn.Supply(:bin).tap(-> $bytes {
+                $seen ~= $bytes.decode('latin-1');
+                if !$served && $seen.contains("\r\n\r\n") {
+                    $served = True;
+
+                    if $seen ~~ / ^ (\w+) \s+ (\S+) / {
+                        $!lock.protect: { @!paths.push(~$1) };
+                    }
+
+                    $conn.print(
+                        "HTTP/1.1 200 OK\r\n"
+                        ~ "Content-Type: text/event-stream\r\n"
+                        ~ "Cache-Control: no-cache\r\n"
+                        ~ "Transfer-Encoding: chunked\r\n\r\n"
+                    );
+                    for @body -> $event {
+                        my $frame = "data: $event\n\n";
+                        $conn.print(
+                            $frame.encode('utf-8').bytes.base(16).lc
+                            ~ "\r\n" ~ $frame ~ "\r\n"
+                        );
+                    }
+                    $conn.print("0\r\n\r\n");
+                }
+            });
+        });
+        $!port = await $!tap.socket-port;
+        self;
+    }
+
+    method stop() {
+        .close for @!conns;
+        $!tap.close;
+    }
+}
+
+# Records the state of the Response at the moment _on-stream-complete
+# fires. The contract is that the hook runs BEFORE the supply is
+# completed, so a subclass attaching post-stream metadata (OpenRouter's
+# /generation cost lookup) has it in place by the time a consumer
+# observes .is-done. The text path used to call .done first, which made
+# that contract a lie on exactly one of the two streaming methods.
+class HookOrderBackend is LLM::Chat::Backend::KoboldCpp {
+    has @.hook-calls;
+
+    method _on-stream-complete(LLM::Chat::Backend::Response::Stream $response) {
+        @!hook-calls.push($response.is-done);
+    }
+}
+
+sub make-backend(Int $port, :$class = LLM::Chat::Backend::KoboldCpp) {
+    $class.new(
+        api_url  => "http://127.0.0.1:$port/v1",
+        settings => LLM::Chat::Backend::Settings.new(max_tokens => 64),
+        template => LLM::Chat::Template::ChatML.new,
+    );
+}
+
+sub user-turn() {
+    [LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi'),]
+}
+
+# THE PIN for the spin. A settled Response is one whose own tap has run,
+# so polling .is-done sees success and failure alike, however fast
+# either happened. Five seconds is a hundredfold what a loopback fixture
+# needs and a fraction of the consumer-side timeouts the unsettled
+# Response used to burn.
+constant SETTLE-LIMIT = 5;
+
+sub settles($response --> Bool) {
+    my $deadline = now + SETTLE-LIMIT;
+    until $response.is-done {
+        return False if now > $deadline;
+        sleep 0.005;
+    }
+    True;
+}
+
+my @chat-stop =
+    '{"choices":[{"delta":{"content":"Once upon"},"finish_reason":null}]}',
+    '{"choices":[{"delta":{"content":" a time"},"finish_reason":"stop"}]}';
+
+my @chat-tool-calls =
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_z1","type":"function","function":{"name":"task","arguments":""}}]},"finish_reason":null}]}',
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"prompt\":\"go\"}"}}]},"finish_reason":null}]}',
+    '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}';
+
+my @chat-silent =
+    '{"choices":[{"delta":{"content":"Once upon"},"finish_reason":null}]}',
+    '{"choices":[{"delta":{"content":" a time"},"finish_reason":null}]}';
+
+my @chat-done =
+    '{"choices":[{"delta":{"content":"Once upon"},"finish_reason":null}]}',
+    '{"choices":[{"delta":{"content":" a time"},"finish_reason":"stop"}]}',
+    '[DONE]';
+
+my @text-stop =
+    '{"choices":[{"text":"Once upon","finish_reason":null}]}',
+    '{"choices":[{"text":" a time","finish_reason":"stop"}]}';
+
+my @text-silent =
+    '{"choices":[{"text":"Once upon","finish_reason":null}]}',
+    '{"choices":[{"text":" a time","finish_reason":null}]}';
+
+my @text-done =
+    '{"choices":[{"text":"Once upon","finish_reason":null}]}',
+    '{"choices":[{"text":" a time","finish_reason":null}]}',
+    '[DONE]';
+
+subtest 'chat: finish_reason stop with no [DONE] completes the stream' => {
+    plan 6;
+    my $server = SSEServer.new.start(@chat-stop);
+    LEAVE { $server.stop }
+
+    my $resp = make-backend($server.port).chat-completion-stream(user-turn());
+
+    ok settles($resp), "settles inside {SETTLE-LIMIT}s rather than hanging";
+    ok $resp.is-done,      'response is done';
+    ok $resp.is-success,   'a stop-terminated stream is a success';
+    is $resp.latest, 'Once upon a time', 'the generation is intact';
+    is $resp.finish-reason, 'stop', 'finish-reason is recorded';
+    nok $resp.error-class.defined, 'and no error class is set';
+};
+
+subtest 'chat: finish_reason tool_calls with no [DONE] completes the stream' => {
+    plan 5;
+    my $server = SSEServer.new.start(@chat-tool-calls);
+    LEAVE { $server.stop }
+
+    my $resp = make-backend($server.port).chat-completion-stream(
+        user-turn(),
+        tools => [{ type => 'function', function => { name => 'task' } },],
+    );
+
+    ok settles($resp), "settles inside {SETTLE-LIMIT}s rather than hanging";
+    ok $resp.is-success, 'a tool_calls-terminated stream is a success';
+    is $resp.finish-reason, 'tool_calls', 'finish-reason is recorded';
+    is $resp.tool-calls.elems, 1, 'the assembled call survives the close';
+    is $resp.tool-calls[0]<function><arguments>, '{"prompt":"go"}',
+        'with its arguments whole';
+};
+
+subtest 'chat: a close with no finish reason is a failure' => {
+    plan 5;
+    # Nothing distinguishes a reply that ended from one that was cut
+    # off in transit, so this cannot be handed over as a complete
+    # answer — but it must still settle.
+    my $server = SSEServer.new.start(@chat-silent);
+    LEAVE { $server.stop }
+
+    my $resp = make-backend($server.port).chat-completion-stream(user-turn());
+
+    ok settles($resp), "settles inside {SETTLE-LIMIT}s rather than hanging";
+    ok $resp.is-done,     'response is done';
+    nok $resp.is-success, 'an unexplained close is not a success';
+    is $resp.error-class, 'response', 'it classifies as a response error';
+    ok ($resp.err // '').Str.contains('without [DONE]'),
+        'and the error says what was missing';
+};
+
+subtest 'text: finish_reason stop with no [DONE] completes the stream' => {
+    plan 4;
+    my $server = SSEServer.new.start(@text-stop);
+    LEAVE { $server.stop }
+
+    my $resp = make-backend($server.port).text-completion-stream(user-turn());
+
+    ok settles($resp), "settles inside {SETTLE-LIMIT}s rather than hanging";
+    ok $resp.is-success, 'a stop-terminated stream is a success';
+    is $resp.latest, 'Once upon a time', 'the generation is intact';
+    is $server.paths[0], '/v1/completions',
+        'request went to the completions endpoint';
+};
+
+subtest 'text: a close with no finish reason is a failure' => {
+    plan 4;
+    my $server = SSEServer.new.start(@text-silent);
+    LEAVE { $server.stop }
+
+    my $resp = make-backend($server.port).text-completion-stream(user-turn());
+
+    ok settles($resp), "settles inside {SETTLE-LIMIT}s rather than hanging";
+    ok $resp.is-done,     'response is done';
+    nok $resp.is-success, 'an unexplained close is not a success';
+    is $resp.error-class, 'response', 'it classifies as a response error';
+};
+
+subtest '[DONE] still terminates both paths normally' => {
+    plan 6;
+    # The regression pin: the path that always worked has to keep
+    # working, on both streaming methods.
+    my $chat-server = SSEServer.new.start(@chat-done);
+    LEAVE { $chat-server.stop }
+    my $chat = make-backend($chat-server.port).chat-completion-stream(user-turn());
+
+    ok settles($chat), 'chat: [DONE] settles the stream';
+    ok $chat.is-success, 'chat: and it is a success';
+    is $chat.latest, 'Once upon a time', 'chat: with the whole generation';
+
+    my $text-server = SSEServer.new.start(@text-done);
+    LEAVE { $text-server.stop }
+    my $text = make-backend($text-server.port).text-completion-stream(user-turn());
+
+    ok settles($text), 'text: [DONE] settles the stream';
+    ok $text.is-success, 'text: and it is a success';
+    is $text.latest, 'Once upon a time', 'text: with the whole generation';
+};
+
+subtest 'the completion hook fires before the response is done' => {
+    plan 6;
+    # THE ORDERING FIX. text-completion-stream's [DONE] arm called
+    # .done and THEN the hook, so a subclass's post-stream metadata
+    # landed after consumers had already been told the response was
+    # complete. Both paths, both terminations, now go through
+    # !settle-stream, which owns the order.
+    for (
+        'chat [DONE]'       => (@chat-done, 'chat'),
+        'chat close-on-stop' => (@chat-stop, 'chat'),
+        'text [DONE]'       => (@text-done, 'text'),
+        'text close-on-stop' => (@text-stop, 'text'),
+    ) -> (:key($what), :value(($events, $kind))) {
+        my $server = SSEServer.new.start(|$events);
+        LEAVE { $server.stop }
+
+        my $backend = make-backend($server.port, class => HookOrderBackend);
+        my $resp = $kind eq 'chat'
+            ?? $backend.chat-completion-stream(user-turn())
+            !! $backend.text-completion-stream(user-turn());
+        settles($resp);
+
+        is $backend.hook-calls, [False],
+            "$what: the hook ran exactly once, before .is-done was set";
+    }
+
+    # And it does NOT fire for a stream that failed — there is no
+    # completion to attach metadata to.
+    my $server = SSEServer.new.start(@chat-silent);
+    LEAVE { $server.stop }
+    my $backend = make-backend($server.port, class => HookOrderBackend);
+    my $resp = $backend.chat-completion-stream(user-turn());
+    settles($resp);
+
+    is $backend.hook-calls.elems, 0,
+        'an unexplained close does not fire the completion hook';
+    nok $resp.is-success, 'and is still a failure';
+};
+
+subtest 'a named terminal failure is left alone by the close path' => {
+    plan 4;
+    # `length` quits where the reason is read; the body then closes,
+    # which reaches !settle-stream with an already-terminal Response.
+    # It must not re-settle it into a success, and must not overwrite
+    # the diagnosis.
+    my $server = SSEServer.new.start(
+        '{"choices":[{"delta":{"content":"Once upon"},"finish_reason":null}]}',
+        '{"choices":[{"delta":{"content":" a"},"finish_reason":"length"}]}',
+    );
+    LEAVE { $server.stop }
+
+    my $resp = make-backend($server.port).chat-completion-stream(user-turn());
+
+    ok settles($resp), "settles inside {SETTLE-LIMIT}s";
+    nok $resp.is-success, 'a truncated stream stays a failure';
+    is $resp.finish-reason, 'length', 'the reason is not overwritten';
+    ok ($resp.err // '').Str.contains('max tokens'),
+        'and neither is the error the reason produced';
+};
+
+done-testing;

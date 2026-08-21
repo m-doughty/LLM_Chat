@@ -1,0 +1,141 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::Jinja2;
+use LLM::Chat::TokenCounter;
+use Tokenizers;
+
+my sub msg(Str:D $role, Str:D $content, *%extra) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra)
+}
+
+my $template = LLM::Chat::Template::Jinja2.new(
+	template => 't/fixtures/kimi-k2.7-chat-template.jinja'.IO.slurp,
+);
+my $tokenizer = Tokenizers.new-from-json('t/fixtures/tokenizer.json'.IO.slurp);
+my $counter = LLM::Chat::TokenCounter.new(:$template, :$tokenizer);
+
+my @messages = (
+	msg('system', 'You are a precise coding assistant.'),
+	msg('user', "Explain this Raku: `say \"λ 😀\"`; then check 東京."),
+	LLM::Chat::Conversation::Message.new(
+		role => 'assistant', content => 'I will inspect it.',
+		tool-calls => [item {
+			id => 'call_1', type => 'function', function => {
+				name => 'read_file', arguments => '{"path":"lib/λ.rakumod"}',
+			},
+		}],
+	),
+	LLM::Chat::Conversation::Message.new(
+		role => 'tool', content => "unit module Λ;\nsub f returns Int # 42",
+		tool-call-id => 'call_1',
+	),
+	msg('user', 'Now give the patch.'),
+);
+my @tools = ({
+	type => 'function', function => {
+		name => 'read_file', description => 'Read UTF-8 source code',
+		parameters => {
+			type => 'object', properties => {
+				path => { type => 'string', description => 'Repository path' },
+			}, required => ['path'],
+		},
+	},
+},);
+my $head = "IDENTITY\nYou are Sadna.";
+my $tail = "RUNTIME\ncwd=/tmp/東京";
+
+my @wire = (msg('system', $head), |@messages, msg('system', $tail));
+my $rendered = $template.render(@wire, :@tools);
+my $expected = $tokenizer.count($rendered, :add-special-tokens(False));
+is $counter.get-request-count(
+	@messages, :@tools, context-head => $head, context-tail => $tail,
+), $expected,
+	'full request count tokenizes the selected template render exactly';
+
+my $conversation-only = $counter.get-conversation-count(@messages);
+ok $expected > $conversation-only,
+	'tool catalogue and runtime context are included beyond conversation count';
+is $counter.get-conversation-count(@messages), $conversation-only,
+	'legacy conversation-only API remains stable';
+
+my $head-pos = $rendered.index('IDENTITY');
+my $conversation-pos = $rendered.index('You are a precise coding assistant.');
+my $tail-pos = $rendered.index('RUNTIME');
+ok $head-pos < $conversation-pos && $conversation-pos < $tail-pos,
+	'runtime context order is head, conversation, tail like Loop wire-view';
+ok $rendered.starts-with('<|im_system|>tool_declare<|im_middle|>'),
+	'Kimi fallback tool JSON is rendered as the first tool_declare turn';
+ok $rendered.contains('"name":"read_file"'),
+	'Kimi tool catalogue uses its compact tojson fallback';
+ok $rendered.contains('<|tool_calls_section_begin|>')
+	&& $rendered.contains('## Return of call_1'),
+	'tool call and result chain reaches the exact rendered prompt';
+ok $rendered.contains('λ 😀') && $rendered.contains('東京'),
+	'Unicode survives full-request rendering';
+ok $rendered.contains('sub f returns Int # 42'),
+	'code survives full-request rendering';
+
+my $messages-before = @messages.raku;
+my $tools-before = @tools.raku;
+$counter.get-request-count(
+	@messages, :@tools, context-head => $head, context-tail => $tail,
+);
+is @messages.raku, $messages-before, 'full-request counting does not mutate messages';
+is @tools.raku, $tools-before, 'full-request counting does not mutate tools';
+
+my $continued-render = $template.render(@wire, True, :@tools);
+is $counter.get-request-count(
+	@messages, :@tools, context-head => $head, context-tail => $tail,
+	:continuation,
+), $tokenizer.count($continued-render, :add-special-tokens(False)),
+	'continuation mode is counted using the template continuation render';
+
+# Counting a conversation that contains tool calls. The template now
+# sees `function.arguments` as a decoded object rather than a JSON
+# string — Kimi's template branches on exactly that (`is string` ...
+# else `| tojson`) — so the counter has to come back with a number on
+# every argument shape a real conversation can hold, including the
+# truncated fragment a stream cut short leaves behind.
+for (
+	'a JSON object'      => '{"path":"lib/λ.rakumod"}',
+	'a truncated object' => '{"path":"lib/λ.rak',
+	'nothing at all'     => '',
+	'a JSON array'       => '[1,2]',
+) -> (:key($what), :value($arguments)) {
+	my @tool-conversation = (
+		msg('user', 'read it'),
+		LLM::Chat::Conversation::Message.new(
+			role => 'assistant', content => '',
+			tool-calls => [item {
+				id => 'call_9', type => 'function',
+				function => { name => 'read_file', :$arguments },
+			}],
+		),
+		LLM::Chat::Conversation::Message.new(
+			role => 'tool', content => 'unit module Λ;', tool-call-id => 'call_9',
+		),
+	);
+
+	my $count;
+	lives-ok { $count = $counter.get-request-count(@tool-conversation, :@tools) },
+		"counting a tool-call conversation with $what does not throw";
+	isa-ok $count, Int, "and returns an Int for $what";
+	ok $count > 0, "a non-empty conversation with $what counts above zero";
+}
+
+throws-like { $counter.get-request-count([42]) },
+	LLM::Chat::TokenCounter::InvalidRequest,
+	message => /'messages[0]'/,
+	'non-message conversation elements are rejected clearly';
+throws-like { $counter.get-request-count(@messages, context-head => 42) },
+	LLM::Chat::TokenCounter::InvalidRequest,
+	message => /'context-head'/,
+	'invalid context head is rejected clearly';
+throws-like { $counter.get-request-count(@messages, tools => ['not a schema']) },
+	LLM::Chat::TokenCounter::InvalidRequest,
+	message => /'tools[0]'/,
+	'invalid tool catalogue entries are rejected clearly';
+
+done-testing;
