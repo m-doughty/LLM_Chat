@@ -11,9 +11,9 @@ my $template = LLM::Chat::Template::Llama4.new;
 is $template.name, 'llama-4', 'Correct template name';
 
 my @messages = (
-    LLM::Chat::Conversation::Message.new(:role<system>,    :content('Be helpful.')),
-    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
-    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi!'))
+	LLM::Chat::Conversation::Message.new(:role<system>,    :content('Be helpful.')),
+	LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+	LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi!'))
 );
 
 is $template.render(@messages), 

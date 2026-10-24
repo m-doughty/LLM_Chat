@@ -1,0 +1,167 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Test::Kit;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+
+use JSON::Fast;
+
+plan 3;
+
+my $requests = Channel.new;
+
+sub json-blob(%payload --> Blob) {
+	to-json(%payload, :!pretty).encode('utf-8');
+}
+
+sub streamed(Str:D $body --> Supply:D) {
+	supply {
+		emit $body.encode('utf-8');
+		done;
+	}
+}
+
+sub usage-sse(Int:D :$prompt!, Int:D :$completion!, Int:D :$total! --> Str:D) {
+	'data: ' ~ to-json({
+		model   => 'test/model',
+		choices => [],
+		usage   => {
+			prompt_tokens     => $prompt,
+			completion_tokens => $completion,
+			total_tokens      => $total,
+		},
+	}, :!pretty) ~ "\n\n" ~ "data: [DONE]\n\n";
+}
+
+# LLM::Chat::Test::Kit's raw server: the usage frame is the last thing
+# in each stream, so every assertion here rests on the whole stream
+# arriving.
+my $server = raw-server(-> $request {
+	given $request.method, $request.path {
+		when ('POST', '/capture/chat/completions') {
+			$requests.send($request.text);
+			$request.json<stream>
+				?? %( type => 'text/event-stream',
+					chunks => streamed(usage-sse(:prompt(11), :completion(22), :total(33))) )
+				!! %( body => json-blob({
+					choices => [ { message => { content => 'ok' }, finish_reason => 'stop' }, ],
+				}) );
+		}
+		when ('POST', '/capture/completions') {
+			$requests.send($request.text);
+			$request.json<stream>
+				?? %( type => 'text/event-stream',
+					chunks => streamed(usage-sse(:prompt(44), :completion(55), :total(99))) )
+				!! %( body => json-blob({
+					choices => [ { text => 'ok', finish_reason => 'stop' }, ],
+				}) );
+		}
+		default {
+			%( status => 404, body => '' );
+		}
+	}
+});
+LEAVE { $server.stop }
+
+class PreservingBackend is LLM::Chat::Backend::OpenAICommon {
+	method _finalize-request-body(%settings --> Hash) {
+		return %settings unless (%settings<stream>:exists) && %settings<stream>.so;
+		my %out = %settings;
+		%out<stream_options> = %(trace_id => 'kept', include_usage => False);
+		%out;
+	}
+}
+
+sub base(--> Str:D) { "{$server.url}/capture" }
+
+sub make-backend(Bool :$request-stream-usage = False, :$class = LLM::Chat::Backend::OpenAICommon) {
+	$class.new(
+		api_url  => base(),
+		api_key  => 'test-key',
+		model    => 'test/model',
+		settings => LLM::Chat::Backend::Settings.new,
+		template => LLM::Chat::Template::ChatML.new,
+		:$request-stream-usage,
+	);
+}
+
+my @messages = LLM::Chat::Conversation::Message.new(:role<user>, :content('count usage'));
+
+sub posted(Str:D $what --> Hash) {
+	my $received = start { $requests.receive };
+	timed($received, $what);
+	from-json($received.result);
+}
+
+sub four-paths($backend --> List) {
+	my @posted;
+
+	settled($backend.chat-completion(@messages), 'chat-completion');
+	@posted.push: posted('the chat-completion body');
+
+	stream-settled($backend.chat-completion-stream(@messages), 'chat-completion-stream');
+	@posted.push: posted('the chat-completion-stream body');
+
+	settled($backend.text-completion(@messages), 'text-completion');
+	@posted.push: posted('the text-completion body');
+
+	stream-settled($backend.text-completion-stream(@messages), 'text-completion-stream');
+	@posted.push: posted('the text-completion-stream body');
+
+	@posted.List;
+}
+
+subtest 'default request body compatibility across all completion paths' => {
+	plan 8;
+	my @posted = four-paths(make-backend());
+
+	nok @posted[0]<stream>:exists, 'chat-completion remains blocking';
+	ok @posted[1]<stream>, 'chat-completion-stream still sets stream';
+	nok @posted[2]<stream>:exists, 'text-completion remains blocking';
+	ok @posted[3]<stream>, 'text-completion-stream still sets stream';
+
+	for @posted.kv -> $i, %body {
+		nok %body<stream_options>:exists,
+			"path $i does not request stream usage by default";
+	}
+};
+
+subtest 'request-stream-usage only annotates streaming bodies and preserves options' => {
+	plan 10;
+	my @posted = four-paths(make-backend(:request-stream-usage, :class(PreservingBackend)));
+
+	nok @posted[0]<stream_options>:exists, 'chat-completion does not get stream_options';
+	nok @posted[2]<stream_options>:exists, 'text-completion does not get stream_options';
+
+	ok @posted[1]<stream>, 'chat stream body is streaming';
+	ok @posted[3]<stream>, 'text stream body is streaming';
+	ok @posted[1]<stream_options><include_usage>, 'chat stream requests usage';
+	ok @posted[3]<stream_options><include_usage>, 'text stream requests usage';
+	is @posted[1]<stream_options><trace_id>, 'kept', 'chat stream preserves existing stream_options fields';
+	is @posted[3]<stream_options><trace_id>, 'kept', 'text stream preserves existing stream_options fields';
+	ok @posted[1]<messages>.defined, 'chat stream keeps messages';
+	ok @posted[3]<prompt>.defined, 'text stream keeps prompt';
+};
+
+subtest 'usage-only terminal stream chunks are lifted' => {
+	plan 8;
+	my $backend = make-backend(:request-stream-usage);
+
+	my $chat = stream-settled($backend.chat-completion-stream(@messages), 'chat usage stream');
+	posted('the chat usage body');
+	ok $chat.is-success, 'chat usage-only stream completes';
+	is $chat.prompt-tokens, 11, 'chat prompt tokens lifted';
+	is $chat.completion-tokens, 22, 'chat completion tokens lifted';
+	is $chat.total-tokens, 33, 'chat total tokens lifted';
+
+	my $text = stream-settled($backend.text-completion-stream(@messages), 'text usage stream');
+	posted('the text usage body');
+	ok $text.is-success, 'text usage-only stream completes';
+	is $text.prompt-tokens, 44, 'text prompt tokens lifted';
+	is $text.completion-tokens, 55, 'text completion tokens lifted';
+	is $text.total-tokens, 99, 'text total tokens lifted';
+};
+

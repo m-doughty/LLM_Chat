@@ -4,6 +4,7 @@ use UUID::V4;
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::Response::Stream;
 use LLM::Chat::Conversation::Message;
+use LLM::Chat::ExceptionText;
 
 unit class LLM::Chat::ToolLoop;
 
@@ -98,7 +99,7 @@ method chat-completion-stream(
 
 		CATCH {
 			default {
-				$out.quit(.message) unless $out.is-done;
+				$out.quit(exception-text($_)) unless $out.is-done;
 			}
 		}
 	}
@@ -130,7 +131,7 @@ method !forward-stream(
 		await $done;
 		CATCH {
 			default {
-				$target.quit(.message) unless $target.is-done;
+				$target.quit(exception-text($_)) unless $target.is-done;
 				$ok = False;
 			}
 		}
@@ -174,7 +175,7 @@ method !execute(@tool-calls --> List) {
 		@results = &!execute-tools(@tool-calls);
 		CATCH {
 			default {
-				$exec-error = .message;
+				$exec-error = exception-text($_);
 			}
 		}
 	}
@@ -194,7 +195,10 @@ method !execute(@tool-calls --> List) {
 method !tool-call-signature(%call --> Str) {
 	my $name = %call<function><name> // '';
 	my $args = %call<function><arguments> // '';
-	$args = to-json($args) if $args ~~ Associative;
+	# Sorted: two calls with equal arguments must share a signature
+	# however their Hashes were built, or the identical-call limit
+	# never sees them as identical.
+	$args = to-json($args, :sorted-keys) if $args ~~ Associative;
 	"$name\0$args";
 }
 

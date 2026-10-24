@@ -1,0 +1,899 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Test::Kit;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::KoboldCpp;
+use LLM::Chat::Backend::OpenRouter;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+use LLM::Chat::Template::Jinja2;
+use LLM::Chat::WireJSON;
+
+use JSON::Fast;
+
+# message-normalization => 'alternate-roles'.
+#
+# Chat templates such as Mistral's raise "After the optional system
+# message, conversation roles must alternate user and assistant roles
+# except for tool calls and results" when a conversation carries two
+# user messages in a row (chunked input, an appended instruction, a
+# repair packet) or a system message mid-conversation. KoboldCpp runs
+# the model's own template when launched with --jinja, so those
+# conversations failed outright there.
+#
+# The option reshapes the outgoing conversation deterministically:
+# adjacent plain messages of one role merge, a mid-conversation system
+# message becomes user text with a marker line, and nothing crosses a
+# tool call or tool result. It is a pure function of the message list,
+# so a repeated conversation prefix normalizes to the same bytes — the
+# property prompt caching depends on — and appending messages can only
+# ever grow the last normalized message.
+#
+# The same templates skip tool turns before checking alternation, so a
+# user message straight after tool results reads as the user speaking
+# twice. The option puts one assistant turn — tool-result-acknowledgement,
+# 'Understood.' by default — between the tool results and that user
+# message.
+
+plan 31;
+
+constant MARK = '[System message]';
+constant ACK  = 'Understood.';
+
+sub msg(Str:D $role, Str:D $content = '', *%extra) {
+	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
+}
+
+# Itemized, so `[call('c1')]` is a list of one tool call rather than the
+# call's three pairs (the single-argument rule flattens a bare Hash).
+sub call(Str:D $id) {
+	item %( id => $id, type => 'function', function => %( name => 'lookup', arguments => '{"q":"x"}' ) );
+}
+
+sub tool-call-turn(*@ids) { msg('assistant', '', tool-calls => @ids.map({ call($_) }).Array) }
+sub tool-result(Str:D $id, Str:D $content) { msg('tool', $content, tool-call-id => $id) }
+
+# A message as wire-message-hashes passes it through untouched.
+sub wire($message --> Hash:D) { from-json(to-json($message.to-hash)).Hash }
+
+sub backend(*%extra) {
+	LLM::Chat::Backend::OpenAICommon.new(
+		api_url               => 'http://127.0.0.1:1/v1',
+		settings              => LLM::Chat::Backend::Settings.new,
+		message-normalization => 'alternate-roles',
+		|%extra,
+	);
+}
+
+sub norm(@messages, *%extra --> Array:D) {
+	backend(|%extra).wire-message-hashes(@messages);
+}
+
+sub roles(@hashes --> Str:D) { @hashes.map(*<role>).join(',') }
+
+# === The rules, one at a time ===
+
+subtest 'adjacent user messages merge, in order, joined by a blank line' => {
+	plan 3;
+	my @out = norm([ msg('user', 'chunk one'), msg('user', 'chunk two'), msg('user', 'chunk three') ]);
+	is @out.elems, 1, 'three user messages become one';
+	is @out[0]<role>, 'user', 'still a user message';
+	is @out[0]<content>, "chunk one\n\nchunk two\n\nchunk three", 'contents joined in order with "\n\n"';
+};
+
+subtest 'adjacent assistant messages without tool calls merge' => {
+	plan 2;
+	my @out = norm([ msg('user', 'q'), msg('assistant', 'part one'), msg('assistant', 'part two') ]);
+	is roles(@out), 'user,assistant', 'the two assistant turns become one';
+	is @out[1]<content>, "part one\n\npart two", 'contents joined in order';
+};
+
+subtest 'the leading system block becomes one system message and stays first' => {
+	plan 3;
+	my @out = norm([ msg('system', 'persona'), msg('system', 'rules'), msg('user', 'hi') ]);
+	is roles(@out), 'system,user', 'one leading system message';
+	is @out[0]<content>, "persona\n\nrules", 'leading systems merged in order';
+	is @out[1]<content>, 'hi', 'the user turn is untouched';
+};
+
+subtest 'a mid-conversation system message is folded into the next user message' => {
+	plan 3;
+	my @out = norm([
+		msg('system', 'persona'), msg('user', 'first'), msg('assistant', 'reply'),
+		msg('system', 'be brief'), msg('user', 'second'),
+	]);
+	is roles(@out), 'system,user,assistant,user', 'no system message after the first turn';
+	is @out[0]<content>, 'persona', 'the leading system message is not touched';
+	is @out[3]<content>, "{MARK}\nbe brief\n\nsecond",
+		'the system text leads the next user message, under its marker line';
+};
+
+subtest 'a trailing system message is appended to the user message before it' => {
+	plan 2;
+	my @out = norm([ msg('user', 'question'), msg('system', 'answer in JSON') ]);
+	is roles(@out), 'user', 'one user message';
+	is @out[0]<content>, "question\n\n{MARK}\nanswer in JSON", 'system text follows the user text';
+};
+
+subtest 'a system message followed by an assistant turn joins the user turn before it' => {
+	plan 2;
+	# Folding it into a LATER user message would move it past the
+	# assistant reply — a reorder. It joins its adjacent user turn.
+	my @out = norm([
+		msg('user', 'question'), msg('system', 'context'), msg('assistant', 'reply'), msg('user', 'next'),
+	]);
+	is roles(@out), 'user,assistant,user', 'alternation restored';
+	is @out[0]<content>, "question\n\n{MARK}\ncontext", 'folded into the preceding user turn, not the later one';
+};
+
+subtest 'a system message with no user turn beside it becomes a user turn of its own' => {
+	plan 4;
+	my @between = norm([ msg('user', 'q'), msg('assistant', 'one'), msg('system', 'note'), msg('assistant', 'two') ]);
+	is roles(@between), 'user,assistant,user,assistant', 'between two assistant turns';
+	is @between[2]<content>, "{MARK}\nnote", 'carrying only the marked system text';
+
+	# After a tool result it is a user turn right after tool results,
+	# so the tool results are acknowledged in front of it.
+	my @after-tool = norm([
+		msg('user', 'q'), tool-call-turn('c1'),
+		tool-result('c1', 'result'), msg('system', 'note'), msg('assistant', 'answer'),
+	]);
+	is roles(@after-tool), 'user,assistant,tool,assistant,user,assistant', 'after a tool result';
+	is @after-tool[4]<content>, "{MARK}\nnote", 'as its own user turn';
+};
+
+subtest 'tool calls and tool results are never merged or folded into' => {
+	plan 8;
+	my @in = (
+		msg('user', 'before'),
+		msg('assistant', 'thinking aloud'),
+		tool-call-turn('c1', 'c2'),
+		tool-result('c1', 'r1'),
+		tool-result('c2', 'r2'),
+		msg('user', 'after one'),
+		msg('user', 'after two'),
+	);
+	my @out = norm(@in);
+	is roles(@out), 'user,assistant,assistant,tool,tool,assistant,user', 'shape around the tool call kept';
+	is @out[1]<content>, 'thinking aloud', 'a plain assistant turn does not merge into the tool-call turn';
+	is-deeply @out[2], wire(@in[2]), 'the tool-call turn is passed through as is';
+	is-deeply @out[3], wire(@in[3]), 'first tool result kept';
+	is-deeply @out[4], wire(@in[4]), 'second tool result kept separately';
+	is @out[5]<content>, ACK, 'the tool results are acknowledged before the user speaks';
+	is @out[6]<content>, "after one\n\nafter two",
+		'user messages after the tool results merge with each other';
+	is @out[0]<content>, 'before', 'but never with the user message before the tool call';
+};
+
+subtest 'a user message right after a tool result gets an acknowledgement in front of it' => {
+	plan 6;
+	my @in = (
+		msg('user', 'weather in Paris?'),
+		tool-call-turn('c1'),
+		tool-result('c1', '18C, cloudy'),
+		msg('user', 'and in Rome?'),
+	);
+	my @out = norm(@in);
+	is roles(@out), 'user,assistant,tool,assistant,user',
+		'one assistant turn between the tool result and the user message';
+	is-deeply @out[3], %( role => 'assistant', content => ACK ),
+		"a plain assistant message saying 'Understood.'";
+	is-deeply @out[1], wire(@in[1]), 'the tool-call turn is untouched';
+	is-deeply @out[2], wire(@in[2]), 'the tool result is untouched';
+	is-deeply @out[4], wire(@in[3]), 'the user message is untouched';
+	is backend().tool-result-acknowledgement, ACK, "'Understood.' is the default";
+};
+
+subtest 'nothing is inserted where the assistant speaks next, or nobody does' => {
+	plan 7;
+	my @answered = norm([
+		msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'),
+		msg('assistant', 'the answer'), msg('user', 'next'),
+	]);
+	is roles(@answered), 'user,assistant,tool,assistant,user', 'tool result then the answer: no acknowledgement';
+	is @answered[3]<content>, 'the answer', "the assistant turn is the caller's own";
+
+	my @chained = norm([
+		msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r1'),
+		tool-call-turn('c2'), tool-result('c2', 'r2'), msg('user', 'next'),
+	]);
+	is roles(@chained), 'user,assistant,tool,assistant,tool,assistant,user',
+		'a tool result followed by another tool call needs none';
+	ok @chained[3]<tool_calls>:exists, 'the assistant turn after the first result is the second tool call';
+	is @chained[5]<content>, ACK, 'only the results the user speaks after are acknowledged';
+
+	my @in = (msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'));
+	my @pending = norm(@in);
+	is roles(@pending), 'user,assistant,tool', 'a conversation ending in tool results goes out as it is';
+	is-deeply @pending, @in.map({ wire($_) }).Array, 'every message exactly as given';
+};
+
+subtest 'a run of tool results gets one acknowledgement, after the last of them' => {
+	plan 4;
+	my @in = (
+		msg('user', 'compare Paris, Rome and Oslo'),
+		tool-call-turn('c1', 'c2', 'c3'),
+		tool-result('c1', 'Paris 18C'),
+		tool-result('c2', 'Rome 24C'),
+		tool-result('c3', 'Oslo 9C'),
+		msg('user', 'thanks'),
+		msg('user', 'now Madrid'),
+	);
+	my @out = norm(@in);
+	is roles(@out), 'user,assistant,tool,tool,tool,assistant,user', 'one acknowledgement';
+	is @out[5]<content>, ACK, 'after the last tool result';
+	is-deeply @out[2..4], @in[2..4].map({ wire($_) }).List, 'the tool results are untouched and not split';
+	is @out[6]<content>, "thanks\n\nnow Madrid", 'the user messages after them merge as usual';
+};
+
+subtest 'system text folded after tool results is acknowledged like a user message' => {
+	plan 10;
+	my @before-user = norm([
+		msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'),
+		msg('system', 'be brief'), msg('user', 'go on'),
+	]);
+	is roles(@before-user), 'user,assistant,tool,assistant,user', 'folded into the user turn after it';
+	is @before-user[3]<content>, ACK, 'which is acknowledged';
+	is @before-user[4]<content>, "{MARK}\nbe brief\n\ngo on", 'the folded text leads the user turn';
+
+	my @alone = norm([
+		msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'), msg('system', 'be brief'),
+	]);
+	is roles(@alone), 'user,assistant,tool,assistant,user', 'standing as a user turn of its own';
+	is @alone[4]<content>, "{MARK}\nbe brief", 'carrying the folded text';
+
+	my @empty-system = norm([
+		msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'), msg('system', ''), msg('user', 'go on'),
+	]);
+	is roles(@empty-system), 'user,assistant,tool,assistant,user',
+		'an empty system message is dropped before the rule is applied';
+
+	my @empty-user = norm([
+		msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'), msg('user', ''),
+	]);
+	is roles(@empty-user), 'user,assistant,tool,assistant,user',
+		'an empty user message is still a user turn, and is acknowledged';
+
+	# 'leading' lifts every system message to the front before
+	# normalization, so only what is left after the tool result counts.
+	my @lifted-answer = norm(
+		[ msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'), msg('system', 's'), msg('assistant', 'a') ],
+		system-message-mode => 'leading',
+	);
+	is roles(@lifted-answer), 'system,user,assistant,tool,assistant',
+		"with 'leading', the lifted system message leaves the answer next: none";
+	is @lifted-answer[4]<content>, 'a', "the assistant turn is the caller's";
+
+	my @lifted-user = norm(
+		[ msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'), msg('system', 's'), msg('user', 'u') ],
+		system-message-mode => 'leading',
+	);
+	is roles(@lifted-user), 'system,user,assistant,tool,assistant,user',
+		"with 'leading', the user message next is acknowledged";
+};
+
+# A message a subclass decorated with an extra key: not plain, so it is
+# passed through as it is — but it is still the user's turn.
+my class NamedMessage is LLM::Chat::Conversation::Message {
+	method to-hash {
+		my %hash = callsame;
+		%hash<name> = 'guest';
+		%hash;
+	}
+}
+
+subtest 'a user message that carries more than a role and text is acknowledged too' => {
+	plan 3;
+	my $named = NamedMessage.new(role => 'user', content => 'and Rome?');
+	my @out = norm([ msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'), $named ]);
+	is roles(@out), 'user,assistant,tool,assistant,user', 'acknowledged';
+	is @out[3]<content>, ACK, 'by the same assistant turn';
+	is-deeply @out[4], wire($named), 'the decorated message is passed through untouched';
+};
+
+subtest 'the acknowledgement text is configurable, and can be switched off' => {
+	plan 6;
+	my @in = (msg('user', 'q'), tool-call-turn('c1'), tool-result('c1', 'r'), msg('user', 'more'));
+
+	my @custom = norm(@in, tool-result-acknowledgement => "Noted — I have the results.\n");
+	is roles(@custom), 'user,assistant,tool,assistant,user', 'custom text: same shape';
+	is @custom[3]<content>, "Noted — I have the results.\n", 'inserted verbatim, whitespace and all';
+
+	my @off = norm(@in, tool-result-acknowledgement => '');
+	is roles(@off), 'user,assistant,tool,user', "'' inserts nothing";
+	is-deeply @off, @in.map({ wire($_) }).Array, 'leaving those messages exactly as given';
+
+	my $none = LLM::Chat::Backend::OpenAICommon.new(
+		api_url                     => 'http://127.0.0.1:1/v1',
+		settings                    => LLM::Chat::Backend::Settings.new,
+		tool-result-acknowledgement => 'Understood, really.',
+	);
+	is roles($none.wire-message-hashes(@in)), 'user,assistant,tool,user',
+		"with message-normalization 'none' the option does nothing";
+	ok ($none.normalized-messages(@in) Z=== @in).all.so,
+		'and the text paths get the caller\'s own messages';
+};
+
+
+subtest 'empty messages' => {
+	plan 6;
+	my @systems = norm([ msg('system', ''), msg('user', 'q'), msg('system', ''), msg('assistant', 'a') ]);
+	is roles(@systems), 'user,assistant', 'empty system messages carry nothing and are dropped';
+
+	my @merged = norm([ msg('user', ''), msg('user', 'text'), msg('user', '') ]);
+	is @merged.elems, 1, 'empty user messages merge into their neighbour';
+	is @merged[0]<content>, 'text', 'adding no stray delimiter';
+
+	my @alone = norm([ msg('user', 'q'), msg('assistant', ''), msg('user', 'r') ]);
+	is roles(@alone), 'user,assistant,user', 'an empty turn with no same-role neighbour is kept';
+	is @alone[1]<content>, '', 'as an empty turn — it still keeps the roles alternating';
+
+	my @blank = norm([ msg('user', "\n"), msg('user', ' ') ]);
+	is @blank[0]<content>, "\n\n\n ", 'whitespace is content and is kept verbatim';
+};
+
+subtest 'the marker line is configurable, and can be switched off' => {
+	plan 2;
+	my @in = (msg('user', 'q'), msg('system', 'note'));
+	is norm(@in, folded-system-marker => '### Instruction')[0]<content>,
+		"q\n\n### Instruction\nnote", 'custom marker';
+	is norm(@in, folded-system-marker => '')[0]<content>,
+		"q\n\nnote", 'empty marker folds the bare text';
+};
+
+subtest "'none' (the default) sends every message as given" => {
+	plan 2;
+	my @in = (msg('system', 's'), msg('user', 'a'), msg('user', 'b'), msg('system', 'mid'));
+	my $plain = LLM::Chat::Backend::OpenAICommon.new(
+		api_url  => 'http://127.0.0.1:1/v1',
+		settings => LLM::Chat::Backend::Settings.new,
+	);
+	is $plain.message-normalization, 'none', 'default is none';
+	is-deeply $plain.wire-message-hashes(@in), @in.map({ from-json(to-json(.to-hash)).Hash }).Array,
+		'wire hashes are exactly the messages';
+};
+
+subtest "composes with system-message-mode 'leading'" => {
+	plan 2;
+	# 'leading' lifts every system message to the front first, so there
+	# is no mid-conversation system text left to fold.
+	my @out = norm(
+		[ msg('system', 'a'), msg('user', 'q1'), msg('system', 'b'), msg('user', 'q2') ],
+		system-message-mode => 'leading',
+	);
+	is roles(@out), 'system,user', 'one system message, one user turn';
+	is @out[0]<content>, "a\n\n---\n\nb", "the system text is placed by 'leading'";
+};
+
+subtest 'option validation' => {
+	plan 6;
+	dies-ok { backend(message-normalization => 'strict') }, 'an unknown mode dies';
+	throws-like { backend(message-normalization => 'strict') }, Exception,
+		message => /'alternate-roles'/, 'naming the accepted values';
+	dies-ok { backend(folded-system-marker => Str) }, 'an undefined marker dies';
+	throws-like { backend(tool-result-acknowledgement => Str) }, Exception,
+		message => /'tool-result-acknowledgement' .* 'empty string'/,
+		'an undefined acknowledgement dies, pointing at the empty string for none';
+	lives-ok { backend(tool-result-acknowledgement => '') }, 'the empty string is accepted';
+	lives-ok {
+		LLM::Chat::Backend::KoboldCpp.new(
+			api_url => 'http://127.0.0.1:1/v1', settings => LLM::Chat::Backend::Settings.new,
+			message-normalization => 'alternate-roles',
+		);
+		LLM::Chat::Backend::OpenRouter.new(
+			api_key => 'k', settings => LLM::Chat::Backend::Settings.new,
+			message-normalization => 'alternate-roles',
+		);
+	}, 'available on the KoboldCpp and OpenRouter subclasses';
+};
+
+# === Properties, over generated conversations ===
+
+# A small LCG so the generated conversations are the same on every
+# Rakudo, whatever its own PRNG does.
+my class Lcg {
+	has Int $.state is rw = 20260923;
+	method next(Int:D $n --> Int:D) {
+		$!state = ($!state * 6364136223846793005 + 1442695040888963407) % 2**64;
+		($!state +> 33) % $n;
+	}
+}
+
+# Contents never contain "\n\n" and never start or end with "\n", so a
+# merged content splits back into its pieces on "\n\n". None of them is
+# ACK, and a merge of them could only read as ACK if one piece were ACK,
+# so an assistant message saying exactly ACK is one normalization
+# inserted.
+constant CONTENTS = ('', 'alpha', 'beta gamma', "line one\nline two", 'δέλτα', ' padded ');
+
+sub generate(Lcg $rng, Int:D $length --> Array:D) {
+	my @out;
+	my Int $call = 0;
+	while @out.elems < $length {
+		my $content = CONTENTS[$rng.next(CONTENTS.elems)];
+		given $rng.next(10) {
+			when 0..2 { @out.push: msg('user', $content) }
+			when 3..4 { @out.push: msg('assistant', $content) }
+			when 5..6 { @out.push: msg('system', $content) }
+			when 7 {
+				# One tool-call turn, answered by one or two results.
+				my @ids = (^(1 + $rng.next(2))).map({ 'call-' ~ $call++ });
+				@out.push: tool-call-turn(|@ids);
+				@out.push: tool-result($_, CONTENTS[$rng.next(CONTENTS.elems)]) for @ids;
+			}
+			default { @out.push: msg(('user', 'assistant').[$rng.next(2)], CONTENTS[1 + $rng.next(CONTENTS.elems - 1)]) }
+		}
+	}
+	@out;
+}
+
+sub is-plain(%h --> Bool:D) {
+	!(%h<tool_calls>:exists) && !(%h<tool_call_id>:exists);
+}
+
+sub is-tool-result(%h --> Bool:D) { %h<role> eq 'tool' }
+
+sub is-tool-call-turn(%h --> Bool:D) { %h<tool_calls>:exists }
+
+sub is-ack(%h --> Bool:D) {
+	is-plain(%h) && %h<role> eq 'assistant' && (%h<content> // '') eq ACK;
+}
+
+sub ack-positions(@hashes --> List:D) { @hashes.keys.grep({ is-ack(@hashes[$_]) }).List }
+
+# What the normalized conversation must contain, in order: each tool
+# turn whole, and the non-empty text of every other message, a
+# mid-conversation system message's text behind its marker.
+sub expected-pieces(@messages --> List:D) {
+	my $first-turn = @messages.first(*.role ne 'system', :k) // @messages.elems;
+	my @pieces;
+	for @messages.kv -> $i, $m {
+		my %h = from-json(to-json($m.to-hash));
+		if !is-plain(%h) { @pieces.push: to-wire-json(%h); next }
+		next unless $m.content.chars;
+		@pieces.push: ($m.role eq 'system' && $i > $first-turn) ?? "{MARK}\n{$m.content}" !! $m.content;
+	}
+	@pieces.List;
+}
+
+# The caller's text, in order: acknowledgements are not the caller's.
+sub actual-pieces(@hashes --> List:D) {
+	@hashes.grep({ !is-ack($_) }).map(-> %h {
+		is-plain(%h)
+			?? (%h<content> // '').split("\n\n").grep(*.chars).Slip
+			!! to-wire-json(%h)
+	}).List;
+}
+
+# How many acknowledgements the rule calls for, read off the caller's
+# messages rather than the normalizer's groups: one for each tool result
+# whose next message — empty system messages dropped — is a user
+# message, or a system message, which folds into user text.
+sub expected-acks(@messages --> Int:D) {
+	my Int $count = 0;
+	for @messages.kv -> $i, $m {
+		next unless $m.role eq 'tool';
+		my $next = @messages[$i ^.. *].first({ .role ne 'system' || .content.chars });
+		$count++ if $next.defined && ($next.role eq 'user' || $next.role eq 'system');
+	}
+	$count;
+}
+
+constant CONVERSATIONS = 150;
+
+subtest "generated conversations: nothing lost, nothing reordered, roles alternate" => {
+	plan 8;
+	my $rng = Lcg.new;
+	my ($lossless, $alternating, $answered, $template-view, $no-mid-system, $acknowledged, $deterministic)
+		= 0 xx 7;
+	my Int $acks = 0;
+	for ^CONVERSATIONS {
+		my @m = generate($rng, 1 + $rng.next(14));
+		my @out = norm(@m);
+
+		$lossless++ if actual-pieces(@out) eqv expected-pieces(@m);
+
+		my Bool $ok = True;
+		for 1 ..^ @out.elems -> $i {
+			$ok = False if is-plain(@out[$i]) && is-plain(@out[$i - 1])
+				&& @out[$i]<role> eq @out[$i - 1]<role>;
+		}
+		$alternating++ if $ok;
+
+		$answered++ unless (1 ..^ @out.elems).first(-> $i {
+			is-tool-result(@out[$i - 1]) && !is-tool-result(@out[$i]) && @out[$i]<role> ne 'assistant'
+		}).defined;
+
+		# What a Mistral-style template checks: the conversation after
+		# the leading system message, tool results and tool-call turns
+		# dropped. Two neighbours there that share a role must be
+		# assistant turns with a tool call between them — assistant text
+		# on both sides of a tool call, which normalization does not
+		# merge across — and are never two user turns.
+		my $first-turn = @out.first(*<role> ne 'system', :k) // @out.elems;
+		my @view = @out.keys.grep({
+			$_ >= $first-turn && !is-tool-result(@out[$_]) && !is-tool-call-turn(@out[$_])
+		});
+		my Bool $strict = True;
+		for 1 ..^ @view.elems -> $v {
+			my ($before, $after) = @view[$v - 1], @view[$v];
+			next unless @out[$before]<role> eq @out[$after]<role>;
+			$strict = False unless @out[$before]<role> eq 'assistant'
+				&& ($before ^..^ $after).first({ is-tool-call-turn(@out[$_]) }).defined;
+		}
+		$template-view++ if $strict;
+
+		$no-mid-system++ unless @out[$first-turn .. *].first(*<role> eq 'system').defined;
+
+		my @positions = ack-positions(@out);
+		$acks += @positions.elems;
+		$acknowledged++ if @positions.elems == expected-acks(@m)
+			&& !@positions.first(-> $p {
+				!($p > 0 && $p < @out.end && is-tool-result(@out[$p - 1]) && @out[$p + 1]<role> eq 'user')
+			}).defined;
+
+		$deterministic++ if to-wire-json(norm(@m)) eq to-wire-json(@out);
+	}
+	is $lossless, CONVERSATIONS, 'every piece of text and every tool turn survives, in order';
+	is $alternating, CONVERSATIONS, 'no two adjacent plain messages share a role';
+	is $answered, CONVERSATIONS, 'a tool result is followed only by another tool result or an assistant turn';
+	is $template-view, CONVERSATIONS,
+		'with tool turns skipped, roles alternate except for assistant text either side of a tool call';
+	is $no-mid-system, CONVERSATIONS, 'no system message after the first turn';
+	is $acknowledged, CONVERSATIONS,
+		'acknowledgements exactly where the rule calls for them, each between a tool result and a user message';
+	is $deterministic, CONVERSATIONS, 'the same messages always normalize to the same bytes';
+	ok $acks >= CONVERSATIONS div 10, "the conversations exercised $acks acknowledgements";
+};
+
+subtest 'generated conversations: a prefix normalizes to a prefix (cache stability)' => {
+	plan 4;
+	# For every conversation and every cut point: normalizing the first
+	# k messages gives the same messages as normalizing all of them,
+	# except the last one, whose content may only have grown at the
+	# end. So a request that repeats an earlier request's conversation
+	# repeats its bytes up to that final message.
+	#
+	# Acknowledgements keep this: a list never ends in one, and a request
+	# ending in tool results is repeated unchanged by the next, which
+	# adds the acknowledgement and the user message after them.
+	my $rng = Lcg.new(state => 7);
+	my ($stable, $cuts, $ack-last, $ack-cuts, $ack-with-user) = 0 xx 5;
+	my @first-failure;
+	for ^CONVERSATIONS {
+		my @m = generate($rng, 2 + $rng.next(12));
+		my @full = norm(@m);
+		for 1 ..^ @m.elems -> $k {
+			$cuts++;
+			my @head = norm(@m[^$k]);
+			my Bool $ok = @full.elems >= @head.elems;
+			if $ok && @head.elems {
+				for ^(@head.elems - 1) -> $i {
+					$ok = False unless to-wire-json(@head[$i]) eq to-wire-json(@full[$i]);
+				}
+				my %last = @head.tail;
+				my %grown = @full[@head.elems - 1];
+				if is-plain(%last) {
+					$ok = False unless %grown<role> eq %last<role>
+						&& is-plain(%grown)
+						&& (%grown<content> // '').starts-with(%last<content> // '');
+				}
+				else {
+					$ok = False unless to-wire-json(%last) eq to-wire-json(%grown);
+				}
+			}
+			if $ok { $stable++ }
+			elsif !@first-failure { @first-failure = (@m.map(*.gist).join(' | '), $k) }
+
+			next unless @head.elems;
+			$ack-last++ if is-ack(@head.tail);
+			if is-tool-result(@head.tail) && @full.elems > @head.elems && is-ack(@full[@head.elems]) {
+				$ack-cuts++;
+				$ack-with-user++ if @full.elems > @head.elems + 1
+					&& @full[@head.elems + 1]<role> eq 'user';
+			}
+		}
+	}
+	is $stable, $cuts, "all $cuts cut points are prefix-stable"
+		or diag "first failure: {@first-failure.raku}";
+	ok $cuts > CONVERSATIONS, 'and there were many of them';
+	is $ack-last, 0, 'no normalized list ends in an acknowledgement, so none ever grows';
+	ok $ack-cuts > 0 && $ack-with-user == $ack-cuts,
+		"$ack-cuts cuts ended in tool results the next request acknowledges, each time together with its user message";
+};
+
+# The recipe the Pod gives for finding the acknowledgements: normalize
+# with and without them; they are the only difference.
+sub recipe-positions($backend, @messages --> List:D) {
+	my @sent = $backend.normalized-messages(@messages);
+	my @bare = $backend.clone(tool-result-acknowledgement => '')
+	                   .normalized-messages(@messages);
+
+	my @positions = gather {
+		my $b = 0;
+		for @sent.kv -> $p, $message {
+			if $b < @bare.elems && $message.role eq @bare[$b].role { $b++ }
+			else { take $p }
+		}
+	}
+	@positions.List;
+}
+
+subtest 'the documented example, and the recipe for finding acknowledgements' => {
+	plan 3;
+	# Verbatim from the Pod, so the example cannot rot.
+	my $backend = LLM::Chat::Backend::KoboldCpp.new(
+		api_url               => 'http://localhost:5001/v1',
+		settings              => LLM::Chat::Backend::Settings.new,
+		message-normalization => 'alternate-roles',
+	);
+
+	my %call = id => 'call-1', type => 'function',
+		function => %( name => 'get_weather', arguments => '{"city":"Paris"}' );
+
+	my @messages =
+		LLM::Chat::Conversation::Message.new(role => 'user', content => "What's the weather in Paris?"),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', tool-calls => [%call,]),
+		LLM::Chat::Conversation::Message.new(role => 'tool', content => '18°C, cloudy', tool-call-id => 'call-1'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'And in Rome?');
+
+	my @wire = $backend.wire-message-hashes(@messages);
+	is @wire.map(*<role>).join(' '), 'user assistant tool assistant user', 'the roles the Pod shows';
+	is-deeply @wire[3], %( role => 'assistant', content => 'Understood.' ), 'and the acknowledgement it shows';
+	is-deeply recipe-positions($backend, @messages), (3,), 'the recipe finds it at index 3';
+};
+
+subtest 'generated conversations: the recipe finds exactly the acknowledgements' => {
+	plan 3;
+	my $rng = Lcg.new(state => 99);
+	my ($text-recipe, $wire-recipe, $same-shape) = 0 xx 3;
+	my $backend = backend();
+	my $bare = $backend.clone(tool-result-acknowledgement => '');
+	for ^CONVERSATIONS {
+		my @m = generate($rng, 1 + $rng.next(14));
+		my @out = $backend.wire-message-hashes(@m);
+
+		$text-recipe++ if recipe-positions($backend, @m) eqv ack-positions(@out);
+
+		# The same comparison over the chat body, reading <role>.
+		my @bare = $bare.wire-message-hashes(@m);
+		my @positions = gather {
+			my $b = 0;
+			for @out.kv -> $p, %message {
+				if $b < @bare.elems && %message<role> eq @bare[$b]<role> { $b++ }
+				else { take $p }
+			}
+		}
+		$wire-recipe++ if @positions.List eqv ack-positions(@out);
+
+		my @text = $backend.normalized-messages(@m);
+		$same-shape++ if @text.map(*.role).List eqv @out.map(*<role>).List
+			&& @text.map(*.content).List eqv @out.map({ $_<content> // '' }).List;
+	}
+	is $text-recipe, CONVERSATIONS, 'over normalized-messages';
+	is $wire-recipe, CONVERSATIONS, 'over wire-message-hashes';
+	is $same-shape, CONVERSATIONS, 'and the text paths get the chat body\'s messages, acknowledgements included';
+};
+
+subtest "the caller's messages are never modified" => {
+	plan 2;
+	my @in = (msg('user', 'a'), msg('user', 'b'), msg('system', 'c'), msg('assistant', 'd'));
+	my $before = @in.map({ .role ~ ':' ~ .content }).join('|');
+	norm(@in);
+	backend().normalized-messages(@in);
+	is @in.map({ .role ~ ':' ~ .content }).join('|'), $before, 'roles and contents unchanged';
+	is @in.elems, 4, 'nothing added or removed';
+};
+
+subtest 'normalized-messages returns Message objects for the text paths' => {
+	plan 5;
+	my @in = (msg('system', 's'), msg('user', 'a'), msg('user', 'b'),
+		msg('assistant', '', tool-calls => [call('c9')]), msg('tool', 'r', tool-call-id => 'c9'));
+	my @out = backend().normalized-messages(@in);
+	is @out.map(*.role).join(','), 'system,user,assistant,tool', 'normalized shape';
+	ok @out[0] === @in[0], 'an untouched message is the caller\'s own object';
+	ok @out[2] === @in[3], 'so is a tool-call turn, tool calls and all';
+	is @out[1].content, "a\n\nb", 'a merged message is a new Message with the merged content';
+
+	my @plain = LLM::Chat::Backend::OpenAICommon.new(
+		api_url => 'http://127.0.0.1:1/v1', settings => LLM::Chat::Backend::Settings.new,
+	).normalized-messages(@in);
+	ok !(@plain === @in) && (@plain Z=== @in).all.so,
+		"with 'none', a new Array holding the same objects";
+};
+
+# === On the wire ===
+
+my $requests = Channel.new;
+
+# LLM::Chat::Test::Kit's raw server: a streaming call has to settle on
+# its whole stream.
+my $server = raw-server(-> $request {
+	given $request.method, $request.path {
+		when ('POST', '/capture/v1/chat/completions') {
+			$requests.send($request.text);
+			$request.json<stream>
+				?? %( type => 'text/event-stream', chunks => [
+					"data: " ~ '{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}'
+						~ "\n\ndata: [DONE]\n\n",
+				] )
+				!! %( body => '{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}' );
+		}
+		when ('POST', '/capture/v1/completions') {
+			$requests.send($request.text);
+			$request.json<stream>
+				?? %( type => 'text/event-stream', chunks => [
+					"data: " ~ '{"choices":[{"text":"ok","finish_reason":"stop"}]}'
+						~ "\n\ndata: [DONE]\n\n",
+				] )
+				!! %( body => '{"choices":[{"text":"ok","finish_reason":"stop"}]}' );
+		}
+		default {
+			%( status => 404, body => '' );
+		}
+	}
+});
+LEAVE { $server.stop }
+
+sub posted(Str:D $what --> Hash:D) {
+	my $received = start { $requests.receive };
+	timed($received, $what);
+	from-json($received.result);
+}
+
+sub live-backend(*%extra) {
+	LLM::Chat::Backend::OpenAICommon.new(
+		api_url  => "{$server.url}/capture/v1",
+		settings => LLM::Chat::Backend::Settings.new,
+		|%extra,
+	);
+}
+
+my @conversation = (
+	msg('system', 'persona'),
+	msg('user', 'chunk one'),
+	msg('user', 'chunk two'),
+	msg('assistant', 'reply'),
+	msg('system', 'repair: answer in JSON'),
+	msg('user', 'again'),
+);
+
+subtest 'both chat paths post the normalized conversation' => {
+	plan 4;
+	my $backend = live-backend(message-normalization => 'alternate-roles');
+
+	my $blocking = stream-settled($backend.chat-completion(@conversation), 'blocking chat');
+	my %blocking = posted('the blocking chat body');
+	my $streamed = stream-settled($backend.chat-completion-stream(@conversation), 'streaming chat');
+	my %streamed = posted('the streaming chat body');
+
+	ok $blocking.is-success && $streamed.is-success, 'both requests succeed';
+	is roles(%blocking<messages>), 'system,user,assistant,user', 'blocking body alternates';
+	is-deeply %streamed<messages>, %blocking<messages>, 'streaming body carries the same messages';
+	is %blocking<messages>[3]<content>, "{MARK}\nrepair: answer in JSON\n\nagain",
+		'the repair instruction rides in the last user turn';
+};
+
+my @tool-conversation = (
+	msg('system', 'persona'),
+	msg('user', "What's the weather in Paris?"),
+	tool-call-turn('c1'),
+	tool-result('c1', '18C, cloudy'),
+	msg('user', 'And in Rome?'),
+);
+
+subtest 'both chat paths post the acknowledgement' => {
+	plan 4;
+	my $backend = live-backend(message-normalization => 'alternate-roles');
+
+	my $blocking = stream-settled($backend.chat-completion(@tool-conversation), 'blocking chat');
+	my %blocking = posted('the blocking chat body');
+	my $streamed = stream-settled($backend.chat-completion-stream(@tool-conversation), 'streaming chat');
+	my %streamed = posted('the streaming chat body');
+
+	ok $blocking.is-success && $streamed.is-success, 'both requests succeed';
+	is roles(%blocking<messages>), 'system,user,assistant,tool,assistant,user',
+		'the tool result is acknowledged before the user message';
+	is-deeply %blocking<messages>[4], %( role => 'assistant', content => ACK ), 'with the acknowledgement text';
+	is-deeply %streamed<messages>, %blocking<messages>, 'streaming body carries the same messages';
+};
+
+subtest 'both text paths render the normalized conversation' => {
+	plan 3;
+	my $backend = live-backend(
+		template              => LLM::Chat::Template::ChatML.new,
+		message-normalization => 'alternate-roles',
+	);
+	stream-settled($backend.text-completion(@conversation), 'blocking text');
+	my %blocking = posted('the blocking text body');
+	stream-settled($backend.text-completion-stream(@conversation), 'streaming text');
+	my %streamed = posted('the streaming text body');
+
+	is %blocking<prompt>,
+		"<|im_start|>system\npersona\n<|im_end|>\n"
+		~ "<|im_start|>user\nchunk one\n\nchunk two\n<|im_end|>\n"
+		~ "<|im_start|>assistant\nreply\n<|im_end|>\n"
+		~ "<|im_start|>user\n{MARK}\nrepair: answer in JSON\n\nagain\n<|im_end|>\n",
+		'the template saw the normalized messages';
+	is %streamed<prompt>, %blocking<prompt>, 'the streaming path renders the same prompt';
+	is @conversation.elems, 6, "the caller's list is untouched";
+};
+
+# The alternation check from Mistral's chat templates, verbatim in
+# substance: tool results and tool-call turns are skipped, and what is
+# left after the optional leading system message must go user,
+# assistant, user, ...
+sub strict-template(--> LLM::Chat::Template::Jinja2:D) {
+	LLM::Chat::Template::Jinja2.new(template => q:to/JINJA/);
+        {%- if messages[0]["role"] == "system" %}{%- set loop_messages = messages[1:] %}{%- else %}{%- set loop_messages = messages %}{%- endif %}
+        {%- for message in loop_messages | rejectattr("role", "equalto", "tool") | selectattr("tool_calls", "undefined") %}
+        {%- if (message["role"] == "user") != (loop.index0 % 2 == 0) %}
+        {{- raise_exception("After the optional system message, conversation roles must alternate user and assistant roles except for tool calls and results.") }}
+        {%- endif %}
+        {%- endfor %}
+        {%- for message in messages %}[{{ message["role"] }}]{{ message["content"] }}
+        {% endfor %}
+        JINJA
+}
+
+subtest 'a strict-alternation chat template: fails without, renders with' => {
+	plan 4;
+	my $strict = strict-template();
+
+	my $raw = stream-settled(live-backend(template => $strict).text-completion(@conversation), 'raw text');
+	nok $raw.is-success, 'without normalization the template refuses the conversation';
+	like ($raw.err // '').Str, /'must alternate'/, 'with the alternation error';
+
+	my $normalized = stream-settled(
+		live-backend(template => $strict, message-normalization => 'alternate-roles')
+			.text-completion(@conversation),
+		'normalized text',
+	);
+	my %body = posted('the normalized text body');
+	ok $normalized.is-success, 'with normalization it renders and completes';
+	like %body<prompt>, /'[user]chunk one' \n\n 'chunk two'/, 'from the merged conversation';
+};
+
+subtest 'a strict-alternation chat template: a user message after tool results' => {
+	plan 5;
+	my $strict = strict-template();
+
+	my $refused = stream-settled(
+		live-backend(
+			template                    => $strict,
+			message-normalization       => 'alternate-roles',
+			tool-result-acknowledgement => '',
+		).text-completion(@tool-conversation),
+		'unacknowledged text',
+	);
+	nok $refused.is-success, 'with the acknowledgement off, the template refuses the conversation';
+	like ($refused.err // '').Str, /'must alternate'/, 'with the alternation error';
+
+	my $rendered = stream-settled(
+		live-backend(template => $strict, message-normalization => 'alternate-roles')
+			.text-completion(@tool-conversation),
+		'acknowledged text',
+	);
+	my %body = posted('the acknowledged text body');
+	ok $rendered.is-success, 'with it on, the template renders and the request completes';
+	like %body<prompt>, /'[tool]18C, cloudy' \s* '[assistant]Understood.' \s* "[user]And in Rome?"/,
+		'the assistant acknowledges the tool result before the user speaks';
+	is @tool-conversation.elems, 5, "the caller's list is untouched";
+};
+
+subtest 'a continuation render no longer pops the caller\'s last message' => {
+	plan 2;
+	# ChatML (like Gemma2, Llama3/4 and MistralV7) pops the last message
+	# off the list it is handed when rendering a continuation. The text
+	# paths used to hand it the caller's own array, from a worker thread.
+	my @messages = (msg('user', 'q'), msg('assistant', 'partial'));
+	my $backend = live-backend(template => LLM::Chat::Template::ChatML.new);
+	stream-settled($backend.text-completion(@messages, True), 'continuation');
+	my %body = posted('the continuation body');
+	is @messages.elems, 2, "the caller's conversation keeps its last message";
+	ok %body<prompt>.ends-with("<|im_start|>assistant\npartial"), 'and the continuation still renders';
+};
+
+done-testing;

@@ -3,7 +3,7 @@ use lib 'lib';
 use LLM::Chat::Backend::Response;
 use LLM::Chat::Backend::Response::Stream;
 
-plan 47;
+plan 52;
 
 my $resp = LLM::Chat::Backend::Response.new(id => "1");
 
@@ -62,10 +62,10 @@ nok $u.model-used.defined,           "model-used undefined by default";
 nok $u.cached-prompt-tokens.defined, "cached-prompt-tokens undefined by default";
 
 $u._set-usage(
-    prompt     => 120,
-    completion => 37,
-    total      => 157,
-    model      => 'z-ai/glm-5.1',
+	prompt     => 120,
+	completion => 37,
+	total      => 157,
+	model      => 'z-ai/glm-5.1',
 );
 is $u.prompt-tokens,     120,              "prompt-tokens populated";
 is $u.completion-tokens, 37,               "completion-tokens populated";
@@ -75,7 +75,7 @@ is $u.model-used,        'z-ai/glm-5.1',   "model-used populated";
 # A provider that says nothing about caching leaves the field
 # unreported — the whole point of "undefined isn't zero".
 nok $u.cached-prompt-tokens.defined,
-    "cached-prompt-tokens untouched by a usage update that omits it";
+	"cached-prompt-tokens untouched by a usage update that omits it";
 
 # Presence-guarded: later partial update must not clear prior values.
 $u._set-usage(completion => 42);   # bumps completion only
@@ -98,7 +98,7 @@ my $u0 = LLM::Chat::Backend::Response.new(id => "u0");
 $u0._set-usage(prompt => 400, cached-prompt => 0);
 is $u0.cached-prompt-tokens, 0,    "a reported zero is recorded as 0, not dropped";
 ok  $u0.cached-prompt-tokens.defined,
-    "a reported zero reads as defined";
+	"a reported zero reads as defined";
 
 # --- Structured error info (Task fallback classification) ------------
 
@@ -131,41 +131,144 @@ is ~$e3.err,         "rate limited", "raw error message survives quit";
 # --- reasoning-text accumulation ---
 my $r4 = LLM::Chat::Backend::Response.new(id => "r4");
 nok $r4.reasoning-text.defined,
-    "reasoning-text starts undefined for non-reasoning models";
+	"reasoning-text starts undefined for non-reasoning models";
 $r4._append-reasoning('Let me think...');
 $r4._append-reasoning(' about it.');
 is $r4.reasoning-text,
-    'Let me think... about it.',
-    "reasoning chunks concatenate in order";
+	'Let me think... about it.',
+	"reasoning chunks concatenate in order";
 $r4._append-reasoning('');
 is $r4.reasoning-text,
-    'Let me think... about it.',
-    "empty reasoning chunk is a no-op (idempotent)";
+	'Let me think... about it.',
+	"empty reasoning chunk is a no-op (idempotent)";
 
 my $r5 = LLM::Chat::Backend::Response.new(id => "r5");
 $r5._append-reasoning('');
 nok $r5.reasoning-text.defined,
-    "reasoning-text stays undefined when only empty chunks arrive";
+	"reasoning-text stays undefined when only empty chunks arrive";
 
 subtest 'last-activity-at advances on response lifecycle events' => {
-    plan 4;
+	plan 4;
 
-    my $s = LLM::Chat::Backend::Response::Stream.new(id => 'activity');
-    ok $s.last-activity-at.defined,
-        'activity timestamp is set at construction';
+	my $s = LLM::Chat::Backend::Response::Stream.new(id => 'activity');
+	ok $s.last-activity-at.defined,
+		'activity timestamp is set at construction';
 
-    my $past = now - 10;
-    $s._touch-activity(at => $past);
-    is $s.last-activity-at, $past,
-        'explicit activity touch is recorded';
+	my $past = now - 10;
+	$s._touch-activity(at => $past);
+	is $s.last-activity-at, $past,
+		'explicit activity touch is recorded';
 
-    $s._touch-activity(at => $past);
-    $s.emit('x');
-    ok $s.last-activity-at > $past,
-        'emitting content advances activity';
+	$s._touch-activity(at => $past);
+	$s.emit('x');
+	ok $s.last-activity-at > $past,
+		'emitting content advances activity';
 
-    $s._touch-activity(at => $past);
-    $s.done;
-    ok $s.last-activity-at > $past,
-        'terminal success advances activity';
+	$s._touch-activity(at => $past);
+	$s.done;
+	ok $s.last-activity-at > $past,
+		'terminal success advances activity';
+};
+
+# The transport-teardown seam. What it BUYS — an openai-compatible
+# server actually stopping — can only be shown over a socket, and
+# t/26-cancel-terminates-request.rakutest does that with a real Cro
+# server watching for the hang up. These are the mechanics underneath
+# it: run-once, run-late, drop-on-terminal, never-throw.
+
+subtest 'cancel runs the registered aborter exactly once' => {
+	plan 5;
+
+	my $r = LLM::Chat::Backend::Response.new(id => 'abort-once');
+	my $runs = 0;
+
+	nok $r.cancel-requested, 'a fresh response has not been cancelled';
+
+	$r._attach-aborter({ $runs++ });
+	is $runs, 0, 'attaching does not abort anything on its own';
+
+	$r.cancel;
+	is $runs, 1, 'cancelling tears the transport down';
+
+	$r.cancel;
+	$r.cancel;
+	is $runs, 1, 'and repeat cancels do not tear it down again';
+	ok $r.cancel-requested, 'the cancel is recorded for the backend to read';
+};
+
+subtest 'an aborter attached after the cancel runs immediately' => {
+	plan 3;
+	# The prefill window: a consumer can cancel before response headers
+	# exist, which is before any backend has a handle to register. The
+	# abort has to land when the handle turns up rather than be lost.
+
+	my $r = LLM::Chat::Backend::Response.new(id => 'abort-late');
+	my $runs = 0;
+
+	$r.cancel;
+	is $runs, 0, 'nothing to abort yet';
+
+	$r._attach-aborter({ $runs++ });
+	is $runs, 1, 'the deferred abort fires the moment a transport exists';
+
+	$r._attach-aborter({ $runs++ });
+	is $runs, 2,
+		'and so does a second one — a retried request is still unwanted';
+};
+
+subtest 'a response that failed before its transport arrived drops it' => {
+	plan 2;
+	# The same rule from the other side: an already-terminal Response
+	# will never read the body coming down that connection, so the
+	# transport is torn down on arrival rather than held by a Response
+	# nobody is waiting on.
+
+	my $r = LLM::Chat::Backend::Response.new(id => 'quit-then-attach');
+	my $runs = 0;
+
+	$r.quit('Must define template in backend to use text completion');
+	$r._attach-aborter({ $runs++ });
+
+	is $runs, 1, 'the transport is closed as it arrives';
+	nok $r.cancel-requested,
+		'without pretending the caller asked for a cancel';
+};
+
+subtest 'a terminal response has nothing left to abort' => {
+	plan 4;
+	# A cancel that loses the race to the last token must not reset a
+	# connection Cro has since handed to somebody else.
+
+	my $done = LLM::Chat::Backend::Response.new(id => 'abort-after-done');
+	my $done-runs = 0;
+	$done._attach-aborter({ $done-runs++ });
+	$done.done;
+	$done.cancel;
+
+	is $done-runs, 0, 'a cancel after success aborts nothing';
+	ok $done.is-success, 'and leaves the success alone';
+
+	my $failed = LLM::Chat::Backend::Response.new(id => 'abort-after-quit');
+	my $failed-runs = 0;
+	$failed._attach-aborter({ $failed-runs++ });
+	$failed.quit('Hit max tokens');
+	$failed.cancel;
+
+	is $failed-runs, 0, 'a cancel after a failure aborts nothing either';
+	is $failed.err, 'Hit max tokens', 'and does not overwrite the diagnosis';
+};
+
+subtest 'a throwing aborter never reaches the cancelling thread' => {
+	plan 3;
+	# cancel() is reached from TUI keybind handlers and job supervisors
+	# that have already been told the cancel worked. A half-dead socket
+	# must not turn that into an exception.
+
+	my $r = LLM::Chat::Backend::Response.new(id => 'abort-throws');
+	$r._attach-aborter({ die 'socket is long gone' });
+
+	lives-ok { $r.cancel }, 'the abort failure is swallowed';
+	ok $r.is-cancelled, 'the local close still happened';
+	is $r.err, 'Cancelled by user',
+		'and the cancel, not the abort failure, is the recorded error';
 };

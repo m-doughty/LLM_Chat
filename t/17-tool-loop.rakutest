@@ -8,7 +8,7 @@ use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 use LLM::Chat::ToolLoop;
 
-plan 5;
+plan 6;
 
 sub msg($role, $content) {
 	LLM::Chat::Conversation::Message.new(:$role, :$content);
@@ -203,6 +203,57 @@ subtest 'Repeated identical calls are stopped' => {
 	is $backend.recorded-calls[2]<tools>.elems, 0, 'Repeat-limit final call omits tools';
 	is $backend.recorded-calls[2]<messages>[*-1].role, 'system',
 		'Repeat-limit instruction was appended';
+};
+
+subtest 'Identical object arguments are identical however they were built' => {
+	plan 3;
+	# Two Hashes with the same members iterate in different orders when
+	# they were filled in different orders. The identical-call limit
+	# must still see the two calls as one.
+	my @names = ('k00' .. 'k19');
+	sub args(@order --> Hash:D) {
+		my %a;
+		%a{$_} = $_ for @order;
+		%a;
+	}
+	my %first = args(@names);
+	my %second;
+	for ^50 {
+		%second = args(@names.pick(*));
+		last if %second.keys.join(',') ne %first.keys.join(',');
+	}
+	sub call(%arguments) {
+		[{
+			id       => 'call_same',
+			type     => 'function',
+			function => { name => 'get_weather', arguments => %arguments },
+		},];
+	}
+
+	my $backend = ScriptedBackend.new(
+		settings => LLM::Chat::Backend::Settings.new,
+		steps => [
+			{ tool-calls => call(%first) },
+			{ tool-calls => call(%second) },
+			{ chunks => ['repeat limited'] },
+		],
+	);
+	my $executed = 0;
+	my $loop = LLM::Chat::ToolLoop.new(
+		:$backend,
+		tools => @tools,
+		max-identical-calls => 1,
+		execute-tools => -> @calls {
+			$executed++;
+			[{ role => 'tool', tool_call_id => @calls[0]<id>, content => 'result' },];
+		},
+	);
+
+	my $resp = $loop.chat-completion-stream([msg('user', 'weather?')]);
+	isnt %second.keys.join(','), %first.keys.join(','),
+		'the fixture really does iterate the two argument hashes differently';
+	is wait-msg($resp), 'repeat limited', 'final answer after the repeat limit';
+	is $executed, 1, 'the second, identically-argued call was not executed';
 };
 
 subtest 'Executor exception becomes tool result message' => {

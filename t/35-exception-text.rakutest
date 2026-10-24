@@ -1,0 +1,350 @@
+use Test;
+use lib 'lib';
+
+use CompUnit::Repository::Staging;
+
+use LLM::Chat::ExceptionText;
+
+# Exceptions without a message.
+#
+# Rakudo's base Exception.message is a stub (`...`): an exception class
+# that defines no message hands back a Failure of X::StubCode, which
+# throws the moment it is used as text. Cro::HTTP::Client raises exactly
+# such a class, Cro::HTTP::Client::PipelineClosedBeforeHeaders, whenever
+# a server closes the connection before sending response headers. Every
+# error handler here interpolated the exception it caught with
+# `.message`, so that one dropped connection made the handler throw from
+# inside its own CATCH — on the request's worker thread, where it is
+# "Unhandled exception in code scheduled on thread N" and the process
+# exits.
+#
+# This file pins LLM::Chat::ExceptionText's two subs on their own, then
+# runs t/35-exception-text-handlers.raku in a child process: that script
+# drives every handler that used to call `.message` with a messageless
+# exception, and its process prints a Rakudo warning on stderr that no
+# code here can suppress (the script's header says why). The child's
+# TAP results are repeated here one by one; its stderr is checked to
+# hold nothing but that warning, and never reaches the test run.
+
+plan 8;
+
+# --- Fixtures: exceptions and messages --------------------------------
+
+# No message of its own: .message is the base stub.
+class X::ExceptionTextTest::Quiet is Exception { }
+
+class X::ExceptionTextTest::Loud is Exception {
+	method message { 'loud and clear' }
+}
+
+class X::ExceptionTextTest::Attribute is Exception {
+	has $.message;
+}
+
+# .message itself dies, with an exception that does have a message.
+class X::ExceptionTextTest::BrokenMessage is Exception {
+	method message { die 'the message method is broken' }
+}
+
+class X::ExceptionTextTest::NilMessage is Exception {
+	method message { Nil }
+}
+
+class X::ExceptionTextTest::TypeObjectMessage is Exception {
+	method message { Str }
+}
+
+# .message returns a Failure, kept so the test can see it was handled.
+class X::ExceptionTextTest::FailedMessage is Exception {
+	has $.failure is rw;
+
+	method message {
+		$!failure = Failure.new(X::AdHoc.new(payload => 'no message today'));
+		$!failure;
+	}
+}
+
+class X::ExceptionTextTest::IntMessage is Exception {
+	method message { 42 }
+}
+
+class X::ExceptionTextTest::EmptyMessage is Exception {
+	method message { '' }
+}
+
+# Message objects whose stringification goes wrong.
+class ExceptionTextTest::DyingStr {
+	method Str { die 'Str is broken' }
+}
+
+class ExceptionTextTest::FailingStr {
+	has $.failure is rw;
+
+	method Str {
+		$!failure = Failure.new(X::AdHoc.new(payload => 'no Str today'));
+		$!failure;
+	}
+}
+
+class ExceptionTextTest::IntStr {
+	method Str { 7 }
+}
+
+class X::ExceptionTextTest::DyingStrMessage is Exception {
+	method message { ExceptionTextTest::DyingStr.new }
+}
+
+class X::ExceptionTextTest::FailingStrMessage is Exception {
+	has $.object = ExceptionTextTest::FailingStr.new;
+
+	method message { $!object }
+}
+
+class X::ExceptionTextTest::NonStrStrMessage is Exception {
+	method message { ExceptionTextTest::IntStr.new }
+}
+
+role ExceptionTextTest::Tag { }
+
+my constant QUIET = 'X::ExceptionTextTest::Quiet';
+
+# Every value that has no message, by what is wrong with it.
+my @messageless =
+	'the base Exception stub'      => X::ExceptionTextTest::Quiet.new,
+	'.message that dies'           => X::ExceptionTextTest::BrokenMessage.new,
+	'.message returning Nil'       => X::ExceptionTextTest::NilMessage.new,
+	'.message returning Str'       => X::ExceptionTextTest::TypeObjectMessage.new,
+	'.message returning a Failure' => X::ExceptionTextTest::FailedMessage.new,
+	'a message whose .Str dies'    => X::ExceptionTextTest::DyingStrMessage.new,
+	'a message whose .Str fails'   => X::ExceptionTextTest::FailingStrMessage.new,
+	'a .Str that is not a Str'     => X::ExceptionTextTest::NonStrStrMessage.new,
+	'an unset $.message attribute' => X::ExceptionTextTest::Attribute.new,
+	'an Exception type object'     => X::ExceptionTextTest::Quiet,
+	'Mu'                           => Mu,
+	'an Int'                       => 42,
+	'a Str'                        => 'not an exception';
+
+# --- exception-message / exception-text -------------------------------
+
+subtest 'the premise: a messageless exception has a booby-trapped .message' => {
+	plan 3;
+	my $message := X::ExceptionTextTest::Quiet.new.message;
+	isa-ok $message, Failure, 'the base Exception.message stub returns a Failure';
+	is $message.exception.^name, 'X::StubCode', '... of X::StubCode';
+	$message.so;
+	throws-like { my $text = "{X::ExceptionTextTest::Quiet.new.message}" }, X::StubCode,
+		'which throws as soon as it is interpolated, as the handlers did';
+};
+
+subtest 'exception-message returns a message that is there' => {
+	plan 6;
+	is exception-message(X::AdHoc.new(payload => 'disk full')), 'disk full',
+		'an X::AdHoc payload';
+	is exception-message(X::ExceptionTextTest::Loud.new), 'loud and clear',
+		'a message method';
+	is exception-message(X::ExceptionTextTest::Attribute.new(message => 'from the attribute')),
+		'from the attribute', 'a $.message attribute';
+	is exception-message(X::ExceptionTextTest::IntMessage.new), '42',
+		'a defined non-Str message is stringified';
+	isa-ok exception-message(X::ExceptionTextTest::IntMessage.new), Str,
+		'... and comes back a Str';
+	is exception-message(X::ExceptionTextTest::EmptyMessage.new), '',
+		'an empty string is a message, returned as one';
+};
+
+subtest 'exception-message is an undefined Str when there is no message' => {
+	plan +@messageless;
+	for @messageless -> (:key($why), Mu :value($exception)) {
+		my $message = exception-message($exception);
+		ok $message === Str, "$why: Str type object";
+	}
+};
+
+subtest 'a Failure from .message or .Str is marked handled' => {
+	plan 4;
+	my $failed-message = X::ExceptionTextTest::FailedMessage.new;
+	ok exception-message($failed-message) === Str,
+		'a failed .message is no message';
+	ok $failed-message.failure.handled,
+		'... and the Failure is handled, so it never warns on collection';
+
+	my $failed-str = X::ExceptionTextTest::FailingStrMessage.new;
+	ok exception-message($failed-str) === Str,
+		'a failed .Str is no message';
+	ok $failed-str.object.failure.handled,
+		'... and that Failure is handled too';
+};
+
+subtest 'exception-text: the message, else the class name' => {
+	plan 8;
+	is exception-text(X::AdHoc.new(payload => 'disk full')), 'disk full',
+		'a message is returned as it is';
+	is exception-text(X::ExceptionTextTest::Quiet.new), QUIET,
+		'a messageless exception is named by its class';
+	is exception-text(X::ExceptionTextTest::BrokenMessage.new),
+		'X::ExceptionTextTest::BrokenMessage',
+		'so is one whose .message dies';
+	is exception-text(X::ExceptionTextTest::Quiet), QUIET,
+		'a type object is named too';
+	is exception-text(42), 'Int', 'a non-exception is named by its type';
+	is exception-text(Mu), 'Mu', 'even Mu';
+	is exception-text(X::ExceptionTextTest::EmptyMessage.new), '',
+		'an empty message is still the message';
+	isa-ok exception-text(X::ExceptionTextTest::Quiet.new), Str,
+		'the answer is a Str';
+};
+
+subtest 'exception-text names the declared class, not runtime mixins' => {
+	plan 4;
+	# Thrown before the Promise is broken with it: `await` rethrowing an
+	# exception that was never thrown is what leaks the Rakudo warning
+	# the handler half runs in a child process for.
+	try die X::ExceptionTextTest::Quiet.new;
+	my $quiet = $!;
+	my $broken = Promise.new;
+	$broken.break($quiet);
+	try await $broken;
+	my $caught = $!;
+	ok $caught.^name.contains('+{X::Await::Died}'),
+		'premise: await mixes X::Await::Died into what it rethrows';
+	is exception-text($caught), QUIET,
+		'the error text is the class that was raised';
+
+	my $loud = Promise.new;
+	$loud.break(X::AdHoc.new(payload => 'loud'));
+	try await $loud;
+	is exception-text($!), 'loud', 'a message still wins over the name';
+
+	is exception-text(X::ExceptionTextTest::Quiet.new but ExceptionTextTest::Tag), QUIET,
+		'any mixed-in role is left off the name';
+};
+
+subtest 'neither sub throws, whatever it is handed' => {
+	my @everything = |@messageless.map(*.value),
+		X::AdHoc.new(payload => 'fine'), X::ExceptionTextTest::IntMessage.new;
+	plan 2 * @everything;
+	for @everything -> $exception {
+		my $label = (try $exception.^name) // 'value';
+		lives-ok { exception-message($exception) }, "exception-message($label)";
+		lives-ok {
+			my Str:D $text = exception-text($exception);
+		}, "exception-text($label) is a Str:D";
+	}
+};
+
+# --- The handlers, in a child process ---------------------------------
+
+my IO::Path $handlers = $?FILE.IO.absolute.IO.parent.add('35-exception-text-handlers.raku');
+
+# The child's own waits are bounded; this bounds the child.
+my constant CHILD-LIMIT = 600;
+
+# Every non-default repo this process has, for the child: a FileSystem
+# repo (forwarded as its dist root when its prefix is a `lib` beside a
+# META6.json, so a provides alias still resolves), or a Staging repo
+# (forwarded by its path-spec, the form `zef install` hands a test
+# process). The default site/vendor/core/home chain needs no forwarding.
+my @inc = $*REPO.repo-chain.grep({
+	$_ ~~ CompUnit::Repository::FileSystem | CompUnit::Repository::Staging
+}).map(-> $repo {
+	if $repo ~~ CompUnit::Repository::Staging {
+		'-I' ~ $repo.path-spec;
+	}
+	else {
+		my $prefix = $repo.prefix;
+		my $dist-root = $prefix.basename eq 'lib'
+				&& $prefix.parent.add('META6.json').e
+			?? $prefix.parent !! $prefix;
+		'-I' ~ $dist-root.absolute;
+	}
+});
+
+# Run the handlers script; collect its stdout, stderr and fate. Both
+# streams are read as they arrive, so neither pipe can fill and stall
+# the child.
+sub run-handlers(--> Hash:D) {
+	my $proc = Proc::Async.new($*EXECUTABLE.absolute, |@inc, $handlers.absolute);
+	my Str $out = '';
+	my Str $err = '';
+	my $out-done = Promise.new;
+	my $err-done = Promise.new;
+	$proc.stdout.tap(
+		-> $chunk { $out ~= $chunk },
+		done => { $out-done.keep },
+		quit => -> $ { $out-done.keep },
+	);
+	$proc.stderr.tap(
+		-> $chunk { $err ~= $chunk },
+		done => { $err-done.keep },
+		quit => -> $ { $err-done.keep },
+	);
+	my $exited = $proc.start;
+	my $all = Promise.allof($exited, $out-done, $err-done);
+	await Promise.anyof($all, Promise.in(CHILD-LIMIT));
+	my Bool $timed-out = $all.status ~~ Planned;
+	if $timed-out {
+		try $proc.kill(SIGKILL);
+		await Promise.anyof($exited, Promise.in(10));
+	}
+	my $result = $exited.status ~~ Kept ?? $exited.result !! Proc;
+	%(
+		:$out,
+		:$err,
+		:$timed-out,
+		exitcode => $result.defined ?? $result.exitcode !! -1,
+		signal   => $result.defined ?? $result.signal !! -1,
+	);
+}
+
+# The child's stderr with every copy of the one warning it is expected
+# to carry taken out: Rakudo's DESTROY report of the stub's Failure,
+# then its backtrace. Whatever is left was not expected.
+sub unexpected-stderr(Str:D $err --> Str:D) {
+	$err.subst(
+		/
+			^^ 'WARNING: unhandled Failure detected in DESTROY.' \N* \n
+			'Stub code executed' [ \n | $ ]
+			[ ^^ \h+ 'in ' \N* [ \n | $ ] ]*
+			[ ^^ \h* \n ]?
+		/,
+		'',
+		:g,
+	).trim;
+}
+
+subtest 'the handlers, end to end, in a child process' => {
+	my %child = run-handlers();
+	my @lines = %child<out>.lines;
+	my $planned = @lines.map({ / ^ '1..' (\d+) / ?? +$0 !! Nil }).first(*.defined);
+	my @results = @lines.grep(/ ^ [ 'not ' ]? 'ok ' \d+ /);
+	my Int $count = $planned // 0;
+	plan $count + 4;
+
+	my Bool $all-passed = True;
+	for ^$count -> $i {
+		with @results[$i] -> $line {
+			my $m = $line ~~ / ^ ('not ')? 'ok ' \d+ [ \h* '-' \h* (.*) ]? $ /;
+			my Str $what = $m && $m[1].defined ?? ~$m[1] !! "test {$i + 1}";
+			my Bool $passed = so $m && !$m[0].defined;
+			$all-passed = False unless $passed;
+			ok $passed, "child: $what";
+		}
+		else {
+			$all-passed = False;
+			flunk "child: test {$i + 1} never reported";
+		}
+	}
+
+	my $fate = "exit {%child<exitcode>}, signal {%child<signal>}"
+		~ (%child<timed-out> ?? ", killed after {CHILD-LIMIT}s" !! '');
+	ok $planned.defined, "the child planned its tests ($fate)";
+	is %child<signal>, 0, "no signal ended the child ($fate)";
+	is %child<exitcode>, 0, "the child exited 0 ($fate)";
+	my Str $stray = unexpected-stderr(%child<err>);
+	ok $stray eq '', "the child's stderr holds nothing but Rakudo's DESTROY warning";
+
+	unless $all-passed && $planned.defined && %child<exitcode> == 0 {
+		diag "the child's TAP:\n" ~ %child<out>;
+	}
+	diag "unexpected stderr from the child:\n$stray" if $stray ne '';
+};

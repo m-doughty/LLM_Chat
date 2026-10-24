@@ -10,287 +10,287 @@ use LLM::Chat::Conversation::Message;
 plan 17;
 
 sub msg($role, $content) {
-    LLM::Chat::Conversation::Message.new(:$role, :$content);
+	LLM::Chat::Conversation::Message.new(:$role, :$content);
 }
 
 subtest 'chat-completion returns canned response' => {
-    plan 3;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['hello world'],
-    );
-    my $resp = $mock.chat-completion([msg('user', 'hi')]);
-    my @got;
-    my $p = Promise.new;
-    $resp.supply.tap(
-        -> $t { @got.push($t) },
-        done => -> { $p.keep },
-    );
-    await Promise.anyof($p, Promise.in(2));
-    is @got.elems, 1, 'single emission for non-stream';
-    is @got[0], 'hello world', 'emitted text matches canned response';
-    ok $p.status ~~ Kept, 'supply closed';
+	plan 3;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['hello world'],
+	);
+	my $resp = $mock.chat-completion([msg('user', 'hi')]);
+	my @got;
+	my $p = Promise.new;
+	$resp.supply.tap(
+		-> $t { @got.push($t) },
+		done => -> { $p.keep },
+	);
+	await Promise.anyof($p, Promise.in(2));
+	is @got.elems, 1, 'single emission for non-stream';
+	is @got[0], 'hello world', 'emitted text matches canned response';
+	ok $p.status ~~ Kept, 'supply closed';
 };
 
 subtest 'streaming splits canned response into tokens' => {
-    plan 2;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['the quick brown fox'],
-    );
-    my $stream = $mock.chat-completion-stream([msg('user', 'hi')]);
-    my @tokens;
-    my $p = Promise.new;
-    $stream.supply.tap(
-        -> $t { @tokens.push($t) },
-        done => -> { $p.keep },
-    );
-    await Promise.anyof($p, Promise.in(2));
-    is @tokens.elems, 4, 'one emission per word';
-    is @tokens.join, 'the quick brown fox', 'reassembled text matches';
+	plan 2;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['the quick brown fox'],
+	);
+	my $stream = $mock.chat-completion-stream([msg('user', 'hi')]);
+	my @tokens;
+	my $p = Promise.new;
+	$stream.supply.tap(
+		-> $t { @tokens.push($t) },
+		done => -> { $p.keep },
+	);
+	await Promise.anyof($p, Promise.in(2));
+	is @tokens.elems, 4, 'one emission per word';
+	is @tokens.join, 'the quick brown fox', 'reassembled text matches';
 };
 
 subtest 'responses advance through queue' => {
-    plan 3;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['first', 'second', 'third'],
-    );
-    my @got;
-    for ^3 {
-        my $resp = $mock.chat-completion([msg('user', 'q')]);
-        my $p = Promise.new;
-        $resp.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
-        await Promise.anyof($p, Promise.in(2));
-    }
-    is @got[0], 'first',  'first call';
-    is @got[1], 'second', 'second call';
-    is @got[2], 'third',  'third call';
+	plan 3;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['first', 'second', 'third'],
+	);
+	my @got;
+	for ^3 {
+		my $resp = $mock.chat-completion([msg('user', 'q')]);
+		my $p = Promise.new;
+		$resp.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
+		await Promise.anyof($p, Promise.in(2));
+	}
+	is @got[0], 'first',  'first call';
+	is @got[1], 'second', 'second call';
+	is @got[2], 'third',  'third call';
 };
 
 subtest 'exhausted queue repeats last by default' => {
-    plan 2;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['only'],
-    );
-    my @got;
-    for ^3 {
-        my $resp = $mock.chat-completion([msg('user', 'q')]);
-        my $p = Promise.new;
-        $resp.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
-        await Promise.anyof($p, Promise.in(2));
-    }
-    is @got[1], 'only', 'second call repeats';
-    is @got[2], 'only', 'third call repeats';
+	plan 2;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['only'],
+	);
+	my @got;
+	for ^3 {
+		my $resp = $mock.chat-completion([msg('user', 'q')]);
+		my $p = Promise.new;
+		$resp.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
+		await Promise.anyof($p, Promise.in(2));
+	}
+	is @got[1], 'only', 'second call repeats';
+	is @got[2], 'only', 'third call repeats';
 };
 
 subtest 'fail-on-empty raises when queue drained' => {
-    plan 1;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings      => LLM::Chat::Backend::Settings.new,
-        responses     => ['once'],
-        fail-on-empty => True,
-    );
-    # Consume the single canned response
-    my $r1 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r1.supply.Promise, Promise.in(2));
-    dies-ok {
-        $mock.chat-completion([msg('user', 'q')]);
-    }, 'second call dies with fail-on-empty';
+	plan 1;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings      => LLM::Chat::Backend::Settings.new,
+		responses     => ['once'],
+		fail-on-empty => True,
+	);
+	# Consume the single canned response
+	my $r1 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r1.supply.Promise, Promise.in(2));
+	dies-ok {
+		$mock.chat-completion([msg('user', 'q')]);
+	}, 'second call dies with fail-on-empty';
 };
 
 subtest 'reset rewinds cursor' => {
-    plan 2;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['a', 'b'],
-    );
-    my @got;
-    my $consume = -> {
-        my $r = $mock.chat-completion([msg('user', 'q')]);
-        my $p = Promise.new;
-        $r.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
-        await Promise.anyof($p, Promise.in(2));
-    };
-    $consume();  # 'a'
-    $consume();  # 'b'
-    $mock.reset;
-    $consume();  # 'a' again
-    is @got[0], 'a', 'first consumption';
-    is @got[2], 'a', 'after reset, first response again';
+	plan 2;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['a', 'b'],
+	);
+	my @got;
+	my $consume = -> {
+		my $r = $mock.chat-completion([msg('user', 'q')]);
+		my $p = Promise.new;
+		$r.supply.tap(-> $t { @got.push($t) }, done => -> { $p.keep });
+		await Promise.anyof($p, Promise.in(2));
+	};
+	$consume();  # 'a'
+	$consume();  # 'b'
+	$mock.reset;
+	$consume();  # 'a' again
+	is @got[0], 'a', 'first consumption';
+	is @got[2], 'a', 'after reset, first response again';
 };
 
 subtest 'recorded-calls logs every completion' => {
-    plan 7;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['reply1', 'reply2'],
-    );
+	plan 7;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['reply1', 'reply2'],
+	);
 
-    my @msgs1 = [msg('system', 'you are helpful'), msg('user', 'hi')];
-    my @msgs2 = [msg('user', 'second turn')];
+	my @msgs1 = [msg('system', 'you are helpful'), msg('user', 'hi')];
+	my @msgs2 = [msg('user', 'second turn')];
 
-    my $r1 = $mock.chat-completion(@msgs1);
-    my $r2 = $mock.chat-completion-stream(@msgs2);
-    await Promise.anyof($r1.supply.Promise, Promise.in(2));
-    await Promise.anyof($r2.supply.Promise, Promise.in(2));
+	my $r1 = $mock.chat-completion(@msgs1);
+	my $r2 = $mock.chat-completion-stream(@msgs2);
+	await Promise.anyof($r1.supply.Promise, Promise.in(2));
+	await Promise.anyof($r2.supply.Promise, Promise.in(2));
 
-    is $mock.recorded-calls.elems, 2, 'two calls logged';
-    is $mock.recorded-calls[0]<kind>, 'chat-completion',         'first kind';
-    is $mock.recorded-calls[1]<kind>, 'chat-completion-stream',  'second kind';
-    is $mock.recorded-calls[0]<messages>.elems, 2, 'first call had 2 messages';
-    is $mock.recorded-calls[0]<messages>[0].role, 'system',   'first msg was system';
-    is $mock.recorded-calls[1]<messages>[0].content, 'second turn',
-        'second call captured user content';
-    is $mock.recorded-calls[0]<response>, 'reply1', 'recorded response aligns with queue';
+	is $mock.recorded-calls.elems, 2, 'two calls logged';
+	is $mock.recorded-calls[0]<kind>, 'chat-completion',         'first kind';
+	is $mock.recorded-calls[1]<kind>, 'chat-completion-stream',  'second kind';
+	is $mock.recorded-calls[0]<messages>.elems, 2, 'first call had 2 messages';
+	is $mock.recorded-calls[0]<messages>[0].role, 'system',   'first msg was system';
+	is $mock.recorded-calls[1]<messages>[0].content, 'second turn',
+		'second call captured user content';
+	is $mock.recorded-calls[0]<response>, 'reply1', 'recorded response aligns with queue';
 };
 
 subtest 'clear-recorded-calls empties the log' => {
-    plan 2;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['x', 'y'],
-    );
-    my $r = $mock.chat-completion([msg('user', 'a')]);
-    await Promise.anyof($r.supply.Promise, Promise.in(2));
-    is $mock.recorded-calls.elems, 1, 'one recorded';
+	plan 2;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['x', 'y'],
+	);
+	my $r = $mock.chat-completion([msg('user', 'a')]);
+	await Promise.anyof($r.supply.Promise, Promise.in(2));
+	is $mock.recorded-calls.elems, 1, 'one recorded';
 
-    $mock.clear-recorded-calls;
-    is $mock.recorded-calls.elems, 0, 'empty after clear';
+	$mock.clear-recorded-calls;
+	is $mock.recorded-calls.elems, 0, 'empty after clear';
 };
 
 subtest 'fake-usage populates OAI-spec attrs on base Response' => {
-    plan 6;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings   => LLM::Chat::Backend::Settings.new,
-        responses  => ['ok1', 'ok2'],
-        fake-usage => %(
-            prompt     => 100,
-            completion => 25,
-            total      => 125,
-            model      => 'mock/test-v1',
-            # OR-specific keys are silently dropped on a base Response
-            # — see the next subtest for them landing on OR Response.
-            cost          => 0.0023e0,
-            generation-id => 'gen-xxx',
-        ),
-    );
-    my $r1 = $mock.chat-completion([msg('user', 'hi')]);
-    await Promise.anyof($r1.supply.Promise, Promise.in(2));
-    is $r1.prompt-tokens,     100,             'prompt on first response';
-    is $r1.completion-tokens, 25,              'completion on first response';
-    is $r1.total-tokens,      125,             'total on first response';
-    is $r1.model-used,        'mock/test-v1',  'model-used on first response';
+	plan 6;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings   => LLM::Chat::Backend::Settings.new,
+		responses  => ['ok1', 'ok2'],
+		fake-usage => %(
+			prompt     => 100,
+			completion => 25,
+			total      => 125,
+			model      => 'mock/test-v1',
+			# OR-specific keys are silently dropped on a base Response
+			# — see the next subtest for them landing on OR Response.
+			cost          => 0.0023e0,
+			generation-id => 'gen-xxx',
+		),
+	);
+	my $r1 = $mock.chat-completion([msg('user', 'hi')]);
+	await Promise.anyof($r1.supply.Promise, Promise.in(2));
+	is $r1.prompt-tokens,     100,             'prompt on first response';
+	is $r1.completion-tokens, 25,              'completion on first response';
+	is $r1.total-tokens,      125,             'total on first response';
+	is $r1.model-used,        'mock/test-v1',  'model-used on first response';
 
-    # Fake usage applies per-call — second response gets the same shape.
-    my $r2 = $mock.chat-completion([msg('user', 'again')]);
-    await Promise.anyof($r2.supply.Promise, Promise.in(2));
-    is $r2.prompt-tokens, 100, 'prompt on second response';
+	# Fake usage applies per-call — second response gets the same shape.
+	my $r2 = $mock.chat-completion([msg('user', 'again')]);
+	await Promise.anyof($r2.supply.Promise, Promise.in(2));
+	is $r2.prompt-tokens, 100, 'prompt on second response';
 
-    # Backend with no fake-usage → Response attrs stay undefined.
-    my $bare = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['plain'],
-    );
-    my $r3 = $bare.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r3.supply.Promise, Promise.in(2));
-    nok $r3.prompt-tokens.defined, 'no fake-usage → attrs undefined';
+	# Backend with no fake-usage → Response attrs stay undefined.
+	my $bare = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['plain'],
+	);
+	my $r3 = $bare.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r3.supply.Promise, Promise.in(2));
+	nok $r3.prompt-tokens.defined, 'no fake-usage → attrs undefined';
 };
 
 subtest 'fake-usage populates OR-specific attrs on Response::OpenRouter' => {
-    plan 11;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings              => LLM::Chat::Backend::Settings.new,
-        responses             => ['ok1'],
-        response-class        => LLM::Chat::Backend::Response::OpenRouter,
-        stream-response-class => LLM::Chat::Backend::Response::OpenRouter::Stream,
-        fake-usage            => %(
-            # OAI-spec
-            prompt     => 80,
-            completion => 30,
-            total      => 110,
-            model      => 'anthropic/claude-opus-4-7',
-            # OR extras
-            cost          => 0.0041e0,
-            generation-id => 'gen-mock-abc',
-            provider-name => 'Anthropic',
-            is-byok       => True,
-        ),
-    );
-    my $r1 = $mock.chat-completion([msg('user', 'hi')]);
-    await Promise.anyof($r1.supply.Promise, Promise.in(2));
-    isa-ok $r1, LLM::Chat::Backend::Response::OpenRouter,
+	plan 11;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings              => LLM::Chat::Backend::Settings.new,
+		responses             => ['ok1'],
+		response-class        => LLM::Chat::Backend::Response::OpenRouter,
+		stream-response-class => LLM::Chat::Backend::Response::OpenRouter::Stream,
+		fake-usage            => %(
+			# OAI-spec
+			prompt     => 80,
+			completion => 30,
+			total      => 110,
+			model      => 'anthropic/claude-opus-4-7',
+			# OR extras
+			cost          => 0.0041e0,
+			generation-id => 'gen-mock-abc',
+			provider-name => 'Anthropic',
+			is-byok       => True,
+		),
+	);
+	my $r1 = $mock.chat-completion([msg('user', 'hi')]);
+	await Promise.anyof($r1.supply.Promise, Promise.in(2));
+	isa-ok $r1, LLM::Chat::Backend::Response::OpenRouter,
                                                    'mock returns OR Response when configured';
-    is $r1.prompt-tokens,     80,                  'OAI-spec prompt populated alongside OR extras';
-    is $r1.completion-tokens, 30,                  'OAI-spec completion populated';
-    is $r1.total-tokens,      110,                 'OAI-spec total populated';
-    is $r1.model-used,        'anthropic/claude-opus-4-7',
+	is $r1.prompt-tokens,     80,                  'OAI-spec prompt populated alongside OR extras';
+	is $r1.completion-tokens, 30,                  'OAI-spec completion populated';
+	is $r1.total-tokens,      110,                 'OAI-spec total populated';
+	is $r1.model-used,        'anthropic/claude-opus-4-7',
                                                    'OAI-spec model-used populated';
-    is $r1.cost,              0.0041e0,            'OR cost populated';
-    is $r1.generation-id,     'gen-mock-abc',      'OR generation-id populated';
-    is $r1.provider-name,     'Anthropic',         'OR provider-name populated';
-    is $r1.is-byok,           True,                'OR is-byok populated';
+	is $r1.cost,              0.0041e0,            'OR cost populated';
+	is $r1.generation-id,     'gen-mock-abc',      'OR generation-id populated';
+	is $r1.provider-name,     'Anthropic',         'OR provider-name populated';
+	is $r1.is-byok,           True,                'OR is-byok populated';
 
-    # Streaming counterpart uses the configured stream-response-class.
-    my $stream = $mock.chat-completion-stream([msg('user', 'hi')]);
-    await Promise.anyof($stream.supply.Promise, Promise.in(2));
-    isa-ok $stream, LLM::Chat::Backend::Response::OpenRouter::Stream,
+	# Streaming counterpart uses the configured stream-response-class.
+	my $stream = $mock.chat-completion-stream([msg('user', 'hi')]);
+	await Promise.anyof($stream.supply.Promise, Promise.in(2));
+	isa-ok $stream, LLM::Chat::Backend::Response::OpenRouter::Stream,
                                                    'stream uses OR Stream class';
-    is $stream.cost,          0.0041e0,            'OR cost present on stream too';
+	is $stream.cost,          0.0041e0,            'OR cost present on stream too';
 };
 
 subtest 'error-producer scripts per-call failures' => {
-    plan 11;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['success'],
-        error-producer => -> $i {
-            when $i == 0 { { class => 'http', status => 500, message => 'boom' } }
-            when $i == 1 { { class => 'timeout' } }
-            default      { Nil }
-        },
-    );
+	plan 11;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['success'],
+		error-producer => -> $i {
+			when $i == 0 { { class => 'http', status => 500, message => 'boom' } }
+			when $i == 1 { { class => 'timeout' } }
+			default      { Nil }
+		},
+	);
 
-    # Call 0: HTTP 500
-    my $r0 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r0.supply.Promise, Promise.in(2));
-    ok $r0.is-done,                       'failed call completes';
-    nok $r0.is-success,                   'failed call not success';
-    is $r0.error-class,  'http',          'error-class propagated';
-    is $r0.error-status, 500,             'error-status propagated';
-    is ~$r0.err,         'boom',          'error message propagated';
+	# Call 0: HTTP 500
+	my $r0 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r0.supply.Promise, Promise.in(2));
+	ok $r0.is-done,                       'failed call completes';
+	nok $r0.is-success,                   'failed call not success';
+	is $r0.error-class,  'http',          'error-class propagated';
+	is $r0.error-status, 500,             'error-status propagated';
+	is ~$r0.err,         'boom',          'error message propagated';
 
-    # Call 1: timeout (no status)
-    my $r1 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r1.supply.Promise, Promise.in(2));
-    is $r1.error-class,  'timeout',       'timeout class on second call';
-    nok $r1.error-status.defined,         'no status for timeout class';
+	# Call 1: timeout (no status)
+	my $r1 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r1.supply.Promise, Promise.in(2));
+	is $r1.error-class,  'timeout',       'timeout class on second call';
+	nok $r1.error-status.defined,         'no status for timeout class';
 
-    # Call 2: success. Response queue was NOT consumed by the prior failures,
-    # so 'success' is still at the head.
-    my $r2 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r2.supply.Promise, Promise.in(2));
-    ok $r2.is-success,                    'third call succeeds';
-    is $r2.msg, 'success',                'response queue intact across failures';
+	# Call 2: success. Response queue was NOT consumed by the prior failures,
+	# so 'success' is still at the head.
+	my $r2 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r2.supply.Promise, Promise.in(2));
+	ok $r2.is-success,                    'third call succeeds';
+	is $r2.msg, 'success',                'response queue intact across failures';
 
-    is $mock.call-index, 3,               'call-index bumped once per call';
-    is $mock.recorded-calls.elems, 3,     'recorded-calls covers all three';
+	is $mock.call-index, 3,               'call-index bumped once per call';
+	is $mock.recorded-calls.elems, 3,     'recorded-calls covers all three';
 };
 
 subtest 'error-producer returning Nil falls through to responses queue' => {
-    plan 2;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['a', 'b'],
-        error-producer => -> $i { Nil },   # never fails
-    );
-    my $r1 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r1.supply.Promise, Promise.in(2));
-    is $r1.msg, 'a', 'Nil from error-producer → normal response';
-    my $r2 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r2.supply.Promise, Promise.in(2));
-    is $r2.msg, 'b', 'queue advances normally';
+	plan 2;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['a', 'b'],
+		error-producer => -> $i { Nil },   # never fails
+	);
+	my $r1 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r1.supply.Promise, Promise.in(2));
+	is $r1.msg, 'a', 'Nil from error-producer → normal response';
+	my $r2 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r2.supply.Promise, Promise.in(2));
+	is $r2.msg, 'b', 'queue advances normally';
 };
 
 # --- finish-reason-producer -------------------------------------------
@@ -301,109 +301,109 @@ subtest 'error-producer returning Nil falls through to responses queue' => {
 # has something honest to detect.
 
 subtest 'finish-reason-producer stamps a truncated-but-successful call' => {
-    plan 5;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['{"beats": [{"first": 0,'],
-        finish-reason-producer => -> $i { 'length' },
-    );
-    my $r = $mock.chat-completion([msg('user', 'q')]);
+	plan 5;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['{"beats": [{"first": 0,'],
+		finish-reason-producer => -> $i { 'length' },
+	);
+	my $r = $mock.chat-completion([msg('user', 'q')]);
 
-    # Readable BEFORE the emission task has necessarily run — the
-    # stamp happens inline, not inside the start block.
-    is $r.finish-reason, 'length', 'finish-reason readable immediately';
+	# Readable BEFORE the emission task has necessarily run — the
+	# stamp happens inline, not inside the start block.
+	is $r.finish-reason, 'length', 'finish-reason readable immediately';
 
-    await Promise.anyof($r.supply.Promise, Promise.in(2));
-    ok $r.is-success,                     'truncated call still succeeds';
-    nok $r.error-class.defined,           'no error class on a truncated success';
-    is $r.msg, '{"beats": [{"first": 0,', 'partial body intact';
-    is $r.finish-reason, 'length',        'finish-reason survives completion';
+	await Promise.anyof($r.supply.Promise, Promise.in(2));
+	ok $r.is-success,                     'truncated call still succeeds';
+	nok $r.error-class.defined,           'no error class on a truncated success';
+	is $r.msg, '{"beats": [{"first": 0,', 'partial body intact';
+	is $r.finish-reason, 'length',        'finish-reason survives completion';
 };
 
 subtest 'no finish-reason-producer leaves finish-reason unset' => {
-    plan 2;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['plain'],
-    );
-    my $r = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r.supply.Promise, Promise.in(2));
-    nok $r.finish-reason.defined, 'historical shape: finish-reason undefined';
-    is $r.msg, 'plain',           'response unaffected';
+	plan 2;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['plain'],
+	);
+	my $r = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r.supply.Promise, Promise.in(2));
+	nok $r.finish-reason.defined, 'historical shape: finish-reason undefined';
+	is $r.msg, 'plain',           'response unaffected';
 };
 
 subtest 'finish-reason-producer addresses calls by index' => {
-    plan 8;
-    # Undefined return on the odd calls → unset, exactly as if no
-    # producer had been passed. Interleaved with a responder to prove
-    # the two hooks are independent.
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['queued-a', 'queued-b'],
-        responder => -> @messages {
-            @messages[*-1].content eq 'intercept' ?? 'from-responder' !! Str
-        },
-        finish-reason-producer => -> $i { $i %% 2 ?? 'length' !! Str },
-    );
+	plan 8;
+	# Undefined return on the odd calls → unset, exactly as if no
+	# producer had been passed. Interleaved with a responder to prove
+	# the two hooks are independent.
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['queued-a', 'queued-b'],
+		responder => -> @messages {
+			@messages[*-1].content eq 'intercept' ?? 'from-responder' !! Str
+		},
+		finish-reason-producer => -> $i { $i %% 2 ?? 'length' !! Str },
+	);
 
-    my @prompts = 'q', 'intercept', 'q', 'intercept';
-    my @resps;
-    for @prompts -> $p {
-        my $r = $mock.chat-completion([msg('user', $p)]);
-        await Promise.anyof($r.supply.Promise, Promise.in(2));
-        @resps.push: $r;
-    }
+	my @prompts = 'q', 'intercept', 'q', 'intercept';
+	my @resps;
+	for @prompts -> $p {
+		my $r = $mock.chat-completion([msg('user', $p)]);
+		await Promise.anyof($r.supply.Promise, Promise.in(2));
+		@resps.push: $r;
+	}
 
-    is @resps[0].finish-reason, 'length', 'call 0 truncated';
-    nok @resps[1].finish-reason.defined,  'call 1 clean';
-    is @resps[2].finish-reason, 'length', 'call 2 truncated';
-    nok @resps[3].finish-reason.defined,  'call 3 clean';
+	is @resps[0].finish-reason, 'length', 'call 0 truncated';
+	nok @resps[1].finish-reason.defined,  'call 1 clean';
+	is @resps[2].finish-reason, 'length', 'call 2 truncated';
+	nok @resps[3].finish-reason.defined,  'call 3 clean';
 
-    # Truncated calls still consume the queue — they succeeded.
-    is @resps[0].msg, 'queued-a',      'call 0 took the first canned slot';
-    is @resps[1].msg, 'from-responder','responder still intercepts';
-    is @resps[2].msg, 'queued-b',      'call 2 took the second canned slot';
-    is $mock.call-index, 4,            'four calls counted';
+	# Truncated calls still consume the queue — they succeeded.
+	is @resps[0].msg, 'queued-a',      'call 0 took the first canned slot';
+	is @resps[1].msg, 'from-responder','responder still intercepts';
+	is @resps[2].msg, 'queued-b',      'call 2 took the second canned slot';
+	is $mock.call-index, 4,            'four calls counted';
 };
 
 subtest 'error-producer wins over finish-reason-producer' => {
-    plan 5;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['survivor'],
-        error-producer => -> $i {
-            $i == 0 ?? { class => 'http', status => 502, message => 'bad gateway' } !! Nil
-        },
-        finish-reason-producer => -> $i { 'length' },
-    );
+	plan 5;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['survivor'],
+		error-producer => -> $i {
+			$i == 0 ?? { class => 'http', status => 502, message => 'bad gateway' } !! Nil
+		},
+		finish-reason-producer => -> $i { 'length' },
+	);
 
-    my $r0 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r0.supply.Promise, Promise.in(2));
-    nok $r0.is-success,          'scripted failure still fails';
-    is $r0.error-class, 'http',  'error info intact';
-    nok $r0.finish-reason.defined,
-        'a failed call never produced a body, so no finish reason';
+	my $r0 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r0.supply.Promise, Promise.in(2));
+	nok $r0.is-success,          'scripted failure still fails';
+	is $r0.error-class, 'http',  'error info intact';
+	nok $r0.finish-reason.defined,
+		'a failed call never produced a body, so no finish reason';
 
-    # The next call is not scripted to fail — it gets the reason.
-    my $r1 = $mock.chat-completion([msg('user', 'q')]);
-    await Promise.anyof($r1.supply.Promise, Promise.in(2));
-    ok $r1.is-success,                'following call succeeds';
-    is $r1.finish-reason, 'length',   'and carries the scripted finish reason';
+	# The next call is not scripted to fail — it gets the reason.
+	my $r1 = $mock.chat-completion([msg('user', 'q')]);
+	await Promise.anyof($r1.supply.Promise, Promise.in(2));
+	ok $r1.is-success,                'following call succeeds';
+	is $r1.finish-reason, 'length',   'and carries the scripted finish reason';
 };
 
 subtest 'text-completion inherits the finish-reason knob' => {
-    plan 4;
-    my $mock = LLM::Chat::Backend::Mock.new(
-        settings  => LLM::Chat::Backend::Settings.new,
-        responses => ['cut off here'],
-        finish-reason-producer => -> $i { 'length' },
-    );
-    my $r = $mock.text-completion([msg('user', 'q')], True);
-    await Promise.anyof($r.supply.Promise, Promise.in(2));
-    is $r.finish-reason, 'length',   'delegation carries the stamp through';
-    is $r.msg, 'cut off here',       'body intact';
-    is $mock.recorded-calls[*-1]<kind>, 'text-completion',
-        'recorded as a text-completion';
-    ok $mock.recorded-calls[*-1]<continuation>,
-        'continuation flag still recorded';
+	plan 4;
+	my $mock = LLM::Chat::Backend::Mock.new(
+		settings  => LLM::Chat::Backend::Settings.new,
+		responses => ['cut off here'],
+		finish-reason-producer => -> $i { 'length' },
+	);
+	my $r = $mock.text-completion([msg('user', 'q')], True);
+	await Promise.anyof($r.supply.Promise, Promise.in(2));
+	is $r.finish-reason, 'length',   'delegation carries the stamp through';
+	is $r.msg, 'cut off here',       'body intact';
+	is $mock.recorded-calls[*-1]<kind>, 'text-completion',
+		'recorded as a text-completion';
+	ok $mock.recorded-calls[*-1]<continuation>,
+		'continuation flag still recorded';
 };

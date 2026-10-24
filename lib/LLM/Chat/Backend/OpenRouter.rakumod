@@ -99,7 +99,7 @@ my $backend = LLM::Chat::Backend::OpenRouter.new(
 );
 
 # Off: messages go on the wire as plain `content => 'text'` strings,
-# byte for byte what earlier releases sent.
+# the message shape earlier releases sent.
 my $plain = LLM::Chat::Backend::OpenRouter.new(
     api_key           => %*ENV<OPENROUTER_API_KEY>,
     model             => 'anthropic/claude-opus-4-7',
@@ -161,6 +161,7 @@ use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::Response::OpenRouter;
 use LLM::Chat::Backend::Response::OpenRouter::Stream;
 use LLM::Chat::Debug;
+use LLM::Chat::ExceptionText;
 
 use Cro::HTTP::Client;
 use JSON::Fast;
@@ -206,6 +207,12 @@ method new(*%args is copy) {
 	self.bless(|%args);
 }
 
+#|( OpenRouter routes one model across many providers and publishes no
+    per-server limits, so this asks nothing and says so. )
+method probe-server-limits(--> Hash:D) {
+	%(source => 'none', note => 'OpenRouter publishes no server limits');
+}
+
 #|( Mirror SillyTavern's request shape: C<include_reasoning> + C<top_k>
     on every request, optional C<reasoning: { effort: ... }> when the
     caller asked for graded reasoning. We deliberately do I<not> send
@@ -225,6 +232,10 @@ method new(*%args is copy) {
     non-reasoning models don't see an unsupported parameter. )
 method _get-api-settings(--> Hash) {
 	my %settings = callsame;
+	# OpenRouter takes thinking as the `reasoning` object below, and has
+	# no slots: the top-level fields OpenAICommon adds for llama.cpp
+	# never go to it.
+	%settings{$_}:delete for <reasoning_effort reasoning_budget_tokens id_slot>;
 	%settings<include_reasoning> = $.settings.defined && $.settings.reasoning_effort.defined;
 	if $.settings.defined && $.settings.reasoning_effort.defined {
 		%settings<reasoning> = %(
@@ -449,10 +460,12 @@ method !fetch-generation-metadata(LLM::Chat::Backend::Response $response) {
 
 	LLM::Chat::Debug.log('GENERATION LOOKUP', $url);
 
-	# Same HTTP/1.1 pin as the parent's request clients — see
+	# Same HTTP/1.1 pin, and the same one-request, non-persistent
+	# client, as the parent's request clients — see
 	# OpenAICommon.chat-completion / chat-completion-stream for the
 	# rationale.
 	my $client = Cro::HTTP::Client.new:
+		:!persistent,
 		:http<1.1>,
 		content-type => 'application/json',
 		timeout      => $.request-timeout;
@@ -527,7 +540,7 @@ method !fetch-generation-metadata(LLM::Chat::Backend::Response $response) {
 	CATCH {
 		default {
 			LLM::Chat::Debug.log('GENERATION LOOKUP FAILED',
-				"{.^name}: {.message}");
+				"{.^name}: {exception-message($_) // '(no message)'}");
 			# Best-effort. Leave .cost Nil rather than escalating
 			# to the user — the primary call itself already
 			# succeeded. CATCH returns normally (doesn't rethrow)

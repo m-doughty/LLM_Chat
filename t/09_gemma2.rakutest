@@ -11,9 +11,9 @@ my $template = LLM::Chat::Template::Gemma2.new;
 is $template.name, 'gemma-2', 'Template name is correct';
 
 my @messages = (
-    LLM::Chat::Conversation::Message.new(:role<system>,    :content('You are a helpful assistant.')),
-    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
-    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi there!'))
+	LLM::Chat::Conversation::Message.new(:role<system>,    :content('You are a helpful assistant.')),
+	LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+	LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi there!'))
 );
 
 my $expected = q:to/END/;

@@ -32,7 +32,8 @@ use LLM::Chat::Debug;
 
 LLM::Chat::Debug.log('REQUEST URL',  $url);
 LLM::Chat::Debug.log-headers('REQUEST HEADERS', %headers);
-LLM::Chat::Debug.log-json('REQUEST BODY', %body);
+LLM::Chat::Debug.log-json('PARSED BODY', %body);    # pretty-printed
+LLM::Chat::Debug.log-bytes('REQUEST BODY', $blob);  # the exact wire bytes
 
 # In a streaming loop:
 LLM::Chat::Debug.log('SSE LINE', $raw-line);
@@ -77,6 +78,18 @@ method log-json(Str:D $label, $body) {
 		?? to-json($body, :pretty)
 		!! $body.gist;
 	self.log($label, $rendered);
+}
+
+#|( Log a byte payload — a request body exactly as it went on the wire —
+    as UTF-8 text. The bytes are decoded only when logging is enabled,
+    so an unlogged multi-megabyte body costs the same single hash
+    lookup as every other call. Bytes that are not valid UTF-8 are
+    logged as a byte count rather than dropped or mangled. )
+method log-bytes(Str:D $label, Blob:D $bytes) {
+	my $path = %*ENV<LLM_CHAT_DEBUG>;
+	return unless $path && $path.chars;
+	my $text = try $bytes.decode('utf-8');
+	self.log($label, $text // "<{$bytes.bytes} bytes, not valid UTF-8>");
 }
 
 #|( Like C<log-json> but redacts the C<Authorization> header (and

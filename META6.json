@@ -8,7 +8,7 @@
   "depends": [
     "Cro::HTTP::Client:ver<0.8.11+>:auth<zef:cro>",
     "Digest::SHA256::Native:ver<1.0.0+>:auth<zef:bduggan>",
-    "JSON::Fast:ver<0.19+>:auth<cpan:TIMOTIMO>",
+    "JSON::Fast:ver<0.21.0+>:auth<zef:timo>",
     "Template::Jinja2:ver<0.3.0+>:auth<zef:apogee>",
     "Tokenizers:ver<0.3.0+>:auth<zef:apogee>",
     "UUID::V4:ver<1.0.0+>:auth<zef:masukomi>"
@@ -32,6 +32,7 @@
     "LLM::Chat::Conversation": "lib/LLM/Chat/Conversation.rakumod",
     "LLM::Chat::Conversation::Message": "lib/LLM/Chat/Conversation/Message.rakumod",
     "LLM::Chat::Debug": "lib/LLM/Chat/Debug.rakumod",
+    "LLM::Chat::ExceptionText": "lib/LLM/Chat/ExceptionText.rakumod",
     "LLM::Chat::Retry": "lib/LLM/Chat/Retry.rakumod",
     "LLM::Chat::Retry::Exceptions": "lib/LLM/Chat/Retry/Exceptions.rakumod",
     "LLM::Chat::Template": "lib/LLM/Chat/Template.rakumod",
@@ -42,8 +43,10 @@
     "LLM::Chat::Template::Llama3": "lib/LLM/Chat/Template/Llama3.rakumod",
     "LLM::Chat::Template::Llama4": "lib/LLM/Chat/Template/Llama4.rakumod",
     "LLM::Chat::Template::MistralV7": "lib/LLM/Chat/Template/MistralV7.rakumod",
+    "LLM::Chat::Test::Kit": "lib/LLM/Chat/Test/Kit.rakumod",
     "LLM::Chat::TokenCounter": "lib/LLM/Chat/TokenCounter.rakumod",
-    "LLM::Chat::ToolLoop": "lib/LLM/Chat/ToolLoop.rakumod"
+    "LLM::Chat::ToolLoop": "lib/LLM/Chat/ToolLoop.rakumod",
+    "LLM::Chat::WireJSON": "lib/LLM/Chat/WireJSON.rakumod"
   },
   "resources": [
   ],
@@ -58,8 +61,7 @@
     "ai"
   ],
   "test-depends": [
-    "Cro::HTTP::Router:ver<0.8.11+>:auth<zef:cro>",
-    "Cro::HTTP::Server:ver<0.8.11+>:auth<zef:cro>"
+    "Cro::HTTP::Response:ver<0.8.11+>:auth<zef:cro>"
   ],
-  "version": "0.10.0"
+  "version": "0.10.1"
 }

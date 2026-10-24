@@ -68,7 +68,9 @@ Only the raw text in C<responses> gets returned.
 =item C<$.call-index> — monotonically-increasing per-backend call count, bumped on every completion call whether it succeeded or failed. Distinct from the internal response cursor — tests can read this to assert call counts without reasoning about the response queue.
 =item C<$.response-class> — class minted for non-streaming completion calls. Defaults to L<LLM::Chat::Backend::Response>; pass L<LLM::Chat::Backend::Response::OpenRouter> to exercise the OR-flavoured Response shape.
 =item C<$.stream-response-class> — streaming counterpart to C<$.response-class>. Pair with L<LLM::Chat::Backend::Response::OpenRouter::Stream>.
-=item C<%.fake-usage> — per-call usage payload. OAI-spec keys (C<prompt>, C<completion>, C<total>, C<model>) flow into C<._set-usage>; OR-specific keys (C<cost>, C<generation-id>, C<provider-name>, C<is-byok>) flow into C<._set-or-usage> when the configured response class consumes the OR Augment role.
+=item C<%.fake-usage> — per-call usage payload. OAI-spec keys (C<prompt>, C<completion>, C<total>, C<model>, C<reasoning>) flow into C<._set-usage>; OR-specific keys (C<cost>, C<generation-id>, C<provider-name>, C<is-byok>) flow into C<._set-or-usage> when the configured response class consumes the OR Augment role.
+=item C<$.fake-reasoning> — optional thinking trace put on every response's C<reasoning-text> (never its content), as a reasoning model's C<reasoning_content> would be.
+=item C<%.server-limits> — what C<probe-server-limits> answers (a copy). Empty by default, which answers like a backend that cannot ask its server: C<{source => 'none', note => ...}>.
 
 =head1 SIMULATING FAILURES
 
@@ -210,14 +212,23 @@ has Mu $.stream-response-class = LLM::Chat::Backend::Response::Stream;
     completion call applies it to the freshly-minted Response so
     telemetry tests can assert on a concrete shape.
 
-    OAI-spec keys (C<prompt>, C<completion>, C<total>, C<model>)
-    flow into C<Response._set-usage>. OR-specific keys (C<cost>,
+    OAI-spec keys (C<prompt>, C<completion>, C<total>, C<model>,
+    C<reasoning>) flow into C<Response._set-usage>. OR-specific keys (C<cost>,
     C<generation-id>, C<provider-name>, C<is-byok>) flow into
     C<Response::OpenRouter::Augment._set-or-usage> when
     C<$.response-class> is OR-typed and are silently ignored
     otherwise. Left empty by default so non-telemetry tests
     don't drift. )
 has %.fake-usage;
+
+#|( What C<probe-server-limits> answers, verbatim (a copy). Empty (the
+    default) answers like a backend that cannot ask its server. )
+has %.server-limits;
+
+#|( Optional thinking trace attached to every successful response, as a
+    reasoning model's C<reasoning_content> would be: readable on
+    C<reasoning-text>, never part of the emitted content. )
+has Str $.fake-reasoning;
 
 #|( Optional prompt-aware responder. When set, each call invokes
     C<&responder(@messages)>; a defined Str return value is used
@@ -295,65 +306,73 @@ has UInt $.call-index = 0;
 has %!cancelled;
 
 sub default-splitter(Str $text --> List) {
-    return ('',) unless $text.chars;
-    # Split on whitespace, keep the trailing space on each token so the
-    # reassembled stream is character-identical to the input.
-    my @words = $text.split(/\s+/, :skip-empty);
-    my @out;
-    for @words.kv -> $i, $w {
-        @out.push: $w ~ (($i == @words.end) ?? '' !! ' ');
-    }
-    @out.List;
+	return ('',) unless $text.chars;
+	# Split on whitespace, keep the trailing space on each token so the
+	# reassembled stream is character-identical to the input.
+	my @words = $text.split(/\s+/, :skip-empty);
+	my @out;
+	for @words.kv -> $i, $w {
+		@out.push: $w ~ (($i == @words.end) ?? '' !! ' ');
+	}
+	@out.List;
 }
 
 method !next-response(--> Str) {
-    $!mock-lock.protect: {
-        if $!cursor >= @!responses.elems {
-            die 'Mock backend: canned responses exhausted' if $!fail-on-empty;
-            # Repeat last
-            return @!responses ?? @!responses[*-1] !! '';
-        }
-        my $r = @!responses[$!cursor];
-        $!cursor++;
-        $r;
-    }
+	$!mock-lock.protect: {
+		if $!cursor >= @!responses.elems {
+			die 'Mock backend: canned responses exhausted' if $!fail-on-empty;
+			# Repeat last
+			return @!responses ?? @!responses[*-1] !! '';
+		}
+		my $r = @!responses[$!cursor];
+		$!cursor++;
+		$r;
+	}
 }
 
 #| The raw text that will be returned by the next completion call.
 #| Useful for assertions in tests that want to know "what's about to
 #| be returned" without popping the queue.
 method peek-next-response(--> Str) {
-    return @!responses[$!cursor] if $!cursor < @!responses.elems;
-    @!responses ?? @!responses[*-1] !! '';
+	return @!responses[$!cursor] if $!cursor < @!responses.elems;
+	@!responses ?? @!responses[*-1] !! '';
 }
 
 #| Reset the response cursor to the start of the queue.
 method reset() { $!cursor = 0 }
 
+#| C<%.server-limits> when set, else the base "reports nothing" answer.
+#| No network: the mock has no server to ask.
+method probe-server-limits(--> Hash:D) {
+	return callsame() unless %!server-limits.elems;
+	%!server-limits.Hash.clone;
+}
+
 # OAI-spec keys go to base Response._set-usage; everything else is
 # treated as an OR-augment key. Centralised so chat / stream paths
 # both apply fake-usage identically.
-my constant @OAI-USAGE-KEYS = <prompt completion total model>;
+my constant @OAI-USAGE-KEYS = <prompt completion total model reasoning>;
 
 #|( Apply C<%.fake-usage> to a freshly-minted Response. Splits keys:
     OAI-spec into C<._set-usage>, OR extras into C<._set-or-usage>
     when the Response consumes the OR Augment role. Anything that
     doesn't match either bucket is silently dropped. )
 method !apply-fake-usage($resp) {
-    return unless %!fake-usage.elems;
-    my %oai;
-    my %or;
-    for %!fake-usage.kv -> $k, $v {
-        if $k eq any(@OAI-USAGE-KEYS) {
-            %oai{$k} = $v;
-        } else {
-            %or{$k} = $v;
-        }
-    }
-    $resp._set-usage(|%oai) if %oai.elems;
-    if %or.elems && $resp ~~ LLM::Chat::Backend::Response::OpenRouter::Augment {
-        $resp._set-or-usage(|%or);
-    }
+	$resp._append-reasoning($!fake-reasoning) if $!fake-reasoning.defined && $!fake-reasoning.chars;
+	return unless %!fake-usage.elems;
+	my %oai;
+	my %or;
+	for %!fake-usage.kv -> $k, $v {
+		if $k eq any(@OAI-USAGE-KEYS) {
+			%oai{$k} = $v;
+		} else {
+			%or{$k} = $v;
+		}
+	}
+	$resp._set-usage(|%oai) if %oai.elems;
+	if %or.elems && $resp ~~ LLM::Chat::Backend::Response::OpenRouter::Augment {
+		$resp._set-or-usage(|%or);
+	}
 }
 
 #| Empty the recorded-calls log. Call between test phases when you
@@ -363,171 +382,171 @@ method clear-recorded-calls() { @!recorded-calls = () }
 # --- Non-streaming: emit whole response, mark done --------------------
 
 method chat-completion(
-    @messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
-    :@tools,
-    --> LLM::Chat::Backend::Response
+	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	:@tools,
+	--> LLM::Chat::Backend::Response
 ) {
-    my $id = uuid-v4;
-    my $resp = $!response-class.new(:$id, supplier => Supplier.new);
-    self!apply-fake-usage($resp);
+	my $id = uuid-v4;
+	my $resp = $!response-class.new(:$id, supplier => Supplier.new);
+	self!apply-fake-usage($resp);
 
-    # Capture the call index BEFORE running the error-producer so
-    # the producer sees the same index the recorded-calls entry
-    # will carry. Incremented unconditionally so failed calls still
-    # bump the counter.
-    my $this-index;
-    $!mock-lock.protect: {
-        $this-index = $!call-index;
-        $!call-index++;
-    }
+	# Capture the call index BEFORE running the error-producer so
+	# the producer sees the same index the recorded-calls entry
+	# will carry. Incremented unconditionally so failed calls still
+	# bump the counter.
+	my $this-index;
+	$!mock-lock.protect: {
+		$this-index = $!call-index;
+		$!call-index++;
+	}
 
-    my $err-info;
-    if &!error-producer.defined {
-        $err-info = &!error-producer($this-index);
-    }
+	my $err-info;
+	if &!error-producer.defined {
+		$err-info = &!error-producer($this-index);
+	}
 
-    if $err-info.defined && ($err-info<class>:exists) {
-        # Scripted failure. Match OpenAICommon's pattern: populate
-        # structured error info before quitting the supplier so the
-        # Task fallback policy can classify the failure.
-        my $cls = $err-info<class>;
-        my $sts = $err-info<status>:exists ?? $err-info<status>.Int !! Int;
-        my $msg = $err-info<message>:exists ?? $err-info<message> !! 'Mock error';
-        $resp._set-error-info(class => $cls, status => $sts);
+	if $err-info.defined && ($err-info<class>:exists) {
+		# Scripted failure. Match OpenAICommon's pattern: populate
+		# structured error info before quitting the supplier so the
+		# Task fallback policy can classify the failure.
+		my $cls = $err-info<class>;
+		my $sts = $err-info<status>:exists ?? $err-info<status>.Int !! Int;
+		my $msg = $err-info<message>:exists ?? $err-info<message> !! 'Mock error';
+		$resp._set-error-info(class => $cls, status => $sts);
 
-        $!mock-lock.protect: {
-            @!recorded-calls.push: {
-                kind       => 'chat-completion',
-                messages   => @messages.clone,
-                tools      => @tools.clone,
-                response   => Nil,
-                error      => { class => $cls, status => $sts, message => $msg },
-                call-index => $this-index,
-                at         => now,
-            };
-        }
+		$!mock-lock.protect: {
+			@!recorded-calls.push: {
+				kind       => 'chat-completion',
+				messages   => @messages.clone,
+				tools      => @tools.clone,
+				response   => Nil,
+				error      => { class => $cls, status => $sts, message => $msg },
+				call-index => $this-index,
+				at         => now,
+			};
+		}
 
-        my $delay = $!initial-delay;
-        start {
-            sleep $delay if $delay > 0;
-            $resp.supplier.quit($msg);
-        }
+		my $delay = $!initial-delay;
+		start {
+			sleep $delay if $delay > 0;
+			$resp.supplier.quit($msg);
+		}
 
-        return $resp;
-    }
+		return $resp;
+	}
 
-    # Not an error: a real blocking completion that exhausts its
-    # completion budget returns 200 with a partial body and
-    # finish_reason 'length'. Stamped before the emission task starts
-    # so callers can read it the moment they hold the Response. Only
-    # reached when the error-producer declined this call — a scripted
-    # failure wins.
-    if &!finish-reason-producer.defined {
-        my $reason = &!finish-reason-producer($this-index);
-        $resp._set-finish-reason($reason) if $reason.defined;
-    }
+	# Not an error: a real blocking completion that exhausts its
+	# completion budget returns 200 with a partial body and
+	# finish_reason 'length'. Stamped before the emission task starts
+	# so callers can read it the moment they hold the Response. Only
+	# reached when the error-producer declined this call — a scripted
+	# failure wins.
+	if &!finish-reason-producer.defined {
+		my $reason = &!finish-reason-producer($this-index);
+		$resp._set-finish-reason($reason) if $reason.defined;
+	}
 
-    my $text;
-    if &!responder.defined {
-        $text = &!responder(@messages);
-    }
-    $text //= self!next-response;
+	my $text;
+	if &!responder.defined {
+		$text = &!responder(@messages);
+	}
+	$text //= self!next-response;
 
-    $!mock-lock.protect: {
-        @!recorded-calls.push: {
-            kind       => 'chat-completion',
-            messages   => @messages.clone,
-            tools      => @tools.clone,
-            response   => $text,
-            call-index => $this-index,
-            at         => now,
-        };
-    }
+	$!mock-lock.protect: {
+		@!recorded-calls.push: {
+			kind       => 'chat-completion',
+			messages   => @messages.clone,
+			tools      => @tools.clone,
+			response   => $text,
+			call-index => $this-index,
+			at         => now,
+		};
+	}
 
-    # Emit asynchronously after a short delay so consumers have time
-    # to attach taps — mirrors network latency in real backends.
-    my $delay = $!initial-delay;
-    start {
-        sleep $delay if $delay > 0;
-        $resp.supplier.emit($text);
-        $resp.supplier.done;
-    }
+	# Emit asynchronously after a short delay so consumers have time
+	# to attach taps — mirrors network latency in real backends.
+	my $delay = $!initial-delay;
+	start {
+		sleep $delay if $delay > 0;
+		$resp.supplier.emit($text);
+		$resp.supplier.done;
+	}
 
-    $resp;
+	$resp;
 }
 
 method text-completion(
-    @messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
-    Bool $continuation = False,
-    --> LLM::Chat::Backend::Response
+	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	Bool $continuation = False,
+	--> LLM::Chat::Backend::Response
 ) {
-    # Delegate to chat-completion for the emission mechanics, but
-    # overwrite the recorded-call kind so tests can distinguish the
-    # two code paths.
-    my $resp = self.chat-completion(@messages);
-    @!recorded-calls[*-1]<kind>         = 'text-completion';
-    @!recorded-calls[*-1]<continuation> = $continuation;
-    $resp;
+	# Delegate to chat-completion for the emission mechanics, but
+	# overwrite the recorded-call kind so tests can distinguish the
+	# two code paths.
+	my $resp = self.chat-completion(@messages);
+	@!recorded-calls[*-1]<kind>         = 'text-completion';
+	@!recorded-calls[*-1]<continuation> = $continuation;
+	$resp;
 }
 
 # --- Streaming: tokenise response and emit with optional delay --------
 
 method chat-completion-stream(
-    @messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
-    :@tools,
-    --> LLM::Chat::Backend::Response::Stream
+	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	:@tools,
+	--> LLM::Chat::Backend::Response::Stream
 ) {
-    my $id = uuid-v4;
-    my $resp = $!stream-response-class.new(:$id, supplier => Supplier.new);
-    self!apply-fake-usage($resp);
-    my $text;
-    if &!responder.defined {
-        $text = &!responder(@messages);
-    }
-    $text //= self!next-response;
-    my @tokens = &!token-splitter($text);
-    my $delay  = $!stream-delay;
-    my %cancelled := %!cancelled;
+	my $id = uuid-v4;
+	my $resp = $!stream-response-class.new(:$id, supplier => Supplier.new);
+	self!apply-fake-usage($resp);
+	my $text;
+	if &!responder.defined {
+		$text = &!responder(@messages);
+	}
+	$text //= self!next-response;
+	my @tokens = &!token-splitter($text);
+	my $delay  = $!stream-delay;
+	my %cancelled := %!cancelled;
 
-    $!mock-lock.protect: {
-        @!recorded-calls.push: {
-            kind     => 'chat-completion-stream',
-            messages => @messages.clone,
-            tools    => @tools.clone,
-            response => $text,
-            at       => now,
-        };
-    }
+	$!mock-lock.protect: {
+		@!recorded-calls.push: {
+			kind     => 'chat-completion-stream',
+			messages => @messages.clone,
+			tools    => @tools.clone,
+			response => $text,
+			at       => now,
+		};
+	}
 
-    my $initial = $!initial-delay;
-    start {
-        sleep $initial if $initial > 0;
-        for @tokens -> $tok {
-            last if %cancelled{$id};
-            $resp.supplier.emit($tok);
-            sleep $delay if $delay > 0;
-        }
-        # If we were cancelled, the caller's cancel() path closes the
-        # supplier with quit(). Don't also call done() — that'd be a
-        # double-close and the supplier would throw on the second one.
-        $resp.supplier.done unless %cancelled{$id};
-    }
+	my $initial = $!initial-delay;
+	start {
+		sleep $initial if $initial > 0;
+		for @tokens -> $tok {
+			last if %cancelled{$id};
+			$resp.supplier.emit($tok);
+			sleep $delay if $delay > 0;
+		}
+		# If we were cancelled, the caller's cancel() path closes the
+		# supplier with quit(). Don't also call done() — that'd be a
+		# double-close and the supplier would throw on the second one.
+		$resp.supplier.done unless %cancelled{$id};
+	}
 
-    $resp;
+	$resp;
 }
 
 method text-completion-stream(
-    @messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
-    Bool $continuation = False,
-    --> LLM::Chat::Backend::Response::Stream
+	@messages where all(@messages) ~~ LLM::Chat::Conversation::Message,
+	Bool $continuation = False,
+	--> LLM::Chat::Backend::Response::Stream
 ) {
-    my $resp = self.chat-completion-stream(@messages);
-    @!recorded-calls[*-1]<kind>         = 'text-completion-stream';
-    @!recorded-calls[*-1]<continuation> = $continuation;
-    $resp;
+	my $resp = self.chat-completion-stream(@messages);
+	@!recorded-calls[*-1]<kind>         = 'text-completion-stream';
+	@!recorded-calls[*-1]<continuation> = $continuation;
+	$resp;
 }
 
 method cancel(LLM::Chat::Backend::Response $resp) {
-    %!cancelled{$resp.id} = True;
-    $resp.cancel;
+	%!cancelled{$resp.id} = True;
+	$resp.cancel;
 }

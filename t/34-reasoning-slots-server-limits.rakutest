@@ -1,0 +1,341 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Test::Kit;
+use LLM::Chat::Backend;
+use LLM::Chat::Backend::Mock;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::OpenRouter;
+use LLM::Chat::Backend::KoboldCpp;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+
+use JSON::Fast;
+
+# Three request-level knobs and one server question, as the backends put
+# them on the wire:
+#
+#   * reasoning_effort / reasoning_budget_tokens: thinking, only when
+#     asked for; what the model thinks lands on reasoning-text, never in
+#     the content, and its token count is lifted when the provider
+#     breaks it out;
+#   * id_slot: a llama.cpp server slot, only when asked for, and only by
+#     the backend whose server has slots;
+#   * probe-server-limits: the server's own context size (llama.cpp
+#     GET /props, KoboldCpp GET /api/extra/true_max_context_length),
+#     bounded and never throwing.
+#
+# The fixture is a real HTTP server: scripted replies under /<name>/...,
+# recording every request body and header it is sent. It is
+# LLM::Chat::Test::Kit's raw server, because the assertions rest on
+# whole responses arriving.
+
+plan 13;
+
+class Fixture {
+	has      $.server;
+	has Int  $.port;
+	has      %!chat;
+	has      %!streams;
+	has      %!props;
+	has      %!slots;
+	has      %!true-max;
+	has      %!bodies;
+	has      %!auth;
+	has      %!paths;
+	has Promise $.release .= new;
+	has Lock $!lock .= new;
+
+	method chat(Str:D $name, %reply --> Fixture) { $!lock.protect: { %!chat{$name} = to-json(%reply, :!pretty) }; self }
+	method stream(Str:D $name, *@frames --> Fixture) { $!lock.protect: { %!streams{$name} = @frames.List }; self }
+	#| A Hash (the JSON reply) or one of 'http-404', 'not-json', 'array', 'hang'.
+	method props(Str:D $name, $answer --> Fixture) { $!lock.protect: { %!props{$name} = $answer }; self }
+	#| A List (the slot array) or one of the 'props' answers.
+	method slots(Str:D $name, $answer --> Fixture) { $!lock.protect: { %!slots{$name} = $answer }; self }
+	method true-max(Str:D $name, $answer --> Fixture) { $!lock.protect: { %!true-max{$name} = $answer }; self }
+	method body(Str:D $name) { $!lock.protect: { %!bodies{$name} } }
+	method auth(Str:D $name) { $!lock.protect: { %!auth{$name} } }
+	method path(Str:D $name) { $!lock.protect: { %!paths{$name} } }
+
+	method !answer($answer --> Hash:D) {
+		given $answer {
+			when Associative { %( body => to-json($answer, :!pretty) ) }
+			when Positional  { %( body => to-json($answer, :!pretty) ) }
+			when 'http-404'  { %( status => 404, body => '{"error":"no such endpoint"}' ) }
+			when 'not-json'  { %( type => 'text/plain', body => 'plainly not json' ) }
+			when 'array'     { %( body => '[1,2]' ) }
+			when 'hang'      { %( delay => Promise.anyof($!release, Promise.in(30)), body => '{}' ) }
+			default          { %( status => 404, body => '' ) }
+		}
+	}
+
+	method !route($request --> Hash:D) {
+		my $target = $request.path ~ ($request.query ?? "?{$request.query}" !! '');
+		with $request.path ~~ / ^ '/' (<-[/]>+) '/v1/chat/completions' $ / -> $route {
+			my $name = ~$route[0];
+			my $text = $request.text;
+			$!lock.protect: { %!bodies{$name} = $text };
+			return from-json($text)<stream>
+				?? %( type => 'text/event-stream',
+					chunks => ($!lock.protect: { %!streams{$name} }).list.map({ "data: $_\n\n" }).List )
+				!! %( body => $!lock.protect({ %!chat{$name} }) );
+		}
+		with $request.path ~~ / ^ '/' (<-[/]>+) '/props' $ / -> $route {
+			my $name = ~$route[0];
+			my $answer = $!lock.protect: {
+				%!auth{$name} = $request.header('authorization');
+				%!paths{$name} = $target;
+				%!props{$name};
+			};
+			return self!answer($answer);
+		}
+		with $request.path ~~ / ^ '/' (<-[/]>+) '/slots' $ / -> $route {
+			return self!answer($!lock.protect: { %!slots{~$route[0]} });
+		}
+		with $request.path ~~ / ^ '/' (<-[/]>+) '/api/extra/true_max_context_length' $ / -> $route {
+			my $name = ~$route[0];
+			my $answer = $!lock.protect: {
+				%!paths{$name} = $target;
+				%!true-max{$name};
+			};
+			return self!answer($answer);
+		}
+		%( status => 404, body => '' );
+	}
+
+	method start(--> Fixture) {
+		$!server = raw-server(-> $request { self!route($request) });
+		$!port = $!server.port;
+		self;
+	}
+
+	method stop(--> Nil) {
+		$!release.keep(True) unless $!release.status;
+		$!server.stop with $!server;
+		Nil;
+	}
+}
+
+my $fixture = Fixture.new.start;
+END { $fixture.stop if $fixture.defined }
+
+sub url(Str:D $name --> Str:D) { "http://127.0.0.1:{$fixture.port}/$name/v1" }
+
+sub messages() { [LLM::Chat::Conversation::Message.new(role => 'user', content => 'Hello')] }
+
+subtest 'Settings: the new knobs and their bounds' => {
+	plan 9;
+	my $s = LLM::Chat::Backend::Settings.new;
+	nok $s.reasoning_effort.defined, 'reasoning_effort is unset by default';
+	nok $s.reasoning_budget_tokens.defined, 'reasoning_budget_tokens is unset by default';
+	nok $s.id_slot.defined, 'id_slot is unset by default';
+	is LLM::Chat::Backend::Settings.new(reasoning_effort => $_).reasoning_effort, $_, "reasoning_effort accepts '$_'"
+		for <none high>;
+	lives-ok { LLM::Chat::Backend::Settings.new(reasoning_effort => $_) for <minimal low medium> },
+		'and every other named level';
+	dies-ok { LLM::Chat::Backend::Settings.new(reasoning_effort => 'max') }, 'an unknown level is refused';
+	dies-ok { LLM::Chat::Backend::Settings.new(id_slot => -1) }, 'a negative slot is refused';
+	dies-ok { LLM::Chat::Backend::Settings.new(reasoning_budget_tokens => -1) }, 'a negative budget is refused';
+};
+
+subtest 'OpenAICommon: sent only when set' => {
+	plan 8;
+	my $plain = LLM::Chat::Backend::OpenAICommon.new(api_url => url('plain'),
+		settings => LLM::Chat::Backend::Settings.new);
+	my %body = $plain._get-api-settings;
+	nok %body{$_}:exists, "no $_ by default" for <reasoning_effort reasoning_budget_tokens id_slot>;
+	my $set = LLM::Chat::Backend::OpenAICommon.new(api_url => url('set'),
+		settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high',
+			reasoning_budget_tokens => 2048, id_slot => 3));
+	%body = $set._get-api-settings;
+	is %body<reasoning_effort>, 'high', 'reasoning_effort is the top-level OpenAI field';
+	is %body<reasoning_budget_tokens>, 2048, 'the budget is llama.cpp\'s reasoning_budget_tokens';
+	is %body<id_slot>, 3, 'the slot is llama.cpp\'s id_slot';
+	my $zero = LLM::Chat::Backend::OpenAICommon.new(api_url => url('zero'),
+		settings => LLM::Chat::Backend::Settings.new(reasoning_budget_tokens => 0, id_slot => 0));
+	%body = $zero._get-api-settings;
+	is %body<id_slot>, 0, 'slot 0 is a slot, not "unset"';
+	is %body<reasoning_budget_tokens>, 0, 'a zero budget is sent (end thinking at once)';
+};
+
+subtest 'KoboldCpp: thinking under its own names, never a slot' => {
+	plan 4;
+	my $b = LLM::Chat::Backend::KoboldCpp.new(api_url => url('kobold'),
+		settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high',
+			reasoning_budget_tokens => 2048, id_slot => 1));
+	my %body = $b._get-api-settings;
+	is %body<reasoning_effort>, 'high', 'reasoning_effort goes out';
+	is %body<thinking_budget_tokens>, 2048, 'the budget goes out as thinking_budget_tokens';
+	nok %body<reasoning_budget_tokens>:exists, 'not under the llama.cpp name';
+	nok %body<id_slot>:exists, 'KoboldCpp has no slots, so none is sent';
+};
+
+subtest 'OpenRouter: the reasoning object, not the llama.cpp fields' => {
+	plan 5;
+	my $b = LLM::Chat::Backend::OpenRouter.new(api_key => 'k', model => 'm',
+		settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'none',
+			reasoning_budget_tokens => 100, id_slot => 2));
+	my %body = $b._get-api-settings;
+	is-deeply %body<reasoning>, %(effort => 'none'), "'none' rides the reasoning object";
+	nok %body{$_}:exists, "no top-level $_" for <reasoning_effort reasoning_budget_tokens id_slot>;
+	is $b.probe-server-limits<source>, 'none', 'and OpenRouter probes nothing';
+};
+
+subtest 'the fields reach the socket' => {
+	plan 3;
+	$fixture.chat('wire', %(choices => [%(message => %(role => 'assistant', content => 'ok'), finish_reason => 'stop'),]));
+	my $b = LLM::Chat::Backend::OpenAICommon.new(api_url => url('wire'),
+		settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high',
+			reasoning_budget_tokens => 2048, id_slot => 2));
+	settled($b.chat-completion(messages()), 'the wire completion');
+	my %sent = from-json($fixture.body('wire'));
+	is %sent<id_slot>, 2, 'id_slot on the wire';
+	is %sent<reasoning_effort>, 'high', 'reasoning_effort on the wire';
+	is %sent<reasoning_budget_tokens>, 2048, 'reasoning_budget_tokens on the wire';
+};
+
+subtest 'blocking: reasoning_content is captured apart from the content' => {
+	plan 5;
+	$fixture.chat('think', %(
+		choices => [%(message => %(role => 'assistant', content => '{"ok":true}',
+			reasoning_content => 'First the lab, then the ridge.'), finish_reason => 'stop'),],
+		usage => %(prompt_tokens => 100, completion_tokens => 40, total_tokens => 140,
+			completion_tokens_details => %(reasoning_tokens => 31)),
+	));
+	my $b = LLM::Chat::Backend::OpenAICommon.new(api_url => url('think'),
+		settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high'));
+	my $resp = settled($b.chat-completion(messages()), 'the thinking completion');
+	ok $resp.is-success, 'the completion succeeds';
+	is $resp.msg, '{"ok":true}', 'the content is the answer alone';
+	is $resp.reasoning-text, 'First the lab, then the ridge.', 'the thinking is on reasoning-text';
+	is $resp.reasoning-tokens, 31, 'reasoning_tokens is lifted';
+	is $resp.completion-tokens, 40, 'and stays a subset of the completion tokens';
+};
+
+subtest 'streaming: reasoning_content deltas never reach the content' => {
+	plan 3;
+	$fixture.stream('stream-think',
+		to-json(%(choices => [%(delta => %(reasoning_content => 'Weigh '), index => 0),]), :!pretty),
+		to-json(%(choices => [%(delta => %(reasoning_content => 'the band.'), index => 0),]), :!pretty),
+		to-json(%(choices => [%(delta => %(content => '{"a":1}'), index => 0),]), :!pretty),
+		to-json(%(choices => [%(delta => %(), index => 0, finish_reason => 'stop'),]), :!pretty),
+		'[DONE]');
+	my $b = LLM::Chat::Backend::OpenAICommon.new(api_url => url('stream-think'),
+		settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high'));
+	my $resp = stream-settled($b.chat-completion-stream(messages()), 'the thinking stream');
+	ok $resp.is-success, 'the stream succeeds';
+	is $resp.msg, '{"a":1}', 'the content is the answer alone';
+	is $resp.reasoning-text, 'Weigh the band.', 'the thinking deltas accumulate on reasoning-text';
+};
+
+subtest 'llama.cpp: GET /props' => {
+	plan 8;
+	$fixture.props('llama', %(default_generation_settings => %(n_ctx => 131072, params => %()),
+		total_slots => 4, build_info => 'b10663'));
+	my $b = LLM::Chat::Backend::OpenAICommon.new(api_url => url('llama') ~ '/', api_key => 'secret',
+		settings => LLM::Chat::Backend::Settings.new);
+	my %limits = $b.probe-server-limits;
+	is %limits<context_length>, 131072, 'n_ctx from default_generation_settings';
+	is-deeply (%limits<slots>, %limits<slots_source>), (4, '/props'), 'total_slots';
+	is %limits<source>, 'llama.cpp:/props', 'the source names the endpoint';
+	nok %limits<note>:exists, 'no note when the probe learnt something';
+	is $fixture.path('llama'), '/llama/props', 'asked at the server root, not under /v1';
+	is $fixture.auth('llama'), 'Bearer secret', 'with the backend\'s credentials';
+
+	$fixture.props('llama-flat', %(n_ctx => 32768));
+	%limits = LLM::Chat::Backend::OpenAICommon.new(api_url => url('llama-flat'),
+		settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+	is %limits<context_length>, 32768, 'a top-level n_ctx is accepted too';
+	ok !(%limits<slots>:exists) && %limits<slots_note>.chars, "no slot count when none is reported ({%limits<slots_note>})";
+};
+
+subtest 'llama.cpp: /slots counts the slots when /props does not' => {
+	plan 6;
+	# A unified pool of 524,288 tokens shared by four slots: each may use all of it.
+	$fixture.props('unified', %(default_generation_settings => %(n_ctx => 524288)));
+	$fixture.slots('unified', [(^4).map({ %(id => $_, n_ctx => 524288, is_processing => False) })]);
+	my %limits = LLM::Chat::Backend::OpenAICommon.new(api_url => url('unified'),
+		settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+	is-deeply (%limits<context_length>, %limits<slots>, %limits<slots_source>), (524288, 4, '/slots'),
+		'the context from /props, the count from /slots';
+	nok %limits<note>:exists, 'nothing missing';
+	for (%(name => 'slots-off', answer => 'http-404'), %(name => 'slots-object', answer => %(error => 'disabled')),
+		%(name => 'slots-empty', answer => [])) -> %case {
+		$fixture.props(%case<name>, %(default_generation_settings => %(n_ctx => 8192)));
+		$fixture.slots(%case<name>, %case<answer>);
+		my %l = LLM::Chat::Backend::OpenAICommon.new(api_url => url(%case<name>),
+			settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+		ok %l<context_length> == 8192 && !(%l<slots>:exists) && %l<slots_note>.chars,
+			"%case<name>: the context stands, no count, a note ({%l<slots_note>})";
+	}
+	$fixture.props('slots-hang', %(default_generation_settings => %(n_ctx => 8192)));
+	$fixture.slots('slots-hang', 'hang');
+	my $started = now;
+	my %l = LLM::Chat::Backend::OpenAICommon.new(api_url => url('slots-hang'), server-probe-timeout => 0.5,
+		settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+	ok %l<context_length> == 8192 && now - $started < 5, 'a hanging /slots is given up on at the timeout';
+};
+
+subtest 'llama.cpp: a probe that learns nothing says why' => {
+	plan 6;
+	my %cases = (
+		'props-404'  => 'http-404',
+		'props-text' => 'not-json',
+		'props-list' => 'array',
+		'props-none' => %(default_generation_settings => %(params => %())),
+		'props-zero' => %(default_generation_settings => %(n_ctx => 0)),
+	);
+	for %cases.sort -> (:key($name), :value($answer)) {
+		$fixture.props($name, $answer);
+		my %limits = LLM::Chat::Backend::OpenAICommon.new(api_url => url($name),
+			settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+		ok !(%limits<context_length>:exists) && %limits<note>.chars, "$name: no context length, a note ({%limits<note>})";
+	}
+	$fixture.props('props-hang', 'hang');
+	my $started = now;
+	my %limits = LLM::Chat::Backend::OpenAICommon.new(api_url => url('props-hang'),
+		server-probe-timeout => 0.5, settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+	ok %limits<note>.contains('0.5') && now - $started < 5, 'a hanging server is given up on at the timeout';
+};
+
+subtest 'KoboldCpp: GET /api/extra/true_max_context_length' => {
+	plan 5;
+	$fixture.true-max('kcpp', %(value => 65536));
+	my %limits = LLM::Chat::Backend::KoboldCpp.new(api_url => url('kcpp'),
+		settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+	is %limits<context_length>, 65536, 'the launch --contextsize';
+	is %limits<source>, 'koboldcpp:/api/extra/true_max_context_length', 'from the true-max endpoint';
+	is $fixture.path('kcpp'), '/kcpp/api/extra/true_max_context_length', 'at the server root';
+	$fixture.true-max('kcpp-bad', %(value => 'lots'));
+	%limits = LLM::Chat::Backend::KoboldCpp.new(api_url => url('kcpp-bad'),
+		settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+	ok !(%limits<context_length>:exists) && %limits<note>.contains('value'), 'a non-integer value is a note';
+	$fixture.true-max('kcpp-old', 'http-404');
+	%limits = LLM::Chat::Backend::KoboldCpp.new(api_url => url('kcpp-old'),
+		settings => LLM::Chat::Backend::Settings.new).probe-server-limits;
+	ok !(%limits<context_length>:exists) && %limits<note>.chars, 'an older KoboldCpp without the endpoint is a note';
+};
+
+subtest 'timeouts must be real numbers of seconds' => {
+	plan 3;
+	dies-ok { LLM::Chat::Backend::OpenAICommon.new(api_url => url('x'), server-probe-timeout => 0,
+		settings => LLM::Chat::Backend::Settings.new) }, 'zero is refused';
+	dies-ok { LLM::Chat::Backend::OpenAICommon.new(api_url => url('x'), server-probe-timeout => Inf,
+		settings => LLM::Chat::Backend::Settings.new) }, 'Inf is refused';
+	dies-ok { LLM::Chat::Backend::OpenAICommon.new(api_url => url('x'), server-probe-timeout => NaN,
+		settings => LLM::Chat::Backend::Settings.new) }, 'NaN is refused';
+};
+
+subtest 'Mock: scripted thinking and limits' => {
+	plan 5;
+	my $m = LLM::Chat::Backend::Mock.new(settings => LLM::Chat::Backend::Settings.new,
+		responses => ['{"a":1}'], fake-reasoning => 'quietly', fake-usage => %(completion => 9, reasoning => 4),
+		server-limits => %(context_length => 8192, source => 'mock'));
+	my $resp = settled($m.chat-completion(messages()), 'the mock completion');
+	is $resp.msg, '{"a":1}', 'the content is the scripted answer';
+	is $resp.reasoning-text, 'quietly', 'the scripted thinking is on reasoning-text';
+	is $resp.reasoning-tokens, 4, 'the scripted reasoning count is lifted';
+	is-deeply $m.probe-server-limits, %(context_length => 8192, source => 'mock'), 'the scripted limits';
+	is LLM::Chat::Backend::Mock.new(settings => LLM::Chat::Backend::Settings.new).probe-server-limits<source>,
+		'none', 'an unscripted mock reports nothing';
+};

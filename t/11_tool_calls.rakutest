@@ -6,7 +6,7 @@ use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 
-plan 12;
+plan 13;
 
 # === Response tool call parsing ===
 
@@ -303,6 +303,39 @@ subtest 'an index-less continuation with no call open opens one' => {
 	is $resp.tool-calls.elems, 1, 'a cold continuation still lands somewhere';
 	is $resp.tool-calls[0]<function><arguments>, '{"orphan":true}',
 		'with its arguments intact';
+};
+
+subtest 'object-valued argument deltas read back as one canonical string' => {
+	plan 4;
+
+	# Some providers stream `arguments` as an object rather than as JSON
+	# text. It is stored as a string, and that string is echoed into
+	# the next request in the assistant's tool_calls — so it has to be
+	# the same string however the provider's object happened to
+	# iterate, or every round changes the prompt bytes.
+	my @names = ('p00' .. 'p15');
+	sub arguments(@order --> Hash:D) {
+		my %args;
+		%args{$_} = $_.substr(1).Int for @order;
+		%args;
+	}
+	sub assembled(%args --> Str:D) {
+		my $resp = LLM::Chat::Backend::Response.new(id => 'object-args');
+		$resp._append-tool-call-deltas([
+			{ index => 0, id => 'c1', type => 'function',
+			  function => { name => 'probe', arguments => %args } },
+		]);
+		$resp.tool-calls[0]<function><arguments>;
+	}
+
+	my $forward = assembled(arguments(@names));
+	my @shuffled = (^10).map({ assembled(arguments(@names.pick(*))) });
+
+	is @shuffled.unique.elems, 1, 'ten insertion orders, one string';
+	is @shuffled[0], $forward, 'the same string as the hash built in order';
+	is-deeply $forward.comb(/<?after '"'> 'p' \d\d <?before '"'>/).list, @names.List,
+		'members in sorted order';
+	is-deeply from-json($forward), arguments(@names), 'and it parses back to the arguments';
 };
 
 done-testing;

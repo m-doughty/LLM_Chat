@@ -31,72 +31,77 @@ plan 5;
 # Returns the bound port; the tap and every accepted connection are
 # closed by the caller's LEAVE.
 class SSEServer {
-    has $.tap;
-    has $.port;
-    has @.conns;
-    has @.paths;
-    has Lock $!lock = Lock.new;
+	has $.tap;
+	has $.port;
+	has @.conns;
+	has @.paths;
+	has Lock $!lock = Lock.new;
 
-    method start(*@events) {
-        my @body = @events;
-        $!tap = IO::Socket::Async.listen('127.0.0.1', 0).tap(-> $conn {
-            $!lock.protect: { @!conns.push($conn) };
-            my Str $seen    = '';
-            my Bool $served = False;
-            # No `return` in here: the tap block is a Block, not a
-            # Routine, and its enclosing method is long gone by the
-            # time bytes arrive.
-            $conn.Supply(:bin).tap(-> $bytes {
-                $seen ~= $bytes.decode('latin-1');
-                if !$served && $seen.contains("\r\n\r\n") {
-                    $served = True;
+	method start(*@events) {
+		my @body = @events;
+		$!tap = IO::Socket::Async.listen('127.0.0.1', 0).tap(-> $conn {
+			$!lock.protect: { @!conns.push($conn) };
+			my Str $seen    = '';
+			my Bool $served = False;
+			# No `return` in here: the tap block is a Block, not a
+			# Routine, and its enclosing method is long gone by the
+			# time bytes arrive.
+			$conn.Supply(:bin).tap(-> $bytes {
+				$seen ~= $bytes.decode('latin-1');
+				if !$served && $seen.contains("\r\n\r\n") {
+					$served = True;
 
-                    if $seen ~~ / ^ (\w+) \s+ (\S+) / {
-                        $!lock.protect: { @!paths.push(~$1) };
-                    }
+					if $seen ~~ / ^ (\w+) \s+ (\S+) / {
+						$!lock.protect: { @!paths.push(~$1) };
+					}
 
-                    $conn.print(
-                        "HTTP/1.1 200 OK\r\n"
-                        ~ "Content-Type: text/event-stream\r\n"
-                        ~ "Cache-Control: no-cache\r\n"
-                        ~ "Transfer-Encoding: chunked\r\n\r\n"
-                    );
-                    for @body -> $event {
-                        my $frame = "data: $event\n\n";
-                        $conn.print(
-                            $frame.encode('utf-8').bytes.base(16).lc
-                            ~ "\r\n" ~ $frame ~ "\r\n"
-                        );
-                    }
-                    $conn.print("0\r\n\r\n");
-                }
-            });
-        });
-        $!port = await $!tap.socket-port;
-        self;
-    }
+					$conn.print(
+						"HTTP/1.1 200 OK\r\n"
+						~ "Content-Type: text/event-stream\r\n"
+						~ "Cache-Control: no-cache\r\n"
+						~ "Transfer-Encoding: chunked\r\n\r\n"
+					);
+					for @body -> $event {
+						my $frame = "data: $event\n\n";
+						$conn.print(
+							$frame.encode('utf-8').bytes.base(16).lc
+							~ "\r\n" ~ $frame ~ "\r\n"
+						);
+					}
+					$conn.print("0\r\n\r\n");
+				}
+			});
+		});
+		$!port = await $!tap.socket-port;
+		self;
+	}
 
-    method stop() {
-        .close for @!conns;
-        $!tap.close;
-    }
+	method stop() {
+		.close for @!conns;
+		$!tap.close;
+	}
 }
 
+# verify-length-finish off: this file is about the generic `length`
+# contract, and the canned server answers every request — a GET of
+# KoboldCpp's /api/extra/perf included — with the same SSE body. The
+# check itself is covered in t/33-koboldcpp-finish-reason.rakutest.
 sub make-backend(Int $port) {
-    LLM::Chat::Backend::KoboldCpp.new(
-        api_url  => "http://127.0.0.1:$port/v1",
-        settings => LLM::Chat::Backend::Settings.new(max_tokens => 16),
-        template => LLM::Chat::Template::ChatML.new,
-    );
+	LLM::Chat::Backend::KoboldCpp.new(
+		api_url              => "http://127.0.0.1:$port/v1",
+		settings             => LLM::Chat::Backend::Settings.new(max_tokens => 16),
+		template             => LLM::Chat::Template::ChatML.new,
+		verify-length-finish => False,
+	);
 }
 
 # A stream that produces two content deltas and is then cut off by the
 # token budget. `[DONE]` never arrives — a truncated generation ends
 # on the finish_reason chunk.
 my @chat-events =
-    '{"choices":[{"delta":{"content":"Once upon"},"finish_reason":null}]}',
-    '{"choices":[{"delta":{"content":" a time"},"finish_reason":null}]}',
-    '{"choices":[{"delta":{"content":""},"finish_reason":"length"}]}';
+	'{"choices":[{"delta":{"content":"Once upon"},"finish_reason":null}]}',
+	'{"choices":[{"delta":{"content":" a time"},"finish_reason":null}]}',
+	'{"choices":[{"delta":{"content":""},"finish_reason":"length"}]}';
 
 # The same cut-off, but mid tool call. A provider that runs out of
 # completion budget while streaming tool_calls arguments leaves a
@@ -105,127 +110,127 @@ my @chat-events =
 # still means truncated, and truncated still means failure, whatever
 # is sitting in the assembled arguments.
 my @tool-length-events =
-    '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x1","type":"function","function":{"name":"task","arguments":""}}]},"finish_reason":null}]}',
-    '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"prompt\":\"write the brief in"}}]},"finish_reason":null}]}',
-    '{"choices":[{"delta":{},"finish_reason":"length"}]}';
+	'{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x1","type":"function","function":{"name":"task","arguments":""}}]},"finish_reason":null}]}',
+	'{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"prompt\":\"write the brief in"}}]},"finish_reason":null}]}',
+	'{"choices":[{"delta":{},"finish_reason":"length"}]}';
 
 my @text-events =
-    '{"choices":[{"text":"Once upon","finish_reason":null}]}',
-    '{"choices":[{"text":" a time","finish_reason":null}]}',
-    '{"choices":[{"text":"","finish_reason":"length"}]}';
+	'{"choices":[{"text":"Once upon","finish_reason":null}]}',
+	'{"choices":[{"text":" a time","finish_reason":null}]}',
+	'{"choices":[{"text":"","finish_reason":"length"}]}';
 
 sub await-quit($resp) {
-    # The Response's own internal tap records the quit; a second tap
-    # just tells us when to stop waiting. Without a quit handler the
-    # exception would escape into the test.
-    my $p = Promise.new;
-    $resp.supply.tap(
-        -> $ { },
-        done => -> { $p.keep unless $p.status },
-        quit => -> $ { $p.keep unless $p.status },
-    );
-    await Promise.anyof($p, Promise.in(20));
-    $p;
+	# The Response's own internal tap records the quit; a second tap
+	# just tells us when to stop waiting. Without a quit handler the
+	# exception would escape into the test.
+	my $p = Promise.new;
+	$resp.supply.tap(
+		-> $ { },
+		done => -> { $p.keep unless $p.status },
+		quit => -> $ { $p.keep unless $p.status },
+	);
+	await Promise.anyof($p, Promise.in(20));
+	$p;
 }
 
 subtest 'chat-completion-stream records finish_reason length' => {
-    plan 5;
-    my $server = SSEServer.new.start(@chat-events);
-    LEAVE { $server.stop }
+	plan 5;
+	my $server = SSEServer.new.start(@chat-events);
+	LEAVE { $server.stop }
 
-    my $backend = make-backend($server.port);
-    my $resp = $backend.chat-completion-stream(
-        [LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
-    );
-    my $p = await-quit($resp);
+	my $backend = make-backend($server.port);
+	my $resp = $backend.chat-completion-stream(
+		[LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
+	);
+	my $p = await-quit($resp);
 
-    ok $p.status ~~ Kept,        'stream terminated';
-    ok $resp.is-done,            'response is done';
-    nok $resp.is-success,        'a truncated stream is not a success';
-    is $resp.error-class, 'response',
-        'budget exhaustion classifies as a response-level error';
-    is $resp.finish-reason, 'length',
-        'finish-reason names the terminal cause';
+	ok $p.status ~~ Kept,        'stream terminated';
+	ok $resp.is-done,            'response is done';
+	nok $resp.is-success,        'a truncated stream is not a success';
+	is $resp.error-class, 'response',
+		'budget exhaustion classifies as a response-level error';
+	is $resp.finish-reason, 'length',
+		'finish-reason names the terminal cause';
 };
 
 subtest 'chat-completion-stream keeps the partial generation' => {
-    plan 2;
-    my $server = SSEServer.new.start(@chat-events);
-    LEAVE { $server.stop }
+	plan 2;
+	my $server = SSEServer.new.start(@chat-events);
+	LEAVE { $server.stop }
 
-    my $backend = make-backend($server.port);
-    my $resp = $backend.chat-completion-stream(
-        [LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
-    );
-    await-quit($resp);
+	my $backend = make-backend($server.port);
+	my $resp = $backend.chat-completion-stream(
+		[LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
+	);
+	await-quit($resp);
 
-    is $resp.latest, 'Once upon a time',
-        'tokens emitted before the cut-off are retained';
-    is $server.paths[0], '/v1/chat/completions',
-        'request went to the chat-completions endpoint';
+	is $resp.latest, 'Once upon a time',
+		'tokens emitted before the cut-off are retained';
+	is $server.paths[0], '/v1/chat/completions',
+		'request went to the chat-completions endpoint';
 };
 
 subtest 'a tool call cut off by the budget still fails' => {
-    plan 5;
-    my $server = SSEServer.new.start(@tool-length-events);
-    LEAVE { $server.stop }
+	plan 5;
+	my $server = SSEServer.new.start(@tool-length-events);
+	LEAVE { $server.stop }
 
-    my $backend = make-backend($server.port);
-    my $resp = $backend.chat-completion-stream(
-        [LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
-        tools => [{ type => 'function', function => { name => 'task' } },],
-    );
-    my $p = await-quit($resp);
+	my $backend = make-backend($server.port);
+	my $resp = $backend.chat-completion-stream(
+		[LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
+		tools => [{ type => 'function', function => { name => 'task' } },],
+	);
+	my $p = await-quit($resp);
 
-    ok $p.status ~~ Kept, 'stream terminated';
-    nok $resp.is-success,
-        'a tool call truncated by the completion budget is not a success';
-    is $resp.error-class, 'response', 'and classifies as a response error';
-    is $resp.finish-reason, 'length', 'finish-reason names the terminal cause';
-    is $resp.tool-calls[0]<function><arguments>,
-        '{"prompt":"write the brief in',
-        'the partial arguments are preserved for diagnosis, not repaired';
+	ok $p.status ~~ Kept, 'stream terminated';
+	nok $resp.is-success,
+		'a tool call truncated by the completion budget is not a success';
+	is $resp.error-class, 'response', 'and classifies as a response error';
+	is $resp.finish-reason, 'length', 'finish-reason names the terminal cause';
+	is $resp.tool-calls[0]<function><arguments>,
+		'{"prompt":"write the brief in',
+		'the partial arguments are preserved for diagnosis, not repaired';
 };
 
 subtest 'text-completion-stream records finish_reason length' => {
-    plan 5;
-    # The regression: this path acted on the reason but never stamped
-    # it, so consumers saw a quit Response with an undefined
-    # finish-reason and no way to tell budget exhaustion from a
-    # content filter.
-    my $server = SSEServer.new.start(@text-events);
-    LEAVE { $server.stop }
+	plan 5;
+	# The regression: this path acted on the reason but never stamped
+	# it, so consumers saw a quit Response with an undefined
+	# finish-reason and no way to tell budget exhaustion from a
+	# content filter.
+	my $server = SSEServer.new.start(@text-events);
+	LEAVE { $server.stop }
 
-    my $backend = make-backend($server.port);
-    my $resp = $backend.text-completion-stream(
-        [LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
-    );
-    my $p = await-quit($resp);
+	my $backend = make-backend($server.port);
+	my $resp = $backend.text-completion-stream(
+		[LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
+	);
+	my $p = await-quit($resp);
 
-    ok $p.status ~~ Kept,        'stream terminated';
-    ok $resp.is-done,            'response is done';
-    nok $resp.is-success,        'a truncated stream is not a success';
-    is $resp.error-class, 'response',
-        'budget exhaustion classifies as a response-level error';
-    is $resp.finish-reason, 'length',
-        'finish-reason names the terminal cause';
+	ok $p.status ~~ Kept,        'stream terminated';
+	ok $resp.is-done,            'response is done';
+	nok $resp.is-success,        'a truncated stream is not a success';
+	is $resp.error-class, 'response',
+		'budget exhaustion classifies as a response-level error';
+	is $resp.finish-reason, 'length',
+		'finish-reason names the terminal cause';
 };
 
 subtest 'text-completion-stream keeps the partial generation' => {
-    plan 2;
-    my $server = SSEServer.new.start(@text-events);
-    LEAVE { $server.stop }
+	plan 2;
+	my $server = SSEServer.new.start(@text-events);
+	LEAVE { $server.stop }
 
-    my $backend = make-backend($server.port);
-    my $resp = $backend.text-completion-stream(
-        [LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
-    );
-    await-quit($resp);
+	my $backend = make-backend($server.port);
+	my $resp = $backend.text-completion-stream(
+		[LLM::Chat::Conversation::Message.new(role => 'user', content => 'hi')],
+	);
+	await-quit($resp);
 
-    is $resp.latest, 'Once upon a time',
-        'tokens emitted before the cut-off are retained';
-    is $server.paths[0], '/v1/completions',
-        'request went to the completions endpoint';
+	is $resp.latest, 'Once upon a time',
+		'tokens emitted before the cut-off are retained';
+	is $server.paths[0], '/v1/completions',
+		'request went to the completions endpoint';
 };
 
 done-testing;

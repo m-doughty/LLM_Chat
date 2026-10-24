@@ -1,0 +1,454 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Test::Kit;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::OpenRouter;
+use LLM::Chat::Backend::KoboldCpp;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+use LLM::Chat::Template::ChatML;
+use LLM::Chat::WireJSON;
+
+use JSON::Fast;
+
+# Request bodies as the backends actually put them on a socket.
+#
+# Every completion path used to hand Cro a Hash, which Cro serialized
+# with its members in whatever order the Hash iterated — a different
+# order per request, JSON Schemas included. llama.cpp and KoboldCpp
+# compile a schema into a grammar that makes the model write fields in
+# the order the schema lists them, so the model's field order was
+# random per request. The paths now serialize the body themselves, via
+# _encode-request-body / LLM::Chat::WireJSON, and post bytes.
+#
+# The fixture below records the raw bytes, Content-Type and
+# Content-Length of every request; the assertions are about those
+# bytes, not about a parse of them.
+
+plan 12;
+
+# === Fixtures ===
+
+# Properties z, m, a; m and z required, in that order.
+sub probe(--> Hash:D) {
+	%(
+		type       => 'object',
+		properties => %(
+			z => %( type => 'string' ),
+			m => %( type => 'string' ),
+			a => %( type => 'string' ),
+		),
+		required   => [ 'm', 'z' ],
+	);
+}
+
+constant PROBE =
+	'{"properties":{"m":{"type":"string"},"z":{"type":"string"},'
+	~ '"a":{"type":"string"}},"required":["m","z"],"type":"object"}';
+
+constant SORTED-PROBE =
+	'{"properties":{"a":{"type":"string"},"m":{"type":"string"},'
+	~ '"z":{"type":"string"}},"required":["m","z"],"type":"object"}';
+
+sub tools(--> Array:D) {
+	[
+		%(
+			type     => 'function',
+			function => %(
+				name        => 'lookup',
+				description => 'Look something up',
+				parameters  => probe(),
+			),
+		),
+	];
+}
+
+constant TOOLS =
+	'[{"function":{"description":"Look something up","name":"lookup",'
+	~ '"parameters":' ~ PROBE ~ '},"type":"function"}]';
+
+sub settings(--> LLM::Chat::Backend::Settings:D) {
+	LLM::Chat::Backend::Settings.new(
+		max_tokens  => 64,
+		temperature => 0.5e0,
+		json_schema => probe(),
+	);
+}
+
+constant RESPONSE-FORMAT =
+	'{"json_schema":{"name":"response","schema":' ~ PROBE
+	~ ',"strict":false},"type":"json_schema"}';
+
+my @messages =
+	LLM::Chat::Conversation::Message.new(:role<system>, :content('Be terse.')),
+	LLM::Chat::Conversation::Message.new(:role<user>,   :content('Hi ✓'));
+
+constant MESSAGES =
+	'[{"content":"Be terse.","role":"system"},{"content":"Hi ✓","role":"user"}]';
+
+#| The chat body OpenAICommon posts for @messages + tools() under
+#| settings(), with the stream members a streaming call adds.
+sub chat-body(Str:D $stream = '' --> Str:D) {
+	'{"frequency_penalty":0e0,"max_tokens":64,"messages":' ~ MESSAGES
+	~ ',"model":"test/model","presence_penalty":0e0,"response_format":'
+	~ RESPONSE-FORMAT ~ ',"stop":[]' ~ $stream
+	~ ',"temperature":0.5e0,"tools":' ~ TOOLS ~ ',"top_k":200,"top_p":1e0}';
+}
+
+#| The text body, around a prompt serialized independently of the
+#| code under test.
+sub text-body(Str:D $prompt, Str:D $stream = '' --> Str:D) {
+	'{"frequency_penalty":0e0,"max_tokens":64,"model":"test/model",'
+	~ '"presence_penalty":0e0,"prompt":' ~ to-json($prompt, :!pretty)
+	~ ',"response_format":' ~ RESPONSE-FORMAT ~ ',"stop":[]' ~ $stream
+	~ ',"temperature":0.5e0,"top_k":200,"top_p":1e0}';
+}
+
+sub json-blob(%payload --> Blob) {
+	to-json(%payload, :!pretty).encode('utf-8');
+}
+
+sub sse(Str:D $frame --> Supply:D) {
+	my $bytes = ("data: $frame\n\n" ~ "data: [DONE]\n\n").encode('utf-8');
+	supply { emit $bytes; done }
+}
+
+# Every request that reached the fixture, oldest first.
+my $requests = Channel.new;
+
+sub record($request) {
+	$requests.send(%(
+		bytes  => $request.body,
+		type   => $request.header('Content-Type') // '',
+		length => $request.header('Content-Length') // '',
+	));
+}
+
+sub is-stream(Blob:D $blob --> Bool:D) {
+	my $parsed = try from-json($blob.decode('utf-8'));
+	so $parsed ~~ Associative && $parsed<stream>;
+}
+
+# LLM::Chat::Test::Kit's raw server: each streaming call has to settle
+# on its whole stream before the next one is checked.
+my $server = raw-server(-> $request {
+	given $request.method, $request.path {
+		when ('POST', '/wire/chat/completions') {
+			record($request);
+			is-stream($request.body)
+				?? %( type => 'text/event-stream',
+					chunks => sse('{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}') )
+				!! %( body => json-blob({
+					choices => [ { message => { content => 'ok' }, finish_reason => 'stop' }, ],
+				}) );
+		}
+		when ('POST', '/wire/completions') {
+			record($request);
+			is-stream($request.body)
+				?? %( type => 'text/event-stream',
+					chunks => sse('{"choices":[{"text":"ok","finish_reason":"stop"}]}') )
+				!! %( body => json-blob({
+					choices => [ { text => 'ok', finish_reason => 'stop' }, ],
+				}) );
+		}
+		default {
+			%( status => 404, body => '' );
+		}
+	}
+});
+LEAVE { $server.stop }
+
+sub make-backend(:$class = LLM::Chat::Backend::OpenAICommon, *%extra) {
+	$class.new(
+		api_url  => "{$server.url}/wire",
+		api_key  => 'test-key',
+		model    => 'test/model',
+		settings => settings(),
+		template => LLM::Chat::Template::ChatML.new,
+		|%extra,
+	);
+}
+
+#| The next request the fixture recorded.
+sub next-request(Str:D $what --> Hash:D) {
+	my $received = start { $requests.receive };
+	timed($received, $what);
+	$received.result;
+}
+
+#| True when re-serializing the parsed body reproduces it byte for
+#| byte, i.e. the body was already in the rule's order everywhere.
+sub canonical(Blob:D $bytes --> Bool:D) {
+	my $text = $bytes.decode('utf-8');
+	to-wire-json(from-json($text), :data-members<messages>) eq $text;
+}
+
+sub check-framing(%request, Str:D $what) {
+	is %request<type>, 'application/json', "$what: Content-Type application/json";
+	is %request<length>, %request<bytes>.bytes.Str, "$what: Content-Length matches the bytes";
+}
+
+# === The four OpenAICommon paths, byte for byte ===
+
+subtest 'chat-completion posts the documented bytes' => {
+	plan 4;
+	my $backend = make-backend;
+	my $response = settled($backend.chat-completion(@messages, tools => tools()), 'chat-completion');
+	my %request = next-request('the chat-completion body');
+
+	ok $response.is-success, 'the call succeeded';
+	is %request<bytes>.decode('utf-8'), chat-body(),
+		'sorted members, schema and tool parameters in required order';
+	check-framing(%request, 'chat-completion');
+};
+
+subtest 'chat-completion-stream posts the documented bytes' => {
+	plan 4;
+	my $backend = make-backend;
+	my $response = stream-settled(
+		$backend.chat-completion-stream(@messages, tools => tools()), 'chat stream');
+	my %request = next-request('the chat-completion-stream body');
+
+	ok $response.is-success, 'the stream succeeded';
+	is %request<bytes>.decode('utf-8'), chat-body(',"stream":true'),
+		'stream flag in its sorted place';
+	check-framing(%request, 'chat-completion-stream');
+};
+
+subtest 'text-completion posts the documented bytes' => {
+	plan 4;
+	my $backend = make-backend;
+	my $prompt = LLM::Chat::Template::ChatML.new.render(@messages, False);
+	my $response = settled($backend.text-completion(@messages), 'text-completion');
+	my %request = next-request('the text-completion body');
+
+	ok $response.is-success, 'the call succeeded';
+	is %request<bytes>.decode('utf-8'), text-body($prompt),
+		'prompt body sorted, response_format schema in required order';
+	check-framing(%request, 'text-completion');
+};
+
+subtest 'text-completion-stream posts the documented bytes' => {
+	plan 4;
+	my $backend = make-backend(:request-stream-usage);
+	my $prompt = LLM::Chat::Template::ChatML.new.render(@messages, False);
+	my $response = stream-settled($backend.text-completion-stream(@messages), 'text stream');
+	my %request = next-request('the text-completion-stream body');
+
+	ok $response.is-success, 'the stream succeeded';
+	is %request<bytes>.decode('utf-8'),
+		text-body($prompt, ',"stream":true,"stream_options":{"include_usage":true}'),
+		'stream and stream_options in their sorted places';
+	check-framing(%request, 'text-completion-stream');
+};
+
+# === Determinism ===
+
+subtest 'the same request is the same bytes on every call' => {
+	plan 2;
+	my $backend = make-backend;
+	my @bodies = (^5).map({
+		settled($backend.chat-completion(@messages, tools => tools()), 'repeat chat-completion');
+		next-request('a repeated chat-completion body')<bytes>;
+	});
+	is @bodies.map(*.decode('utf-8')).unique.elems, 1, 'five calls, one body';
+
+	# A second backend, with its settings, tools and schema all built
+	# from scratch, in the reverse insertion order.
+	my %props;
+	%props<a> = %( type => 'string' );
+	%props<m> = %( type => 'string' );
+	%props<z> = %( type => 'string' );
+	my %schema;
+	%schema<required>   = [ 'm', 'z' ];
+	%schema<properties> = %props;
+	%schema<type>       = 'object';
+	my $other = make-backend(settings => LLM::Chat::Backend::Settings.new(
+		max_tokens  => 64,
+		temperature => 0.5e0,
+		json_schema => %schema,
+	));
+	settled($other.chat-completion(@messages, tools => tools()), 'rebuilt chat-completion');
+	is next-request('the rebuilt chat-completion body')<bytes>.decode('utf-8'),
+		@bodies[0].decode('utf-8'),
+		'the same request assembled in another order is the same bytes';
+};
+
+subtest 'the same request is the same bytes in every process' => {
+	plan 2;
+	my $backend = make-backend;
+	settled($backend.chat-completion(@messages, tools => tools()), 'chat-completion for the process check');
+	my $ours = next-request('the chat-completion body')<bytes>.list.fmt('%02x', '');
+
+	my @inc = $*REPO.repo-chain
+		.grep(CompUnit::Repository::FileSystem)
+		.map({ '-I' ~ .prefix.absolute });
+
+	# Assembles the chat body exactly as chat-completion does, in a
+	# fresh VM with its own hash seed, and prints the bytes.
+	my constant CHILD = q:to/RAKU/;
+        use LLM::Chat::Backend::OpenAICommon;
+        use LLM::Chat::Backend::Settings;
+        use LLM::Chat::Conversation::Message;
+        my %props = a => %( type => 'string' ), z => %( type => 'string' ), m => %( type => 'string' );
+        my $backend = LLM::Chat::Backend::OpenAICommon.new(
+            api_url  => 'http://unused.invalid/v1',
+            api_key  => 'test-key',
+            model    => 'test/model',
+            settings => LLM::Chat::Backend::Settings.new(
+                max_tokens  => 64,
+                temperature => 0.5e0,
+                json_schema => %( required => [ 'm', 'z' ], type => 'object', properties => %props ),
+            ),
+        );
+        my @messages =
+            LLM::Chat::Conversation::Message.new(:role<system>, :content('Be terse.')),
+            LLM::Chat::Conversation::Message.new(:role<user>,   :content('Hi ✓'));
+        my @tools = %(
+            function => %(
+                parameters  => %( properties => %props, type => 'object', required => [ 'm', 'z' ] ),
+                name        => 'lookup',
+                description => 'Look something up',
+            ),
+            type => 'function',
+        ),;
+        my %body = $backend._get-api-settings;
+        %body<messages> = $backend.wire-message-hashes(@messages);
+        %body<tools>    = @tools;
+        %body = $backend._finalize-request-body(%body);
+        print $backend._encode-request-body(%body).list.fmt('%02x', '');
+        RAKU
+
+	my @theirs = (^3).map({
+		my $proc = run $*EXECUTABLE, |@inc, '-e', CHILD, :out, :err;
+		my $out  = $proc.out.slurp(:close);
+		my $err  = $proc.err.slurp(:close);
+		diag $err if $err.chars;
+		$proc.exitcode == 0 && !$proc.signal ?? $out !! "child failed: {$proc.exitcode}/{$proc.signal}";
+	});
+	is @theirs.unique.elems, 1, 'three fresh processes encoded identical bytes';
+	is @theirs[0], $ours, 'and the bytes this process put on the wire';
+};
+
+# === The subclasses ===
+
+subtest 'KoboldCpp: json_schema field in required order, every member sorted' => {
+	plan 7;
+	my $backend = make-backend(:class(LLM::Chat::Backend::KoboldCpp));
+	my $response = settled($backend.chat-completion(@messages, tools => tools()), 'KoboldCpp chat-completion');
+	my %request = next-request('the KoboldCpp body');
+	my $text = %request<bytes>.decode('utf-8');
+
+	ok $response.is-success, 'the call succeeded';
+	ok $text.contains('"json_schema":' ~ PROBE ~ ','), 'native json_schema field in required order';
+	ok $text.contains('"dry_sequence_breakers":["\n",":","\"","*"]'), 'array order kept';
+	ok $text.starts-with('{"dry_allowed_length":2,"dry_base":1.75e0,'), 'top-level members sorted';
+	ok canonical(%request<bytes>), 'the whole body is in the rule order';
+	check-framing(%request, 'KoboldCpp');
+};
+
+subtest 'OpenRouter: cache_control parts are sorted data, tool schemas ordered' => {
+	plan 5;
+	my $backend = make-backend(:class(LLM::Chat::Backend::OpenRouter));
+	my $response = settled($backend.chat-completion(@messages, tools => tools()), 'OpenRouter chat-completion');
+	my %request = next-request('the OpenRouter body');
+	my $text = %request<bytes>.decode('utf-8');
+
+	ok $response.is-success, 'the call succeeded';
+	ok $text.contains(
+		'"messages":[{"content":[{"cache_control":{"type":"ephemeral"},"text":"Be terse.","type":"text"}],"role":"system"},'
+		~ '{"content":[{"cache_control":{"type":"ephemeral"},"text":"Hi ✓","type":"text"}],"role":"user"}]'),
+		'breakpoint content parts serialized with sorted members';
+	ok $text.contains('"tools":' ~ TOOLS), 'tool parameters in required order';
+	ok $text.contains('"include_reasoning":false,'), 'OpenRouter extras present';
+	ok canonical(%request<bytes>), 'the whole body is in the rule order';
+};
+
+subtest 'the conversation is data, even where it looks like a schema' => {
+	plan 3;
+	my @conversation =
+		LLM::Chat::Conversation::Message.new(:role<user>, :content('make a schema')),
+		LLM::Chat::Conversation::Message.new(
+			role       => 'assistant',
+			content    => '',
+			tool-calls => [
+				%(
+					id       => 'c1',
+					type     => 'function',
+					function => %( name => 'lookup', arguments => probe() ),
+				),
+			],
+		),
+		LLM::Chat::Conversation::Message.new(
+			role         => 'tool',
+			tool-call-id => 'c1',
+			content      => 'done',
+		);
+
+	my $backend = make-backend;
+	settled($backend.chat-completion(@conversation, tools => tools()), 'chat-completion with tool calls');
+	my $text = next-request('the tool-call conversation body')<bytes>.decode('utf-8');
+
+	ok $text.contains('"arguments":' ~ SORTED-PROBE),
+		'object-valued tool-call arguments inside messages are sorted, not schema-ordered';
+	ok $text.contains('"tools":' ~ TOOLS), 'while the tool definitions keep required order';
+	ok $text.contains('{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":'),
+		'message members sorted, null content kept';
+};
+
+# === Extension and diagnostics ===
+
+class FixedBodyBackend is LLM::Chat::Backend::OpenAICommon {
+	method _encode-request-body(%body --> Blob:D) {
+		('{"custom":true,"stream":' ~ (%body<stream> ?? 'true' !! 'false') ~ '}').encode('utf-8');
+	}
+}
+
+subtest 'an _encode-request-body override decides the bytes on every path' => {
+	plan 4;
+	my $backend = make-backend(:class(FixedBodyBackend));
+
+	settled($backend.chat-completion(@messages), 'override chat-completion');
+	is next-request('override chat body')<bytes>.decode('utf-8'),
+		'{"custom":true,"stream":false}', 'chat-completion';
+	stream-settled($backend.chat-completion-stream(@messages), 'override chat stream');
+	is next-request('override chat stream body')<bytes>.decode('utf-8'),
+		'{"custom":true,"stream":true}', 'chat-completion-stream';
+	settled($backend.text-completion(@messages), 'override text-completion');
+	is next-request('override text body')<bytes>.decode('utf-8'),
+		'{"custom":true,"stream":false}', 'text-completion';
+	stream-settled($backend.text-completion-stream(@messages), 'override text stream');
+	is next-request('override text stream body')<bytes>.decode('utf-8'),
+		'{"custom":true,"stream":true}', 'text-completion-stream';
+};
+
+subtest '_encode-request-body is the serializer the paths use' => {
+	plan 2;
+	my $backend = make-backend;
+	my %body = $backend._get-api-settings;
+	%body<messages> = $backend.wire-message-hashes(@messages);
+	%body<tools>    = tools();
+	my $bytes = $backend._encode-request-body(%body);
+	isa-ok $bytes, Blob, 'returns bytes';
+	is $bytes.decode('utf-8'), chat-body(), 'the same bytes chat-completion posts';
+};
+
+subtest 'the debug log records the exact bytes posted' => {
+	plan 3;
+	my $log = $*TMPDIR.add("llm-chat-wire-body-{$*PID}.log");
+	LEAVE { try $log.unlink }
+	%*ENV<LLM_CHAT_DEBUG> = $log.absolute;
+	LEAVE { %*ENV<LLM_CHAT_DEBUG>:delete }
+
+	my $backend = make-backend;
+	settled($backend.chat-completion(@messages, tools => tools()), 'logged chat-completion');
+	my $posted = next-request('the logged chat-completion body')<bytes>.decode('utf-8');
+	my $content = $log.slurp;
+
+	is $posted, chat-body(), 'the posted body';
+	ok $content.contains("=== REQUEST BODY ===\n$posted\n"), 'is logged verbatim, on one line';
+	nok $content.contains('test-key'), 'and the log still carries no credential';
+};
+
+done-testing;

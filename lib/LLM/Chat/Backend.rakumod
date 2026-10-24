@@ -48,3 +48,12 @@ method text-completion-stream(
 method cancel(LLM::Chat::Backend::Response $resp) {
 	fail "cancel must be implemented by the subclass";
 }
+
+#|( What the server says about its own limits: a Hash with C<source>
+    and either C<context_length> (plus C<slots> when known) or a
+    C<note> saying why nothing was learnt. A backend that cannot ask
+    its server answers with a note and no network traffic; see
+    L<LLM::Chat::Backend::OpenAICommon> for the servers that can. )
+method probe-server-limits(--> Hash:D) {
+	%(source => 'none', note => "{self.^name} reports no server limits");
+}

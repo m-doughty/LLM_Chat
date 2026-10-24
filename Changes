@@ -2,6 +2,294 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.10.1  2026-10-24T17:46:46+01:00
+    - [2026-10-24] The HTTP-level tests run against `raw-server`, the
+      fixture server in LLM::Chat::Test::Kit: an HTTP/1.1 server on
+      IO::Socket::Async that answers each request with what a responder
+      returns (a body, chunks, a Supply of chunks, a delay) and
+      finishes writing every response before it closes anything. Cro's
+      own server can lose the end of a response on its Connection:
+      close path when the machine is busy, which would fail the suite
+      intermittently on a loaded machine. Installing no longer pulls
+      in Cro::HTTP::Server or Cro::HTTP::Router for the tests.
+    - [2026-10-24] Requests no longer leave their connection open. Each
+      one used a fresh Cro client, persistent by default, so its
+      connection stayed cached in a client that was then thrown away:
+      a socket left open per request for the life of the process,
+      which on a 256-descriptor limit (the macOS default) exhausted
+      file descriptors over a long session or a busy batch. Every
+      client the backends make (completions, streams, server probes,
+      KoboldCpp's abort and length check, OpenRouter's generation
+      lookup) is now non-persistent: it asks the server to close the
+      connection once the response is done. The test suite also
+      passes, with nothing but TAP in its output, under that limit.
+    - [2026-10-24] A transport, hook or tool error whose exception has
+      no message no longer kills the process. Cro raises one when a
+      server closes the connection before sending response headers
+      (Cro::HTTP::Client::PipelineClosedBeforeHeaders). Such an
+      exception's message is the base Exception's stub, which throws
+      as soon as it is used, and the error handlers interpolated it
+      into their log lines — so each threw again from inside its
+      CATCH, on the request's worker thread, where that is "Unhandled
+      exception in code scheduled on thread N" and the program exits.
+      Such a request now fails like any other, with the exception's
+      class name as its error text; error-class 'unknown'. The side
+      calls are covered too: a `_reconcile-finish-reason` hook or
+      OpenRouter's generation lookup that dies that way is logged and
+      shrugged off like any other failure of theirs, where it used to
+      fail the completion with "Stub code executed"; so is a
+      Response's aborter, where `cancel` used to throw at its caller;
+      the server probes (`probe-server-limits`, KoboldCpp's length
+      check) end their `note` with "(no message)" rather than nothing;
+      and ToolLoop quits with the class name when a backend call dies
+      that way, and hands it back as the tool result's content when
+      `execute-tools` does. The new LLM::Chat::ExceptionText exports
+      the two subs behind the fix, `exception-message` and
+      `exception-text`, which read any exception's message without
+      ever throwing.
+    - [2026-09-28] Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19
+      (cpan:TIMOTIMO) fails its own tests under the RakuAST compiler
+      frontend that Rakudo 2026.09 makes the default, so installing this
+      distribution stopped at that dependency.
+    - [2026-09-25] Thinking, per request. `reasoning_effort` now takes
+      'none' and 'minimal' beside 'low', 'medium' and 'high', and
+      OpenAICommon sends it as the top-level OpenAI field (it used to
+      reach OpenRouter only): llama.cpp's server hands it to the chat
+      template, where 'none' turns thinking off and a Mistral Small 4
+      template takes 'high'. A new `reasoning_budget_tokens` setting
+      caps the thinking per request (llama.cpp's
+      `reasoning_budget_tokens`, which overrides `--reasoning-budget`
+      and forces the end-of-thinking tag once spent; KoboldCpp gets it
+      as `thinking_budget_tokens`). Both go out only when set.
+      OpenRouter keeps its `reasoning: {effort}` object and drops the
+      top-level fields.
+    - [2026-09-25] Thinking is captured, never mixed in. A blocking
+      reply's `reasoning_content` (llama.cpp, KoboldCpp) now lands on
+      `reasoning-text` as `reasoning` (OpenRouter) and the streamed
+      deltas already did; the content stays the answer alone.
+      `usage.completion_tokens_details.reasoning_tokens` is lifted onto
+      a new `reasoning-tokens` (a subset of `completion-tokens`,
+      undefined when unreported).
+    - [2026-09-25] `id_slot`: a new setting that pins a request to one
+      llama.cpp server slot, so requests sharing a long prefix reuse
+      that slot's KV cache dependably. OpenAICommon sends it only when
+      set; KoboldCpp and OpenRouter never send it.
+    - [2026-09-25] `probe-server-limits`: ask the server for its context
+      size. OpenAICommon reads llama.cpp's `GET /props`
+      (`default_generation_settings.n_ctx`, plus `total_slots`, or the
+      length of `GET /slots` when `/props` has no slot count);
+      KoboldCpp reads `GET /api/extra/true_max_context_length`;
+      OpenRouter and the base class ask nothing. The answer always has
+      `source` and either `context_length` (and `slots` with its
+      `slots_source`, or a `slots_note`) or a `note`; it never throws
+      and each request is bounded by the new `server-probe-timeout`
+      (3 s). New shared internals for subclasses: `_server-root`,
+      `_probe-json` and `_probe-json-array`.
+    - [2026-09-25] Mock: `fake-reasoning` (a thinking trace on every
+      response), `server-limits` (what `probe-server-limits` answers)
+      and a `reasoning` usage key.
+    - [2026-09-23] Streams keep their usage when they fail. Both
+      streaming paths quit the Response the moment they read a
+      `length`, `content_filter` or unknown finish reason — and the
+      text path settled on `stop` the same way — but the usage frame
+      that stream_options.include_usage asks for comes AFTER the
+      finish chunk, so a failed stream, and every text stream, lost
+      its token counts. A finish reason is now recorded where it
+      arrives and acted on where the stream settles (`[DONE]`, the
+      body closing, or a new `stream-finish-grace` timer); later
+      chunks are read for usage and model only, never for content,
+      reasoning or tool-call deltas. The outcomes are unchanged — the
+      same success/failure split, error class and error text ("Hit
+      max tokens", ...) — except that a failure now carries its usage,
+      and `[DONE]` after a failure reason still fails. A server that
+      sends its finish chunk and then neither `[DONE]` nor a close is
+      settled after `stream-finish-grace` seconds (default 10; Inf
+      waits for the body) and its connection dropped, rather than
+      holding the Response for the body's own, unbounded, timeout. A
+      cancel in that gap stays a plain cancel. The blocking text path
+      now lifts usage and records the finish reason too; it read the
+      text and nothing else.
+    - [2026-09-23] New `_reconcile-finish-reason` hook on OpenAICommon:
+      it sees every finish reason once, on all four paths (on a stream
+      after the usage frame), and returns the reason the Response acts
+      on. The Response now has `provider-finish-reason` (the wire
+      value, verbatim) beside `finish-reason` (the decided one), and
+      `finish-reason-evidence` (a detached Hash of how a backend
+      decided, when it checked).
+    - [2026-09-23] KoboldCpp: truthful stop reasons. KoboldCpp reports
+      every stop that is not an EOS token as `length` (koboldcpp.py:
+      `"length" if (sr!=1) else "stop"`), so a generation that ended
+      on a custom stop sequence was indistinguishable from a truncated
+      one and failed the stream — commonly after a tool result, with
+      output "" or "\n". On a `length` finish the backend now asks
+      `GET /api/extra/perf` and finishes it as `stop` when
+      `stop_reason` is 2 (CUSTOM_STOPPER in KoboldCpp's expose.h) and
+      `last_token_count` equals the usage `completion_tokens` — or,
+      when there is no usage (KoboldCpp's tool-call streams never send
+      it), is at most 90% of max_tokens. Anything else, including a
+      perf request that fails or outlasts
+      `verify-length-finish-timeout` (default 2s), keeps `length`. The
+      wire value stays on `provider-finish-reason` and the numbers on
+      `finish-reason-evidence`. Off with `verify-length-finish =>
+      False`.
+    - [2026-09-23] Opt-in message normalization for strict chat
+      templates: `message-normalization => 'alternate-roles'` on every
+      OpenAI-compatible backend (default 'none'). Mistral-family
+      templates, which llama.cpp and KoboldCpp --jinja run as-is,
+      reject a conversation whose roles do not alternate ("After the
+      optional system message, conversation roles must alternate user
+      and assistant roles except for tool calls and results").
+      Adjacent plain messages of one role merge, joined by "\n\n";
+      the leading system messages become one; a later system message
+      becomes user text under a `[System message]` marker line
+      (`folded-system-marker`) and merges into the user turn beside
+      it, or stands as its own user turn. Tool calls and tool results
+      are never merged or crossed. Those templates skip tool turns
+      before checking, so a user message directly after tool results
+      reads as the user speaking twice: it gets one assistant turn in
+      front of it, whose text is `tool-result-acknowledgement`
+      (default 'Understood.'; '' inserts none). Nothing is reordered,
+      only empty system messages are dropped. The result is a pure
+      function of the message list and prefix-stable — appending
+      messages only ever grows the last normalized message, and a
+      user message after tool results adds the acknowledgement and
+      itself after them — so repeated prefixes stay byte-identical
+      for prompt caches. Applies to both chat paths (inside
+      `wire-message-hashes`, after `system-message-mode`) and to the
+      messages both text paths hand their template (new
+      `normalized-messages`).
+    - [2026-09-23] The text paths no longer hand their template the
+      caller's own message array. ChatML, Gemma2, Llama3, Llama4 and
+      MistralV7 `pop` the last message when rendering a continuation,
+      so `text-completion(@messages, True)` removed the caller's last
+      message — from a worker thread, while the request was in flight.
+    - [2026-09-23] Request bodies are now serialized deterministically,
+      and a JSON Schema's property order is the caller's to choose.
+      Every completion path handed Cro the body as a Hash, and Cro
+      wrote its members in whatever order the Hash iterated — which
+      differs between two hashes holding the same keys and between
+      two runs of the same program. That included the schema of a
+      structured-output request. llama.cpp and KoboldCpp compile a
+      `response_format` / `json_schema` schema into a grammar that
+      makes the model write an object's fields in the order the
+      schema lists them, so the model wrote its fields in a random
+      order per request, and an application could not ask for, say,
+      the evidence before the conclusion it supports. Random bytes
+      also defeated provider prompt-prefix caching and made a logged
+      request impossible to replay exactly.
+      All four paths (chat and text, blocking and streaming) on
+      OpenAICommon, OpenRouter and KoboldCpp now post bytes from the
+      new overridable `_encode-request-body`, with
+      `Content-Type: application/json` as before. The rule: arrays
+      keep their order; every object's members are sorted by code
+      point; a schema's `properties` map follows the sibling
+      `required` array (in array order), then the optional
+      properties sorted — at every depth, including nested objects,
+      `items`, `$defs`, `anyOf` / `oneOf` / `allOf` branches, tool
+      `parameters` and KoboldCpp's native `json_schema`. So the order
+      of `required` is the order the model writes the fields. Names
+      inside property and `$defs`-style maps are never read as
+      keywords, and data is never reordered as schema: the values of
+      `const` / `default` / `enum` / `examples`, and the whole
+      `messages` member, are plain sorted data. The same Hash is now
+      the same bytes on every call and in every process, and parses
+      to the same data as before.
+      The serializer is exported as `LLM::Chat::WireJSON`
+      (`to-wire-json`, with `:data-members` and `:!schema-order`) for
+      applications that build prompt text or schemas themselves.
+      Numbers, booleans, enums and other non-string scalars are still
+      written by JSON::Fast; strings are escaped in a single linear
+      pass. Two wire defects of the old path go with it: JSON::Fast
+      escapes by splicing, which is quadratic in the number of
+      characters needing an escape (a 1 MB transcript full of
+      newlines took seconds to serialize), and a combining mark right
+      after an escape sequence normalized into the escape's letter —
+      a newline followed by a combining acute went out as `\ń`, an
+      invalid escape the server rejects. Such a mark is now written
+      as a `\u` escape.
+      With LLM_CHAT_DEBUG set, the chat paths now log REQUEST BODY as
+      the exact compact bytes posted rather than a pretty-printed
+      re-rendering (new `LLM::Chat::Debug.log-bytes`, which decodes
+      only when logging is enabled).
+      Two adjacent Hash-order defects: a streamed tool call whose
+      `arguments` arrived as an object is now stored as sorted JSON,
+      so the string echoed back into the next request is stable; and
+      `ToolLoop`'s identical-call limit now recognises two calls with
+      equal object arguments built in different orders as identical.
+    - [2026-09-15] Add opt-in OpenAICommon request-stream-usage for
+      stream_options.include_usage, preserving other stream options and
+      blocking request bodies. Both chat and text streaming now retain
+      usage-only terminal chunks in Response token counters.
+    - [2026-09-14] OpenAI-compatible HTTP failures now preserve bounded
+      provider error evidence on the Response before the generation is
+      quit. Both 4xx and 5xx Cro HTTP errors read at most 16 KiB of the
+      response body, never headers or request content, and expose
+      `Response.provider-error` as detached data with status, retained
+      byte counts, truncation state, content type, bounded text, and
+      OpenAI-style `error.message` / `type` / `code` when present. The
+      Response error string is augmented only with those safe structured
+      error fields, so existing attempt-failure diagnostics can show a
+      provider reason such as "System message must be at the beginning"
+      without enabling plaintext debug logs.
+      `OpenAICommon` also gains `system-message-mode`, default
+      `preserve`. Set it to `leading` for OpenAI-compatible servers that
+      reject later system messages: `wire-message-hashes` merges all
+      system-message content, in original relative order, into one
+      leading system message separated by a documented stable delimiter
+      while preserving non-system message order and tool-call fields.
+    - [2026-09-02] Cancelling a generation on an OpenAI-compatible
+      backend now actually stops it. `cancel` only ever quit the local
+      Supplier: the consumer stopped seeing tokens while the backend's
+      react loop went on draining the body to the end, so the server —
+      llama.cpp's, OpenRouter, any openai-compat gateway — generated
+      the whole reply for a request that had been abandoned, and billed
+      for it. A caller that cancels freely (a chat UI where every
+      re-roll supersedes the last request) accumulated abandoned
+      generations on exactly the slow, expensive models where it hurt.
+      The cancel was cosmetic; only the consumer stopped looking.
+      There is no abort message in the OAI protocol — a client that no
+      longer wants a completion hangs up — so all four completion paths
+      now hand the Response the means to hang up: `Response.cancel`
+      quits the local supply first, synchronously and unconditionally,
+      and then drops the HTTP connection via `Cro::HTTP::Response.cancel`,
+      which quits the body stream and closes the socket rather than
+      returning a quietly-drained connection to Cro's pool. That is the
+      same mechanism Cro uses for its own body / total request
+      timeouts, so a deadline and a cancel now terminate the upstream
+      generation the same way. Transport teardown is best-effort and
+      swallows its own failures — a dead endpoint must never make a
+      cancel throw on the thread that asked for it.
+      Two edges came with it. A cancel raised while the server is still
+      prefilling arrives BEFORE there is a response to close, and Cro's
+      client exposes no handle on a request in flight; the Response
+      records the request and aborts the moment the transport exists,
+      so the abort lands on the first response byte instead of being
+      lost. That window is the common case, not the corner one. And a
+      cancelled Response is no longer classified: Cro reports the
+      torn-down body as a `body`-phase timeout, indistinguishable from
+      a genuinely stalled one, and filing it as `error-class 'timeout'`
+      would have told a fallback policy to retry the request the user
+      just abandoned. `.error-class` now stays undefined on a cancel.
+      New on `Response`: `_attach-aborter` (backends register transport
+      teardown) and `cancel-requested`. The aborter runs at most once
+      and is dropped when the Response reaches any terminal state, so a
+      cancel that loses the race to `[DONE]` is a genuine no-op and a
+      completed Response keeps `.is-success`.
+      `KoboldCpp.cancel` is unchanged and still POSTs
+      `/api/extra/abort`; it now rides along on the connection close
+      too. The two cover different windows — the POST stops a
+      generation still in prefill, the close is instant once a body
+      exists — so both stay.
+    - MAINT: [2026-08-27] moved the shared HTTP-fixture test support from
+      C<t/lib/ChatTestKit.rakumod> into C<lib/LLM/Chat/Test/Kit.rakumod>
+      (C<LLM::Chat::Test::Kit>). A C<t/lib> directory is its own
+      CompUnit repo that starts cold on a fresh C<zef install>, and
+      parallel test files pulling the fixture's dependency chain into
+      that cold store can race and fail the install outright. C<lib/>
+      is staged and precompiled before the test phase runs, so
+      shipping test support inside the dist's own namespace dissolves
+      the race. This is the fleet-wide convention going forward.
+
 0.10.0  2026-08-21T22:05:38+01:00
     - [2026-08-21] Require Template::Jinja2 0.3.0. The byte-identical
       rendering of upstream GLM and Kimi chat templates leans on its Python

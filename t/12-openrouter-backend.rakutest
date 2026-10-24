@@ -1,7 +1,7 @@
 use Test;
-use lib 'lib', 't/lib';
+use lib 'lib';
 
-use ChatTestKit;
+use LLM::Chat::Test::Kit;
 use LLM::Chat::Backend;
 use LLM::Chat::Backend::OpenAICommon;
 use LLM::Chat::Backend::OpenRouter;
@@ -12,8 +12,6 @@ use LLM::Chat::Backend::Settings;
 use LLM::Chat::Conversation::Message;
 use LLM::Chat::Template::ChatML;
 
-use Cro::HTTP::Router;
-use Cro::HTTP::Server;
 use JSON::Fast;
 
 # Unit coverage for the OpenRouter backend's overrides. The HTTP
@@ -44,12 +42,12 @@ use JSON::Fast;
 plan 20;
 
 sub make-backend(*%args) {
-    LLM::Chat::Backend::OpenRouter.new(
-        settings => LLM::Chat::Backend::Settings.new,
-        model    => 'anthropic/claude-opus-4-7',
-        api_key  => 'test-key',
-        |%args,
-    );
+	LLM::Chat::Backend::OpenRouter.new(
+		settings => LLM::Chat::Backend::Settings.new,
+		model    => 'anthropic/claude-opus-4-7',
+		api_key  => 'test-key',
+		|%args,
+	);
 }
 
 # === The fixture server ===
@@ -71,111 +69,109 @@ sub make-backend(*%args) {
 my $bodies = Channel.new;
 
 sub json-blob(%payload --> Blob) {
-    to-json(%payload, :!pretty).encode('utf-8');
+	to-json(%payload, :!pretty).encode('utf-8');
 }
 
 sub chat-reply(%usage?, :$id --> Hash) {
-    my %r =
-        model   => 'anthropic/claude-opus-4-7',
-        # Trailing comma is load-bearing: `[ %h ]` hits the single-arg
-        # rule and flattens the Hash into one array element per Pair.
-        choices => [ { message => { content => 'ok' }, finish_reason => 'stop' }, ];
-    %r<id>    = $id     if $id.defined;
-    %r<usage> = %usage  if %usage.elems;
-    %r;
+	my %r =
+		model   => 'anthropic/claude-opus-4-7',
+		# Trailing comma is load-bearing: `[ %h ]` hits the single-arg
+		# rule and flattens the Hash into one array element per Pair.
+		choices => [ { message => { content => 'ok' }, finish_reason => 'stop' }, ];
+	%r<id>    = $id     if $id.defined;
+	%r<usage> = %usage  if %usage.elems;
+	%r;
 }
 
-my $app = route {
-    # ChatTestKit's boot() proves the listener on the port it picked is
-    # ours and not some other process's.
-    get -> 'ping' { content 'text/plain', 'pong' }
+# LLM::Chat::Test::Kit's raw server: every assertion reads a whole
+# reply, and the Kit's DESCRIPTION says why that rules out Cro's.
+my $server = raw-server(-> $request {
+	given $request.method, $request.path {
+		when ('POST', '/poll/chat/completions') {
+			%( body => json-blob(chat-reply(
+				%( prompt_tokens => 4096, completion_tokens => 64, total_tokens => 4160 ),
+				id => 'gen-poll',
+			)) );
+		}
+		when ('GET', '/poll/generation') {
+			%( body => json-blob({
+				data => {
+					total_cost           => 0.0042,
+					provider_name        => 'Anthropic',
+					# Deliberately disagrees with the body: the poll may
+					# only fill fields the body left unreported.
+					tokens_prompt        => 9,
+					tokens_completion    => 9,
+					native_tokens_cached => 1536,
+				},
+			}) );
+		}
 
-    post -> 'poll', 'chat', 'completions' {
-        content 'application/json', json-blob(chat-reply(
-            %( prompt_tokens => 4096, completion_tokens => 64, total_tokens => 4160 ),
-            id => 'gen-poll',
-        ));
-    }
-    get -> 'poll', 'generation' {
-        content 'application/json', json-blob({
-            data => {
-                total_cost           => 0.0042,
-                provider_name        => 'Anthropic',
-                # Deliberately disagrees with the body: the poll may
-                # only fill fields the body left unreported.
-                tokens_prompt        => 9,
-                tokens_completion    => 9,
-                native_tokens_cached => 1536,
-            },
-        });
-    }
+		when ('POST', '/body/chat/completions') {
+			%( body => json-blob(chat-reply(
+				%(
+					prompt_tokens         => 4096,
+					completion_tokens     => 64,
+					total_tokens          => 4160,
+					prompt_tokens_details => { cached_tokens => 2048 },
+				),
+				id => 'gen-body',
+			)) );
+		}
+		when ('GET', '/body/generation') {
+			%( body => json-blob({
+				data => {
+					total_cost           => 0.0042,
+					native_tokens_cached => 7,
+				},
+			}) );
+		}
 
-    post -> 'body', 'chat', 'completions' {
-        content 'application/json', json-blob(chat-reply(
-            %(
-                prompt_tokens         => 4096,
-                completion_tokens     => 64,
-                total_tokens          => 4160,
-                prompt_tokens_details => { cached_tokens => 2048 },
-            ),
-            id => 'gen-body',
-        ));
-    }
-    get -> 'body', 'generation' {
-        content 'application/json', json-blob({
-            data => {
-                total_cost           => 0.0042,
-                native_tokens_cached => 7,
-            },
-        });
-    }
+		when ('POST', '/nocache/chat/completions') {
+			%( body => json-blob(chat-reply(
+				%( prompt_tokens => 4096, completion_tokens => 64, total_tokens => 4160 ),
+				id => 'gen-nocache',
+			)) );
+		}
+		when ('GET', '/nocache/generation') {
+			%( body => json-blob({
+				data => { total_cost => 0.0042, provider_name => 'Anthropic' },
+			}) );
+		}
 
-    post -> 'nocache', 'chat', 'completions' {
-        content 'application/json', json-blob(chat-reply(
-            %( prompt_tokens => 4096, completion_tokens => 64, total_tokens => 4160 ),
-            id => 'gen-nocache',
-        ));
-    }
-    get -> 'nocache', 'generation' {
-        content 'application/json', json-blob({
-            data => { total_cost => 0.0042, provider_name => 'Anthropic' },
-        });
-    }
+		when ('POST', '/capture/chat/completions') {
+			$bodies.send($request.text);
+			%( body => json-blob(chat-reply()) );
+		}
+		when ('POST', '/capture/completions') {
+			$bodies.send($request.text);
+			%( body => json-blob({
+				choices => [ { text => 'ok', finish_reason => 'stop' }, ],
+			}) );
+		}
 
-    post -> 'capture', 'chat', 'completions' {
-        request-body-blob -> $blob {
-            $bodies.send($blob.decode('utf-8'));
-            content 'application/json', json-blob(chat-reply());
-        }
-    }
-    post -> 'capture', 'completions' {
-        request-body-blob -> $blob {
-            $bodies.send($blob.decode('utf-8'));
-            content 'application/json', json-blob({
-                choices => [ { text => 'ok', finish_reason => 'stop' }, ],
-            });
-        }
-    }
-};
-
-my ($server, $port) = boot($app);
-LEAVE { try $server.stop with $server }
+		default {
+			%( status => 404, body => '' );
+		}
+	}
+});
+LEAVE { $server.stop }
 
 sub make-http-backend(Str:D $prefix, *%args) {
-    make-backend(
-        api_url  => "http://127.0.0.1:$port/$prefix",
-        template => LLM::Chat::Template::ChatML.new,
-        |%args,
-    );
+	make-backend(
+		api_url  => "{$server.url}/$prefix",
+		template => LLM::Chat::Template::ChatML.new,
+		|%args,
+	);
 }
 
 #| The one request body the fixture recorded, as raw text. Waits with
 #| a deadline rather than blocking the suite forever on a call that
 #| never reached the server.
 sub captured(Str:D $what --> Str:D) {
-    my $received = start { $bodies.receive };
-    timed($received, $what);
-    $received.result;
+	my $received = start { $bodies.receive };
+	timed($received, $what);
+	$received.result;
 }
 
 #| A conversation with every message shape the breakpoint walk has to
@@ -183,458 +179,458 @@ sub captured(Str:D $what --> Str:D) {
 #| assistant that holds tool calls instead of text, a tool result, and
 #| the latest user turn.
 sub breakpoint-convo(--> List) {
-    (
-        LLM::Chat::Conversation::Message.new(:role<system>,
-            :content('You are a careful assistant.')),
-        LLM::Chat::Conversation::Message.new(:role<user>,
-            :content('First question')),
-        LLM::Chat::Conversation::Message.new(:role<assistant>,
-            :content('Here is the answer.')),
-        LLM::Chat::Conversation::Message.new(:role<assistant>, :content(''),
-            # Trailing comma again — a bare `[ %h ]` would flatten.
-            :tool-calls([ %(
-                id       => 'call-1',
-                type     => 'function',
-                function => %( name => 'lookup', arguments => '{}' ),
-            ), ])),
-        LLM::Chat::Conversation::Message.new(:role<tool>,
-            :content('{"ok":true}'), :tool-call-id('call-1')),
-        LLM::Chat::Conversation::Message.new(:role<user>,
-            :content('Latest question')),
-    );
+	(
+		LLM::Chat::Conversation::Message.new(:role<system>,
+			:content('You are a careful assistant.')),
+		LLM::Chat::Conversation::Message.new(:role<user>,
+			:content('First question')),
+		LLM::Chat::Conversation::Message.new(:role<assistant>,
+			:content('Here is the answer.')),
+		LLM::Chat::Conversation::Message.new(:role<assistant>, :content(''),
+			# Trailing comma again — a bare `[ %h ]` would flatten.
+			:tool-calls([ %(
+				id       => 'call-1',
+				type     => 'function',
+				function => %( name => 'lookup', arguments => '{}' ),
+			), ])),
+		LLM::Chat::Conversation::Message.new(:role<tool>,
+			:content('{"ok":true}'), :tool-call-id('call-1')),
+		LLM::Chat::Conversation::Message.new(:role<user>,
+			:content('Latest question')),
+	);
 }
 
 #| Every cache_control marker in a serialized body, across all
 #| messages — the number OpenRouter caps at four.
 sub breakpoints-in(%body --> Int:D) {
-    %body<messages>.grep({ $_<content> ~~ Positional })
-                   .map({ $_<content>.grep({ $_<cache_control>.defined }).elems })
-                   .sum;
+	%body<messages>.grep({ $_<content> ~~ Positional })
+	               .map({ $_<content>.grep({ $_<cache_control>.defined }).elems })
+	               .sum;
 }
 
 subtest 'class hierarchy' => {
-    plan 3;
-    my $b = make-backend();
-    isa-ok $b, LLM::Chat::Backend::OpenAICommon, 'is-a OpenAICommon';
-    isa-ok $b, LLM::Chat::Backend,                'is-a Backend';
-    is $b.api_url, 'https://openrouter.ai/api/v1', 'default api_url';
+	plan 3;
+	my $b = make-backend();
+	isa-ok $b, LLM::Chat::Backend::OpenAICommon, 'is-a OpenAICommon';
+	isa-ok $b, LLM::Chat::Backend,                'is-a Backend';
+	is $b.api_url, 'https://openrouter.ai/api/v1', 'default api_url';
 };
 
 subtest 'api_url override is honoured' => {
-    plan 1;
-    my $b = make-backend(api_url => 'https://or.example.com/v1');
-    is $b.api_url, 'https://or.example.com/v1', 'caller-supplied api_url wins';
+	plan 1;
+	my $b = make-backend(api_url => 'https://or.example.com/v1');
+	is $b.api_url, 'https://or.example.com/v1', 'caller-supplied api_url wins';
 };
 
 subtest 'make-response returns Response::OpenRouter' => {
-    plan 2;
-    my $b = make-backend();
-    my $r = $b.make-response;
-    isa-ok $r, LLM::Chat::Backend::Response::OpenRouter, 'OR-typed response';
-    ok $r.id.chars > 0, 'response has a generated id';
+	plan 2;
+	my $b = make-backend();
+	my $r = $b.make-response;
+	isa-ok $r, LLM::Chat::Backend::Response::OpenRouter, 'OR-typed response';
+	ok $r.id.chars > 0, 'response has a generated id';
 };
 
 subtest 'make-stream-response returns Response::OpenRouter::Stream' => {
-    plan 1;
-    my $b = make-backend();
-    my $s = $b.make-stream-response;
-    isa-ok $s, LLM::Chat::Backend::Response::OpenRouter::Stream, 'OR Stream-typed response';
+	plan 1;
+	my $b = make-backend();
+	my $s = $b.make-stream-response;
+	isa-ok $s, LLM::Chat::Backend::Response::OpenRouter::Stream, 'OR Stream-typed response';
 };
 
 subtest '_get-api-settings matches SillyTavern wire shape' => {
-    plan 9;
-    my $b = make-backend();
-    my %s = $b._get-api-settings;
-    # OAI-spec fields preserved.
-    is %s<model>,          'anthropic/claude-opus-4-7', 'OAI-spec model preserved';
-    ok %s<temperature>:exists,                         'OAI-spec temperature preserved';
-    ok %s<max_tokens>:exists,                          'OAI-spec max_tokens preserved';
-    ok %s<top_p>:exists,                               'OAI-spec top_p preserved';
-    ok %s<top_k>:exists,                               'top_k plumbed (matches ST)';
-    # include_reasoning is sent as a Boolean on every request, mirroring ST.
-    is %s<include_reasoning>, False,
-        'include_reasoning is False when no reasoning_effort configured';
-    # Deliberately omitted to keep the request bytes identical to ST.
-    nok %s<usage>:exists,
-        'usage block NOT sent (was triggering OR header-phase hangs)';
-    nok %s<stream_options>:exists,
-        'stream_options NOT sent (was triggering OR header-phase hangs)';
-    # repetition_penalty default is 1.0, treated as "unset" for OR.
-    nok %s<repetition_penalty>:exists,
-        'repetition_penalty omitted at default 1.0 (matches ST conditional)';
+	plan 9;
+	my $b = make-backend();
+	my %s = $b._get-api-settings;
+	# OAI-spec fields preserved.
+	is %s<model>,          'anthropic/claude-opus-4-7', 'OAI-spec model preserved';
+	ok %s<temperature>:exists,                         'OAI-spec temperature preserved';
+	ok %s<max_tokens>:exists,                          'OAI-spec max_tokens preserved';
+	ok %s<top_p>:exists,                               'OAI-spec top_p preserved';
+	ok %s<top_k>:exists,                               'top_k plumbed (matches ST)';
+	# include_reasoning is sent as a Boolean on every request, mirroring ST.
+	is %s<include_reasoning>, False,
+		'include_reasoning is False when no reasoning_effort configured';
+	# Deliberately omitted to keep the request bytes identical to ST.
+	nok %s<usage>:exists,
+		'usage block NOT sent (was triggering OR header-phase hangs)';
+	nok %s<stream_options>:exists,
+		'stream_options NOT sent (was triggering OR header-phase hangs)';
+	# repetition_penalty default is 1.0, treated as "unset" for OR.
+	nok %s<repetition_penalty>:exists,
+		'repetition_penalty omitted at default 1.0 (matches ST conditional)';
 };
 
 subtest '_get-api-headers adds attribution when configured, omits when not' => {
-    plan 6;
-    my $bare = make-backend();
-    my %h = $bare._get-api-headers;
-    is %h<Authorization>, 'Bearer test-key',           'Authorization preserved';
-    nok %h<HTTP-Referer>:exists,                       'no HTTP-Referer when unset';
-    nok %h<X-Title>:exists,                            'no X-Title when unset';
+	plan 6;
+	my $bare = make-backend();
+	my %h = $bare._get-api-headers;
+	is %h<Authorization>, 'Bearer test-key',           'Authorization preserved';
+	nok %h<HTTP-Referer>:exists,                       'no HTTP-Referer when unset';
+	nok %h<X-Title>:exists,                            'no X-Title when unset';
 
-    my $attr = make-backend(
-        http-referer => 'https://example.com/app',
-        x-title      => 'My App',
-    );
-    my %h2 = $attr._get-api-headers;
-    is %h2<Authorization>, 'Bearer test-key',          'Authorization still set';
-    is %h2<HTTP-Referer>,  'https://example.com/app', 'HTTP-Referer set';
-    is %h2<X-Title>,       'My App',                  'X-Title set';
+	my $attr = make-backend(
+		http-referer => 'https://example.com/app',
+		x-title      => 'My App',
+	);
+	my %h2 = $attr._get-api-headers;
+	is %h2<Authorization>, 'Bearer test-key',          'Authorization still set';
+	is %h2<HTTP-Referer>,  'https://example.com/app', 'HTTP-Referer set';
+	is %h2<X-Title>,       'My App',                  'X-Title set';
 };
 
 subtest '_lift-usage extracts OR extras from a full response body' => {
-    plan 8;
-    my $b = make-backend();
-    my $resp = $b.make-response;
-    my %payload = %(
-        id       => 'gen-xyz789',
-        model    => 'anthropic/claude-opus-4-7',
-        provider => 'Anthropic',
-        usage    => %(
-            prompt_tokens     => 200,
-            completion_tokens => 50,
-            total_tokens      => 250,
-            cost              => 0.0125e0,
-            is_byok           => False,
-        ),
-    );
-    $b._lift-usage($resp, %payload);
-    # OAI-spec lifts (parent's callsame path)
-    is $resp.prompt-tokens,      200,                   'OAI prompt-tokens via callsame';
-    is $resp.completion-tokens,  50,                    'OAI completion-tokens via callsame';
-    is $resp.total-tokens,       250,                   'OAI total-tokens via callsame';
-    is $resp.model-used, 'anthropic/claude-opus-4-7',   'OAI model via callsame';
-    # OR extras (subclass-specific lift)
-    is $resp.cost,               0.0125e0,              'OR cost extracted';
-    is $resp.generation-id,      'gen-xyz789',          'OR generation-id extracted from top-level id';
-    is $resp.provider-name,      'Anthropic',           'OR provider-name extracted';
-    is $resp.is-byok,            False,                 'OR is-byok extracted';
+	plan 8;
+	my $b = make-backend();
+	my $resp = $b.make-response;
+	my %payload = %(
+		id       => 'gen-xyz789',
+		model    => 'anthropic/claude-opus-4-7',
+		provider => 'Anthropic',
+		usage    => %(
+			prompt_tokens     => 200,
+			completion_tokens => 50,
+			total_tokens      => 250,
+			cost              => 0.0125e0,
+			is_byok           => False,
+		),
+	);
+	$b._lift-usage($resp, %payload);
+	# OAI-spec lifts (parent's callsame path)
+	is $resp.prompt-tokens,      200,                   'OAI prompt-tokens via callsame';
+	is $resp.completion-tokens,  50,                    'OAI completion-tokens via callsame';
+	is $resp.total-tokens,       250,                   'OAI total-tokens via callsame';
+	is $resp.model-used, 'anthropic/claude-opus-4-7',   'OAI model via callsame';
+	# OR extras (subclass-specific lift)
+	is $resp.cost,               0.0125e0,              'OR cost extracted';
+	is $resp.generation-id,      'gen-xyz789',          'OR generation-id extracted from top-level id';
+	is $resp.provider-name,      'Anthropic',           'OR provider-name extracted';
+	is $resp.is-byok,            False,                 'OR is-byok extracted';
 };
 
 subtest '_lift-usage is presence-gated for partial bodies' => {
-    plan 6;
-    my $b = make-backend();
+	plan 6;
+	my $b = make-backend();
 
-    # Body with only a usage block + no top-level id/provider —
-    # cost gets set, generation-id / provider-name stay undefined.
-    my $r1 = $b.make-response;
-    $b._lift-usage($r1, %( usage => %( cost => 0.002e0 ) ));
-    is  $r1.cost, 0.002e0,                              'cost set';
-    nok $r1.generation-id.defined,                      'generation-id stays undefined';
-    nok $r1.provider-name.defined,                      'provider-name stays undefined';
+	# Body with only a usage block + no top-level id/provider —
+	# cost gets set, generation-id / provider-name stay undefined.
+	my $r1 = $b.make-response;
+	$b._lift-usage($r1, %( usage => %( cost => 0.002e0 ) ));
+	is  $r1.cost, 0.002e0,                              'cost set';
+	nok $r1.generation-id.defined,                      'generation-id stays undefined';
+	nok $r1.provider-name.defined,                      'provider-name stays undefined';
 
-    # Body with only top-level id — generation-id set, cost stays undefined.
-    my $r2 = $b.make-response;
-    $b._lift-usage($r2, %( id => 'gen-only' ));
-    is  $r2.generation-id, 'gen-only',                  'generation-id set';
-    nok $r2.cost.defined,                               'cost stays undefined';
+	# Body with only top-level id — generation-id set, cost stays undefined.
+	my $r2 = $b.make-response;
+	$b._lift-usage($r2, %( id => 'gen-only' ));
+	is  $r2.generation-id, 'gen-only',                  'generation-id set';
+	nok $r2.cost.defined,                               'cost stays undefined';
 
-    # Empty payload is a no-op.
-    my $r3 = $b.make-response;
-    $b._lift-usage($r3, %());
-    nok $r3.cost.defined,                               'empty payload leaves OR fields untouched';
+	# Empty payload is a no-op.
+	my $r3 = $b.make-response;
+	$b._lift-usage($r3, %());
+	nok $r3.cost.defined,                               'empty payload leaves OR fields untouched';
 };
 
 subtest '_lift-usage is defensive against base Response (no _set-or-usage)' => {
-    plan 3;
-    my $b = make-backend();
-    my $base = LLM::Chat::Backend::Response.new(id => 'base1');
-    my %payload = %(
-        id       => 'gen-zzz',
-        provider => 'OpenAI',
-        model    => 'openai/gpt-5.4',
-        usage    => %(
-            prompt_tokens => 10,
-            cost          => 0.0001e0,
-        ),
-    );
-    # Should NOT die even though base Response lacks _set-or-usage.
-    lives-ok {
-        $b._lift-usage($base, %payload);
-    }, 'lift-usage tolerates a non-OR Response';
-    # OAI-spec still lifts via callsame (it works on base Response).
-    is $base.prompt-tokens, 10,                         'OAI-spec lift still works';
-    is $base.model-used,    'openai/gpt-5.4',           'OAI-spec model lift still works';
+	plan 3;
+	my $b = make-backend();
+	my $base = LLM::Chat::Backend::Response.new(id => 'base1');
+	my %payload = %(
+		id       => 'gen-zzz',
+		provider => 'OpenAI',
+		model    => 'openai/gpt-5.4',
+		usage    => %(
+			prompt_tokens => 10,
+			cost          => 0.0001e0,
+		),
+	);
+	# Should NOT die even though base Response lacks _set-or-usage.
+	lives-ok {
+		$b._lift-usage($base, %payload);
+	}, 'lift-usage tolerates a non-OR Response';
+	# OAI-spec still lifts via callsame (it works on base Response).
+	is $base.prompt-tokens, 10,                         'OAI-spec lift still works';
+	is $base.model-used,    'openai/gpt-5.4',           'OAI-spec model lift still works';
 };
 
 subtest 'reasoning_effort omitted from request when unset' => {
-    plan 2;
-    my $b = make-backend();
-    my %s = $b._get-api-settings;
-    nok %s<reasoning>:exists,
-        'reasoning field stays out of the body when not configured';
-    is %s<include_reasoning>, False,
-        'include_reasoning is Boolean False when reasoning_effort unset';
+	plan 2;
+	my $b = make-backend();
+	my %s = $b._get-api-settings;
+	nok %s<reasoning>:exists,
+		'reasoning field stays out of the body when not configured';
+	is %s<include_reasoning>, False,
+		'include_reasoning is Boolean False when reasoning_effort unset';
 };
 
 subtest 'completion hooks defend against missing gen-id and non-OR Response' => {
-    plan 4;
-    my $b = make-backend();
+	plan 4;
+	my $b = make-backend();
 
-    # Fresh OR Response with no generation-id captured — both hooks
-    # must early-return before attempting a /generation fetch. We
-    # can't directly observe the absence of a network call in a unit
-    # test, but we CAN observe that the method completes synchronously
-    # without throwing.
-    my $r-or = $b.make-response;
-    lives-ok {
-        $b._on-blocking-complete($r-or);
-    }, '_on-blocking-complete is a no-op when generation-id is undefined';
+	# Fresh OR Response with no generation-id captured — both hooks
+	# must early-return before attempting a /generation fetch. We
+	# can't directly observe the absence of a network call in a unit
+	# test, but we CAN observe that the method completes synchronously
+	# without throwing.
+	my $r-or = $b.make-response;
+	lives-ok {
+		$b._on-blocking-complete($r-or);
+	}, '_on-blocking-complete is a no-op when generation-id is undefined';
 
-    my $s-or = $b.make-stream-response;
-    lives-ok {
-        $b._on-stream-complete($s-or);
-    }, '_on-stream-complete is a no-op when generation-id is undefined';
+	my $s-or = $b.make-stream-response;
+	lives-ok {
+		$b._on-stream-complete($s-or);
+	}, '_on-stream-complete is a no-op when generation-id is undefined';
 
-    # Base Response (not OR-augmented). The OR override checks the
-    # role with a `~~` guard before touching subclass-only methods,
-    # so passing a plain Response must not crash. The blocking-path
-    # hook is the only one that can receive a base Response — the
-    # streaming hook is signature-pinned to Response::Stream.
-    my $base = LLM::Chat::Backend::Response.new(id => 'base1');
-    lives-ok {
-        $b._on-blocking-complete($base);
-    }, '_on-blocking-complete tolerates a non-OR Response';
+	# Base Response (not OR-augmented). The OR override checks the
+	# role with a `~~` guard before touching subclass-only methods,
+	# so passing a plain Response must not crash. The blocking-path
+	# hook is the only one that can receive a base Response — the
+	# streaming hook is signature-pinned to Response::Stream.
+	my $base = LLM::Chat::Backend::Response.new(id => 'base1');
+	lives-ok {
+		$b._on-blocking-complete($base);
+	}, '_on-blocking-complete tolerates a non-OR Response';
 
-    # Sanity check — the Augment role membership is what gates the
-    # fetch path, so confirm Response::OpenRouter does it and a base
-    # Response doesn't.
-    ok $r-or ~~ LLM::Chat::Backend::Response::OpenRouter::Augment,
-        'OR-typed response carries the Augment role';
+	# Sanity check — the Augment role membership is what gates the
+	# fetch path, so confirm Response::OpenRouter does it and a base
+	# Response doesn't.
+	ok $r-or ~~ LLM::Chat::Backend::Response::OpenRouter::Augment,
+		'OR-typed response carries the Augment role';
 };
 
 subtest 'reasoning_effort serialises only `effort` (matches ST shape)' => {
-    plan 7;
-    for <low medium high> -> $level {
-        my $b = LLM::Chat::Backend::OpenRouter.new(
-            settings => LLM::Chat::Backend::Settings.new(
-                reasoning_effort => $level,
-            ),
-            model    => 'anthropic/claude-opus-4-7',
-            api_key  => 'test-key',
-        );
-        my %s = $b._get-api-settings;
-        is %s<reasoning><effort>, $level,
-            "$level effort serialised under reasoning.effort";
-    }
-    # Mirroring SillyTavern's wire bytes verbatim: only `effort`,
-    # never the speculative `enabled` key we used to send. ST's
-    # ~0 % failure rate vs our ~80 % was the dispositive evidence
-    # that anything beyond what ST sends could trigger the hang.
-    my $b = LLM::Chat::Backend::OpenRouter.new(
-        settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high'),
-        model    => 'anthropic/claude-opus-4-7',
-        api_key  => 'test-key',
-    );
-    my %s = $b._get-api-settings;
-    nok %s<reasoning><enabled>:exists,
-        '`enabled` key NOT sent (matches ST shape)';
-    is %s<reasoning>.keys.elems,         1,
-        'reasoning hash has exactly the effort key';
-    is %s<reasoning><effort>,            'high',
-        'effort still carries the configured level';
-    is %s<include_reasoning>,            True,
-        'include_reasoning Boolean True when reasoning_effort set';
+	plan 7;
+	for <low medium high> -> $level {
+		my $b = LLM::Chat::Backend::OpenRouter.new(
+			settings => LLM::Chat::Backend::Settings.new(
+				reasoning_effort => $level,
+			),
+			model    => 'anthropic/claude-opus-4-7',
+			api_key  => 'test-key',
+		);
+		my %s = $b._get-api-settings;
+		is %s<reasoning><effort>, $level,
+			"$level effort serialised under reasoning.effort";
+	}
+	# Mirroring SillyTavern's wire bytes verbatim: only `effort`,
+	# never the speculative `enabled` key we used to send. ST's
+	# ~0 % failure rate vs our ~80 % was the dispositive evidence
+	# that anything beyond what ST sends could trigger the hang.
+	my $b = LLM::Chat::Backend::OpenRouter.new(
+		settings => LLM::Chat::Backend::Settings.new(reasoning_effort => 'high'),
+		model    => 'anthropic/claude-opus-4-7',
+		api_key  => 'test-key',
+	);
+	my %s = $b._get-api-settings;
+	nok %s<reasoning><enabled>:exists,
+		'`enabled` key NOT sent (matches ST shape)';
+	is %s<reasoning>.keys.elems,         1,
+		'reasoning hash has exactly the effort key';
+	is %s<reasoning><effort>,            'high',
+		'effort still carries the configured level';
+	is %s<include_reasoning>,            True,
+		'include_reasoning Boolean True when reasoning_effort set';
 };
 
 subtest 'json_schema settings become an OpenAI response_format block' => {
-    plan 6;
-    my %schema = %(
-        type       => 'object',
-        properties => %( events => %( type => 'array' ) ),
-        required   => ['events'],
-    );
+	plan 6;
+	my %schema = %(
+		type       => 'object',
+		properties => %( events => %( type => 'array' ) ),
+		required   => ['events'],
+	);
 
-    my $plain = make-backend();
-    nok $plain._get-api-settings<response_format>:exists,
-        'response_format omitted when no json_schema is set';
+	my $plain = make-backend();
+	nok $plain._get-api-settings<response_format>:exists,
+		'response_format omitted when no json_schema is set';
 
-    my $b = make-backend(settings => LLM::Chat::Backend::Settings.new(
-        json_schema      => %schema,
-        json_schema_name => 'relationship_events',
-    ));
-    my %s = $b._get-api-settings;
-    is %s<response_format><type>, 'json_schema', 'response_format type';
-    is %s<response_format><json_schema><name>, 'relationship_events',
-        'schema name threaded through';
-    is %s<response_format><json_schema><strict>, False,
-        'strict is False (shape guidance, not provider-narrowing)';
-    is-deeply %s<response_format><json_schema><schema>, %schema,
-        'schema passed through verbatim';
+	my $b = make-backend(settings => LLM::Chat::Backend::Settings.new(
+		json_schema      => %schema,
+		json_schema_name => 'relationship_events',
+	));
+	my %s = $b._get-api-settings;
+	is %s<response_format><type>, 'json_schema', 'response_format type';
+	is %s<response_format><json_schema><name>, 'relationship_events',
+		'schema name threaded through';
+	is %s<response_format><json_schema><strict>, False,
+		'strict is False (shape guidance, not provider-narrowing)';
+	is-deeply %s<response_format><json_schema><schema>, %schema,
+		'schema passed through verbatim';
 
-    my $mutated = make-backend();
-    $mutated.settings.json_schema = %schema;
-    ok $mutated._get-api-settings<response_format>:exists,
-        'post-construction settings mutation is honoured';
+	my $mutated = make-backend();
+	$mutated.settings.json_schema = %schema;
+	ok $mutated._get-api-settings<response_format>:exists,
+		'post-construction settings mutation is honoured';
 };
 
 # === Cache telemetry ===
 
 subtest 'the /generation poll supplies cached prompt tokens' => {
-    plan 5;
-    my @convo = breakpoint-convo();
-    my $resp  = settled(
-        make-http-backend('poll').chat-completion(@convo),
-        'the polled completion',
-    );
+	plan 5;
+	my @convo = breakpoint-convo();
+	my $resp  = settled(
+		make-http-backend('poll').chat-completion(@convo),
+		'the polled completion',
+	);
 
-    ok $resp.is-success, 'the completion succeeded';
-    is $resp.cached-prompt-tokens, 1536,
-        'native_tokens_cached from /generation lands on the Response';
-    # The poll disagrees with the body about the token counts on
-    # purpose: a field the body already reported is never overwritten.
-    is $resp.prompt-tokens,     4096, 'body-reported prompt tokens survive the poll';
-    is $resp.completion-tokens, 64,   'body-reported completion tokens survive the poll';
-    is $resp.provider-name, 'Anthropic',
-        'the poll still filled in the fields the body left out';
+	ok $resp.is-success, 'the completion succeeded';
+	is $resp.cached-prompt-tokens, 1536,
+		'native_tokens_cached from /generation lands on the Response';
+	# The poll disagrees with the body about the token counts on
+	# purpose: a field the body already reported is never overwritten.
+	is $resp.prompt-tokens,     4096, 'body-reported prompt tokens survive the poll';
+	is $resp.completion-tokens, 64,   'body-reported completion tokens survive the poll';
+	is $resp.provider-name, 'Anthropic',
+		'the poll still filled in the fields the body left out';
 };
 
 subtest 'a body-reported cache hit outranks the /generation poll' => {
-    plan 3;
-    my @convo = breakpoint-convo();
-    my $resp  = settled(
-        make-http-backend('body').chat-completion(@convo),
-        'the body-reported completion',
-    );
+	plan 3;
+	my @convo = breakpoint-convo();
+	my $resp  = settled(
+		make-http-backend('body').chat-completion(@convo),
+		'the body-reported completion',
+	);
 
-    ok $resp.is-success, 'the completion succeeded';
-    is $resp.cached-prompt-tokens, 2048,
-        'usage.prompt_tokens_details.cached_tokens wins';
-    isnt $resp.cached-prompt-tokens, 7,
-        'the poll did not overwrite it with its own (rounded) number';
+	ok $resp.is-success, 'the completion succeeded';
+	is $resp.cached-prompt-tokens, 2048,
+		'usage.prompt_tokens_details.cached_tokens wins';
+	isnt $resp.cached-prompt-tokens, 7,
+		'the poll did not overwrite it with its own (rounded) number';
 };
 
 subtest 'no cache field anywhere leaves cached-prompt-tokens undefined' => {
-    plan 3;
-    my @convo = breakpoint-convo();
-    my $resp  = settled(
-        make-http-backend('nocache').chat-completion(@convo),
-        'the cache-less completion',
-    );
+	plan 3;
+	my @convo = breakpoint-convo();
+	my $resp  = settled(
+		make-http-backend('nocache').chat-completion(@convo),
+		'the cache-less completion',
+	);
 
-    ok $resp.is-success, 'the completion succeeded';
-    nok $resp.cached-prompt-tokens.defined,
-        'unreported caching stays undefined rather than defaulting to 0';
-    is $resp.provider-name, 'Anthropic',
-        'and the poll ran regardless — the field is absent, not the payload';
+	ok $resp.is-success, 'the completion succeeded';
+	nok $resp.cached-prompt-tokens.defined,
+		'unreported caching stays undefined rather than defaulting to 0';
+	is $resp.provider-name, 'Anthropic',
+		'and the poll ran regardless — the field is absent, not the payload';
 };
 
 # === cache_control breakpoints ===
 
 subtest 'cache-breakpoints off sends the pre-breakpoint body' => {
-    plan 4;
-    my @convo    = breakpoint-convo();
-    my @expected = @convo.map(*.to-hash).Array;
+	plan 4;
+	my @convo    = breakpoint-convo();
+	my @expected = @convo.map(*.to-hash).Array;
 
-    my $resp = settled(
-        make-http-backend('capture', cache-breakpoints => False)
-            .chat-completion(@convo),
-        'the unannotated completion',
-    );
-    ok $resp.is-success, 'the completion succeeded';
+	my $resp = settled(
+		make-http-backend('capture', cache-breakpoints => False)
+			.chat-completion(@convo),
+		'the unannotated completion',
+	);
+	ok $resp.is-success, 'the completion succeeded';
 
-    my $raw = captured('the unannotated request body');
-    nok $raw.contains('cache_control'),
-        'nothing on the wire mentions cache_control';
+	my $raw = captured('the unannotated request body');
+	nok $raw.contains('cache_control'),
+		'nothing on the wire mentions cache_control';
 
-    my %body = from-json($raw);
-    is-deeply %body<messages>.Array, @expected,
-        'messages are byte-for-byte what to-hash produced';
-    nok %body<stream>:exists, 'and the rest of the body is the usual shape';
+	my %body = from-json($raw);
+	is-deeply %body<messages>.Array, @expected,
+		'messages are byte-for-byte what to-hash produced';
+	nok %body<stream>:exists, 'and the rest of the body is the usual shape';
 };
 
 subtest 'cache-breakpoints on marks the head and the last two turns' => {
-    plan 10;
-    my @convo = breakpoint-convo();
+	plan 10;
+	my @convo = breakpoint-convo();
 
-    my $resp = settled(
-        make-http-backend('capture').chat-completion(@convo),
-        'the annotated completion',
-    );
-    ok $resp.is-success, 'the completion succeeded';
+	my $resp = settled(
+		make-http-backend('capture').chat-completion(@convo),
+		'the annotated completion',
+	);
+	ok $resp.is-success, 'the completion succeeded';
 
-    my %body = from-json(captured('the annotated request body'));
-    my @msgs = %body<messages>.list;
-    is @msgs.elems, 6, 'every message still reached the wire';
+	my %body = from-json(captured('the annotated request body'));
+	my @msgs = %body<messages>.list;
+	is @msgs.elems, 6, 'every message still reached the wire';
 
-    is-deeply @msgs[0]<content>,
-        [ %(
-            type          => 'text',
-            text          => 'You are a careful assistant.',
-            cache_control => %( type => 'ephemeral' ),
-        ), ],
-        'the head message is promoted to a marked content-parts block';
-    is @msgs[0]<role>, 'system', 'and keeps its role';
+	is-deeply @msgs[0]<content>,
+		[ %(
+			type          => 'text',
+			text          => 'You are a careful assistant.',
+			cache_control => %( type => 'ephemeral' ),
+		), ],
+		'the head message is promoted to a marked content-parts block';
+	is @msgs[0]<role>, 'system', 'and keeps its role';
 
-    is @msgs[1]<content>, 'First question',
-        'an older turn keeps the plain string shape';
+	is @msgs[1]<content>, 'First question',
+		'an older turn keeps the plain string shape';
 
-    is-deeply @msgs[2]<content>,
-        [ %(
-            type          => 'text',
-            text          => 'Here is the answer.',
-            cache_control => %( type => 'ephemeral' ),
-        ), ],
-        'the second-newest eligible turn is marked';
-    is-deeply @msgs[5]<content>,
-        [ %(
-            type          => 'text',
-            text          => 'Latest question',
-            cache_control => %( type => 'ephemeral' ),
-        ), ],
-        'the newest turn is marked';
+	is-deeply @msgs[2]<content>,
+		[ %(
+			type          => 'text',
+			text          => 'Here is the answer.',
+			cache_control => %( type => 'ephemeral' ),
+		), ],
+		'the second-newest eligible turn is marked';
+	is-deeply @msgs[5]<content>,
+		[ %(
+			type          => 'text',
+			text          => 'Latest question',
+			cache_control => %( type => 'ephemeral' ),
+		), ],
+		'the newest turn is marked';
 
-    # The two shapes the backward walk has to step over to reach that
-    # second marker: an assistant whose content to-hash nulled because
-    # it carries tool calls, and a tool result.
-    nok @msgs[3]<content>.defined,
-        'a tool-calling assistant is left with its null content';
-    is @msgs[4]<content>, '{"ok":true}',
-        'a tool result is left as a plain string';
+	# The two shapes the backward walk has to step over to reach that
+	# second marker: an assistant whose content to-hash nulled because
+	# it carries tool calls, and a tool result.
+	nok @msgs[3]<content>.defined,
+		'a tool-calling assistant is left with its null content';
+	is @msgs[4]<content>, '{"ok":true}',
+		'a tool result is left as a plain string';
 
-    is breakpoints-in(%body), 3,
-        'three markers placed, inside OpenRouter\'s ceiling of four';
+	is breakpoints-in(%body), 3,
+		'three markers placed, inside OpenRouter\'s ceiling of four';
 };
 
 subtest 'text-completion bodies are never annotated' => {
-    plan 4;
-    my @convo = breakpoint-convo();
+	plan 4;
+	my @convo = breakpoint-convo();
 
-    my $resp = settled(
-        make-http-backend('capture').text-completion(@convo),
-        'the text completion',
-    );
-    ok $resp.is-success, 'the completion succeeded';
+	my $resp = settled(
+		make-http-backend('capture').text-completion(@convo),
+		'the text completion',
+	);
+	ok $resp.is-success, 'the completion succeeded';
 
-    my $raw = captured('the text-completion request body');
-    nok $raw.contains('cache_control'),
-        'a prompt body carries no markers — there are no messages to mark';
+	my $raw = captured('the text-completion request body');
+	nok $raw.contains('cache_control'),
+		'a prompt body carries no markers — there are no messages to mark';
 
-    my %body = from-json($raw);
-    ok %body<prompt>.defined,       'the rendered prompt is there';
-    nok %body<messages>:exists,     'and no messages key was invented';
+	my %body = from-json($raw);
+	ok %body<prompt>.defined,       'the rendered prompt is there';
+	nok %body<messages>:exists,     'and no messages key was invented';
 };
 
 subtest 'annotating a request leaves the conversation untouched' => {
-    plan 3;
-    my @convo  = breakpoint-convo();
-    my @before = @convo.map(*.to-hash).Array;
+	plan 3;
+	my @convo  = breakpoint-convo();
+	my @before = @convo.map(*.to-hash).Array;
 
-    my $resp = settled(
-        make-http-backend('capture').chat-completion(@convo),
-        'the checksum-invariance completion',
-    );
-    ok $resp.is-success, 'the completion succeeded';
-    captured('the request body of the checksum-invariance call');
+	my $resp = settled(
+		make-http-backend('capture').chat-completion(@convo),
+		'the checksum-invariance completion',
+	);
+	ok $resp.is-success, 'the completion succeeded';
+	captured('the request body of the checksum-invariance call');
 
-    is-deeply @convo.map(*.to-hash).Array, @before,
-        'to-hash reads the same after the request as before it';
+	is-deeply @convo.map(*.to-hash).Array, @before,
+		'to-hash reads the same after the request as before it';
 
-    # get-checksum memoises on first call, so asking the messages we
-    # just sent is only meaningful against a pristine twin built from
-    # the same inputs — if a breakpoint had leaked into Message state,
-    # the digests would diverge here.
-    is-deeply @convo.map(*.get-checksum).Array,
-              breakpoint-convo().map(*.get-checksum).Array,
-        'checksums match a conversation that was never sent anywhere';
+	# get-checksum memoises on first call, so asking the messages we
+	# just sent is only meaningful against a pristine twin built from
+	# the same inputs — if a breakpoint had leaked into Message state,
+	# the digests would diverge here.
+	is-deeply @convo.map(*.get-checksum).Array,
+	          breakpoint-convo().map(*.get-checksum).Array,
+		'checksums match a conversation that was never sent anywhere';
 };

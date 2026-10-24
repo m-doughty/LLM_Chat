@@ -96,6 +96,16 @@ my $backend = LLM::Chat::Backend::KoboldCpp.new(
 );
 ```
 
+KoboldCpp reports a generation that ended on one of your `stop` strings as `finish_reason: "length"` — the same as one that ran out of budget. When a completion finishes with `length`, this backend asks KoboldCpp's `GET /api/extra/perf` why it stopped, and finishes it as `stop` when that was a stop string and the token counts match (or, with no usage to match, are well under `max_tokens`). The wire value stays readable:
+
+```raku
+$resp.finish-reason;            # 'stop'
+$resp.provider-finish-reason;   # 'length'
+$resp.finish-reason-evidence;   # { source, verdict, note, stop_reason, last_token_count, ... }
+```
+
+Anything short of a clear answer leaves `length`. The check is bounded (`verify-length-finish-timeout`, 2 seconds) and can be turned off with `verify-length-finish => False`. The rules and their limits are in [LLM::Chat::Backend::KoboldCpp](../lib/LLM/Chat/Backend/KoboldCpp.rakumod).
+
 ### OpenAI-compatible
 
 Any OpenAI-compatible API (vLLM, Ollama, etc.):
@@ -108,6 +118,38 @@ my $backend = LLM::Chat::Backend::OpenAICommon.new(
     model   => 'my-model',
 );
 ```
+
+### Message normalization
+
+Some chat templates (Mistral's, among others) refuse any conversation that is not an optional system message followed by strictly alternating user and assistant turns — and llama.cpp or KoboldCpp `--jinja` run the model's own template. Every OpenAI-compatible backend can reshape the outgoing conversation to fit:
+
+```raku
+my $backend = LLM::Chat::Backend::KoboldCpp.new(
+    api_url               => 'http://localhost:5001/v1',
+    message-normalization => 'alternate-roles',   # default 'none'
+);
+```
+
+Adjacent plain messages of one role merge (contents joined with a blank line), the leading system messages become one, and a system message later in the conversation becomes user text under a `[System message]` marker line, merged into the user turn beside it. Tool calls and tool results are never merged or crossed; a user message straight after tool results, which such a template reads as the user speaking twice, gets an assistant turn in front of it saying `tool-result-acknowledgement` (`'Understood.'`; `''` for none). Nothing is reordered, and the result is a pure function of the messages — a repeated conversation prefix normalizes to the same bytes, so prompt caches keep matching. It applies to the chat paths' `messages` and to the messages the text paths render through their template. The full rules are in [LLM::Chat::Backend::OpenAICommon](../lib/LLM/Chat/Backend/OpenAICommon.rakumod).
+
+### Structured output and field order
+
+Set `json_schema` on the settings to constrain the reply's shape. It goes out as `response_format` on OpenAI-compatible backends and as the native `json_schema` field on KoboldCpp. Servers that compile the schema into a grammar (llama.cpp, KoboldCpp) make the model write an object's fields in the order the schema lists them, and LLM::Chat lists a schema's `properties` in the order of its `required` array, then any optional properties alphabetically — so **the order of `required` is the order the model writes the fields**:
+
+```raku
+my $settings = LLM::Chat::Backend::Settings.new(
+    json_schema => %(
+        type       => 'object',
+        properties => %(
+            change   => %( type => 'string' ),
+            evidence => %( type => 'string' ),
+        ),
+        required   => [ 'evidence', 'change' ],   # evidence first
+    ),
+);
+```
+
+Every request body is serialized deterministically — the same request is the same bytes on every call and in every process, which also keeps provider prompt caches warm. The full rule, including nested schemas, `$defs` and tool parameters, is in [LLM::Chat::WireJSON](../lib/LLM/Chat/WireJSON.rakumod), which is exported for building prompt text with the same guarantees.
 
 ### Mock (for tests)
 
@@ -191,17 +233,22 @@ $resp.cost;                # Num (credits)
 $resp.model-used;          # Str, provider-reported routed model
 $resp.provider-id;         # Str, provider-assigned request id
 $resp.finish-reason;       # Str ('stop' / 'length' / 'content_filter' / ...)
+$resp.provider-finish-reason; # Str, the reason exactly as the wire said it —
+                           # differs only when a backend corrected it
+$resp.finish-reason-evidence; # Hash, how a backend decided, when it checked
 ```
 
 ### How a stream ends
 
 A streamed generation ends in one of three ways, and every backend built on `LLM::Chat::Backend::OpenAICommon` settles the Response the same way for each:
 
-  * **The provider says it is finished** — `[DONE]`, or a `stop` / `tool_calls` finish reason and then a closed body. `.is-done` and `.is-success` are both true.
+  * **The provider says it is finished** — `[DONE]`, or a `stop` / `tool_calls` finish reason and then `[DONE]` or a closed body. `.is-done` and `.is-success` are both true.
 
-  * **The provider names a terminal failure** — `length`, `content_filter`, or a reason this library doesn't know. `.is-success` is false, `.error-class` is `'response'`, and `.finish-reason` says which. Note that `length` is a failure: a generation stopped by the completion budget is a truncated one, and it never arrives labelled as a complete answer. The partial text is still on `.latest` / `.msg`.
+  * **The provider names a terminal failure** — `length`, `content_filter`, or a reason this library doesn't know. `.is-success` is false, `.error-class` is `'response'`, and `.finish-reason` says which. Note that `length` is a failure: a generation stopped by the completion budget is a truncated one, and it never arrives labelled as a complete answer. The partial text is still on `.latest` / `.msg`, and the usage is on the token counters when the provider sent it.
 
   * **The body just stops** — no `[DONE]`, no finish reason. A dropped connection, a killed upstream worker, a proxy that gave up. `.is-success` is false with `.error-class` `'response'`; there is no way to tell a reply that was cut off from one that ended.
+
+A finish reason is recorded when it arrives but acted on only when the stream ends, because the usage frame (`stream_options.include_usage`) comes *after* the finish chunk — a stream settled on the finish chunk never reported its token counts. Content after the finish chunk is ignored; a server that sends its finish chunk and then goes quiet is settled after `stream-finish-grace` seconds (default 10) and its connection dropped.
 
 A streamed `data:` line that doesn't parse is skipped rather than fatal, but counted on `.dropped-frames`:
 
@@ -210,6 +257,36 @@ $resp.dropped-frames;      # Int, 0 unless frames were unparseable
 ```
 
 If any frames were dropped **while tool calls were being assembled**, the stream fails whatever else happened — tool-call `arguments` are streamed as JSON fragments concatenated blind, so a hole in them can produce valid JSON saying something the model never asked for, and nothing downstream could detect it. Prose-only streams keep their success and leave the counter for the caller to judge.
+
+### Cancelling a generation
+
+There is a fourth way a generation can end that isn't the provider's decision: the caller changes its mind. `cancel` is for that, and it stops the **server** as well as the client.
+
+```raku
+my $resp = $backend.chat-completion-stream(@messages);
+# ... the user hits escape, or a newer request supersedes this one ...
+$backend.cancel($resp);      # or $resp.cancel — same effect
+
+$resp.is-done;               # True, immediately and synchronously
+$resp.is-cancelled;          # True
+$resp.err;                   # 'Cancelled by user'
+$resp.error-class;           # undefined — a cancel is not a failure
+$resp.latest;                # whatever had already arrived, kept
+```
+
+The OpenAI-compatible protocol has no abort message: a client that no longer wants a completion hangs up, and llama.cpp's server, OpenRouter and the gateways between them stop generating when it does. So `cancel` closes the HTTP connection carrying the generation. Without that it would only quit the local supply — the caller sees nothing more while the model generates, and bills for, the entire reply anyway. On a slow model with a caller that cancels freely, that accumulates abandoned generations nobody will ever read.
+
+Three properties are worth relying on:
+
+  * **The local close is synchronous and unconditional.** The supply is quit before any network work, so a hung or unreachable endpoint cannot delay or prevent the cancel. Tearing down the connection is best-effort and swallows its own errors — safe to call straight from a keybind handler.
+
+  * **A cancel during prefill is not lost.** Before response headers arrive there is nothing to close, and Cro's client offers no handle on a request in flight. The Response remembers that a cancel was asked for and aborts the instant the transport exists, so the abort lands on the first response byte rather than never. Prefill is exactly when a caller gets bored, so this is the common case.
+
+  * **A cancel after the generation finished is a no-op.** A late or duplicate cancel changes nothing; a completed Response keeps `.is-success`.
+
+A cancelled Response is deliberately **not** classified — `.error-class` stays undefined — so a fallback policy reading the Response cannot mistake an abandoned request for a flaky backend and retry it.
+
+`LLM::Chat::Backend::KoboldCpp` additionally sends `POST /api/extra/abort`, which stops a generation still in prefill, before there is a connection to close. Its `cancel` returns the background `Promise` for that POST; it is fire-and-forget and callers may sink it.
 
 Tool Loop
 ---------

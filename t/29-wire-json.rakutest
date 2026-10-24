@@ -1,0 +1,524 @@
+use Test;
+use lib 'lib';
+
+use JSON::Fast;
+use LLM::Chat::WireJSON;
+use Telemetry;
+
+# LLM::Chat::WireJSON is the serializer every backend request body goes
+# through. A Raku Hash has no member order, so a body handed to Cro as a
+# Hash went out in a different order on every request — including the
+# JSON Schema of a structured-output request, which llama.cpp and
+# KoboldCpp compile into a grammar that makes the model write fields in
+# the order the schema lists them. This file pins the ordering rule
+# down, then the bytes: escaping, parity with JSON::Fast for everything
+# that is not member order, determinism within and across processes,
+# and linear cost on large bodies.
+#
+# t/30-request-body-wire.rakutest covers the same serializer as the
+# backends actually put it on a socket.
+
+plan 21;
+
+# A schema whose properties are z, m and a, with m and z required in
+# that order. On the wire: m, z (required order), then a (optional).
+sub probe(--> Hash:D) {
+	%(
+		type       => 'object',
+		properties => %(
+			z => %( type => 'string' ),
+			m => %( type => 'string' ),
+			a => %( type => 'string' ),
+		),
+		required   => [ 'm', 'z' ],
+	);
+}
+
+constant PROBE =
+	'{"properties":{"m":{"type":"string"},"z":{"type":"string"},'
+	~ '"a":{"type":"string"}},"required":["m","z"],"type":"object"}';
+
+# The same probe serialized as plain data: every object sorted.
+constant SORTED-PROBE =
+	'{"properties":{"a":{"type":"string"},"m":{"type":"string"},'
+	~ '"z":{"type":"string"}},"required":["m","z"],"type":"object"}';
+
+#| True when every backslash in the bytes starts a valid JSON escape.
+#| Walks the bytes rather than a Str so that nothing is renormalized
+#| on the way.
+sub valid-escapes(Blob:D $bytes --> Bool:D) {
+	my @b = $bytes.list;
+	my int $i = 0;
+	while $i < @b.elems {
+		if @b[$i] == 0x5C {
+			return False if $i + 1 >= @b.elems;
+			return False unless @b[$i + 1] == any(0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74, 0x75);
+			$i += 2;
+		}
+		else {
+			$i++;
+		}
+	}
+	True;
+}
+
+# === The ordering rule ===
+
+subtest 'objects are sorted by code point; arrays keep their order' => {
+	plan 7;
+	is to-wire-json(%( b => 1, a => 2, c => 3 )), '{"a":2,"b":1,"c":3}',
+		'members sorted';
+	is to-wire-json(%( z => 1, b => 2, B => 3, _ => 4, '1' => 5, 'é' => 6 )),
+		'{"1":5,"B":3,"_":4,"b":2,"z":1,"é":6}',
+		'code point order: digits, uppercase, underscore, lowercase, then non-ASCII';
+	is to-wire-json([3, 1, 2]), '[3,1,2]', 'array order kept';
+	is to-wire-json(%( list => [ %( z => 1, a => 2 ), %( y => 1, b => 2 ) ] )),
+		'{"list":[{"a":2,"z":1},{"b":2,"y":1}]}',
+		'objects inside arrays sorted, array order kept';
+	is to-wire-json(%( outer => %( z => %( y => 1, x => 2 ), a => 1 ) )),
+		'{"outer":{"a":1,"z":{"x":2,"y":1}}}',
+		'sorted at every depth';
+	is to-wire-json(%()), '{}', 'empty object';
+	is to-wire-json([]), '[]', 'empty array';
+};
+
+subtest 'names that differ only past a combining mark sort by code point' => {
+	plan 2;
+	# Both names are single synthetic graphemes. MoarVM numbers
+	# synthetics in the order a process first meets them, so an order
+	# built on those numbers would differ between processes; the
+	# serializer's order is the code points' (a-acute-circumflex-tilde
+	# is E1 302 303, a-tilde-acute is E3 301, so the first sorts first),
+	# whatever order they were created in.
+	my $late  = "a\x[303]\x[301]";
+	my $early = "a\x[301]\x[302]\x[303]";
+	my %h = $late => 1, $early => 2;
+	my $json = to-wire-json(%h);
+	ok $json.index($early) < $json.index($late), 'E1… sorts before E3…';
+	is-deeply from-json($json), %h, 'and both names survive the round trip';
+};
+
+subtest "a property map follows its schema's required array" => {
+	plan 2;
+	is to-wire-json(probe()), PROBE,
+		'required names first, in array order, then optional names sorted';
+	is to-wire-json(%(
+		type       => 'object',
+		properties => %( b => 1, d => 1, c => 1, a => 1 ),
+		required   => [ 'd', 'b', 'c', 'a' ],
+	)), '{"properties":{"d":1,"b":1,"c":1,"a":1},"required":["d","b","c","a"],"type":"object"}',
+		'a fully required map is exactly the required order';
+};
+
+subtest 'without a usable required array the whole map is sorted' => {
+	plan 5;
+	my %props = z => 1, m => 1, a => 1;
+	constant SORTED = '"properties":{"a":1,"m":1,"z":1}';
+
+	ok to-wire-json(%( properties => %props )).contains(SORTED),
+		'no required member';
+	ok to-wire-json(%( properties => %props, required => 'z' )).contains(SORTED),
+		'required is a string';
+	ok to-wire-json(%( properties => %props, required => %( z => True ) )).contains(SORTED),
+		'required is an object';
+	ok to-wire-json(%( properties => %props, required => Any )).contains(SORTED),
+		'required is null';
+	ok to-wire-json(%( properties => %props, required => [] )).contains(SORTED),
+		'required is empty';
+};
+
+subtest 'unusable required entries are skipped, not fatal' => {
+	plan 2;
+	my $json = to-wire-json(%(
+		properties => %( a => 1, b => 1, c => 1 ),
+		required   => [ 'c', 5, Any, 'nope', 'c', 'a' ],
+	));
+	ok $json.starts-with('{"properties":{"c":1,"a":1,"b":1}'),
+		'non-strings, unknown names and repeats skipped; the rest in order';
+	ok $json.contains('"required":["c",5,null,"nope","c","a"]'),
+		'while the required array itself goes out untouched';
+};
+
+subtest 'required may be any list' => {
+	plan 2;
+	my %props = z => 1, m => 1, a => 1;
+	ok to-wire-json(%( properties => %props, required => <z a> ))
+		.starts-with('{"properties":{"z":1,"a":1,"m":1}'),
+		'a List';
+	ok to-wire-json(%( properties => %props, required => <z a>.map(*.Str) ))
+		.starts-with('{"properties":{"z":1,"a":1,"m":1},"required":["z","a"]'),
+		'a Seq — read for the order and still serialized afterwards';
+};
+
+subtest 'the rule applies at every depth' => {
+	plan 14;
+	is to-wire-json(%(
+		type       => 'object',
+		properties => %( outer => probe(), aa => %( type => 'string' ) ),
+		required   => [ 'outer' ],
+	)), '{"properties":{"outer":' ~ PROBE ~ ',"aa":{"type":"string"}},"required":["outer"],"type":"object"}',
+		'nested object property';
+
+	is to-wire-json(%( items => probe() )), '{"items":' ~ PROBE ~ '}', 'items';
+	is to-wire-json(%( prefixItems => [ probe(), probe() ] )),
+		'{"prefixItems":[' ~ PROBE ~ ',' ~ PROBE ~ ']}', 'prefixItems';
+	is to-wire-json(%( additionalProperties => probe() )),
+		'{"additionalProperties":' ~ PROBE ~ '}', 'additionalProperties';
+	for <anyOf oneOf allOf> -> $kw {
+		is to-wire-json(%( $kw => [ probe(), %( type => 'null' ) ] )),
+			'{"' ~ $kw ~ '":[' ~ PROBE ~ ',{"type":"null"}]}', "$kw branches";
+	}
+	is to-wire-json(%( not => probe() )), '{"not":' ~ PROBE ~ '}', 'not';
+	is to-wire-json(%( if => probe(), then => probe(), else => probe() )),
+		'{"else":' ~ PROBE ~ ',"if":' ~ PROBE ~ ',"then":' ~ PROBE ~ '}', 'if / then / else';
+	is to-wire-json(%( '$defs' => %( b => probe(), a => probe() ) )),
+		'{"$defs":{"a":' ~ PROBE ~ ',"b":' ~ PROBE ~ '}}', '$defs entries (sorted by name)';
+	is to-wire-json(%( definitions => %( one => probe() ) )),
+		'{"definitions":{"one":' ~ PROBE ~ '}}', 'definitions entries';
+	is to-wire-json(%( patternProperties => %( '^x' => probe() ) )),
+		'{"patternProperties":{"^x":' ~ PROBE ~ '}}', 'patternProperties entries';
+	is to-wire-json(%( dependentSchemas => %( m => probe() ) )),
+		'{"dependentSchemas":{"m":' ~ PROBE ~ '}}', 'dependentSchemas entries';
+	is to-wire-json(%( a => [ [ %( deep => [ probe(), ] ), ], ] )),
+		'{"a":[[{"deep":[' ~ PROBE ~ ']}]]}', 'inside arbitrary arrays and objects';
+};
+
+subtest 'names inside property and definition maps are names, not keywords' => {
+	plan 3;
+	is to-wire-json(%(
+		type       => 'object',
+		properties => %(
+			properties => probe(),
+			required   => %( type => 'string' ),
+			enum       => probe(),
+			'$defs'    => probe(),
+		),
+		required   => [ 'required', 'enum' ],
+	)),
+		'{"properties":{"required":{"type":"string"},"enum":' ~ PROBE
+		~ ',"$defs":' ~ PROBE ~ ',"properties":' ~ PROBE
+		~ '},"required":["required","enum"],"type":"object"}',
+		'properties named properties / required / enum / $defs are ordinary properties';
+
+	is to-wire-json(%( '$defs' => %( properties => probe(), enum => probe() ) )),
+		'{"$defs":{"enum":' ~ PROBE ~ ',"properties":' ~ PROBE ~ '}}',
+		'a definition named properties or enum is still a schema';
+
+	is to-wire-json(%( patternProperties => %( const => probe() ) )),
+		'{"patternProperties":{"const":' ~ PROBE ~ '}}',
+		'so is a pattern that happens to spell a data keyword';
+};
+
+subtest 'data keywords hold data, which is never reordered as schema' => {
+	plan 4;
+	is to-wire-json(%( const => probe() )), '{"const":' ~ SORTED-PROBE ~ '}', 'const';
+	is to-wire-json(%( default => probe() )), '{"default":' ~ SORTED-PROBE ~ '}', 'default';
+	is to-wire-json(%( enum => [ probe(), ] )), '{"enum":[' ~ SORTED-PROBE ~ ']}', 'enum';
+	is to-wire-json(%( examples => [ probe(), ] )), '{"examples":[' ~ SORTED-PROBE ~ ']}', 'examples';
+};
+
+subtest 'data members are data at every depth' => {
+	plan 5;
+	my %body =
+		messages => [
+			%(
+				role       => 'assistant',
+				tool_calls => [ %( function => %( arguments => probe() ) ), ],
+			),
+		],
+		tools => [ probe(), ];
+
+	my $json = to-wire-json(%body, :data-members<messages>);
+	ok $json.contains('"arguments":' ~ SORTED-PROBE),
+		'an object inside messages is sorted even when it looks like a schema';
+	ok $json.contains('"tools":[' ~ PROBE ~ ']'),
+		'members not named keep the schema rule';
+	is to-wire-json(%body, :data-members(<messages tools>)),
+		'{"messages":[{"role":"assistant","tool_calls":[{"function":{"arguments":'
+		~ SORTED-PROBE ~ '}}]}],"tools":[' ~ SORTED-PROBE ~ ']}',
+		'a list of names';
+	is to-wire-json(%( schema => %( messages => probe() ) ), :data-members<messages>),
+		'{"schema":{"messages":' ~ PROBE ~ '}}',
+		'only top-level members are data members';
+	is to-wire-json([ probe(), ], :data-members<messages>), '[' ~ PROBE ~ ']',
+		'ignored when the value is not an object';
+};
+
+subtest ':!schema-order sorts everything' => {
+	plan 2;
+	is to-wire-json(probe(), :!schema-order), SORTED-PROBE, 'top level';
+	is to-wire-json(%( items => probe() ), :!schema-order),
+		'{"items":' ~ SORTED-PROBE ~ '}', 'nested';
+};
+
+subtest 'tool definitions' => {
+	plan 1;
+	my @tools = %(
+		type     => 'function',
+		function => %(
+			name        => 'lookup',
+			description => 'Look something up',
+			parameters  => probe(),
+		),
+	),;
+	is to-wire-json(@tools),
+		'[{"function":{"description":"Look something up","name":"lookup","parameters":'
+		~ PROBE ~ '},"type":"function"}]',
+		'function parameters follow required order';
+};
+
+# === The bytes ===
+
+subtest 'non-string scalars are written exactly as JSON::Fast writes them' => {
+	my enum Tone <soft loud>;
+	my @values =
+		0, 42, -7, 2 ** 70, 1.5, 0.1, 1/3, 2.0, FatRat.new(1, 4),
+		1e0, 0.5e0, -2.5e-7, 1e300,
+		True, False,
+		<42>, <1.5>, <1e3>,
+		loud,
+		Date.new(2026, 1, 2),
+		v1.2.3;
+	plan @values.elems;
+	for @values -> $v {
+		is to-wire-json($v), to-json($v, :!pretty), "{$v.^name} {$v.raku}";
+	}
+};
+
+subtest 'undefined values and non-finite numbers are null' => {
+	plan 8;
+	sub failing() { fail 'nope' }
+	is to-wire-json(Any), 'null', 'Any';
+	is to-wire-json(Nil), 'null', 'Nil';
+	is to-wire-json(Str), 'null', 'a Str type object';
+	is to-wire-json(Hash), 'null', 'a Hash type object';
+	is to-wire-json(failing()), 'null', 'a Failure';
+	is to-wire-json(%( content => Any )), '{"content":null}', 'an undefined member';
+	is to-wire-json(NaN), to-json(NaN, :!pretty), 'NaN as JSON::Fast writes it';
+	is to-wire-json(Inf), to-json(Inf, :!pretty), 'Inf as JSON::Fast writes it';
+};
+
+subtest 'containers JSON::Fast accepts serialize the same way' => {
+	plan 4;
+	is to-wire-json((1..3).map(* * 2)), '[2,4,6]', 'a Seq';
+	is to-wire-json(1..3), '[1,2,3]', 'a Range';
+	is to-wire-json((b => 1)), '{"b":1}', 'a Pair';
+	is to-wire-json((1, (2, 3))), '[1,[2,3]]', 'a nested List';
+};
+
+subtest 'strings: the mandatory escapes and nothing else' => {
+	plan 9;
+	is to-wire-json(''), '""', 'empty';
+	is to-wire-json('plain text'), '"plain text"', 'plain';
+	is to-wire-json(Q/say "hi" \ bye \\/), Q/"say \"hi\" \\ bye \\\\"/, 'quote and backslash';
+	is to-wire-json('a/b'), '"a/b"', 'solidus left alone';
+	is to-wire-json("l1\nl2\r\n\tx"), Q/"l1\nl2\r\n\tx"/, 'newline, carriage return, tab';
+	is to-wire-json("\x[0]\x[1]\x[8]\x[c]\x[1b]\x[1f]"),
+		Q/"\u0000\u0001\u0008\u000c\u001b\u001f"/,
+		'other control characters as lowercase \u00XX';
+	is to-wire-json("\x[7f]é✓日本語🎲\x[2028]"), "\"\x[7f]é✓日本語🎲\x[2028]\"",
+		'DEL, non-ASCII and astral characters written as themselves';
+	is to-wire-json(%( "a\"b" => 1, "\n" => 2 )), Q/{"\n":2,"a\"b":1}/,
+		'names are escaped the same way';
+	is to-wire-json("\x[301]leading mark"), "\"\x[301]leading mark\"",
+		'a string may start with a combining mark';
+};
+
+subtest 'a combining mark after an escape cannot corrupt it' => {
+	# `\n` followed by U+0301 normalizes to `\ń` — an invalid escape —
+	# as soon as the text is treated as text. The mark is escaped
+	# instead, so the JSON stays valid however the Str is handled.
+	my @cases =
+		"\n\x[301]x"              => Q/"\n\u0301x"/,
+		"\t\x[316]\x[301]y"       => Q/"\t\u0316\u0301y"/,
+		"\r\x[30C]"               => Q/"\r\u030c"/,
+		"\x[1]\x[301]"            => Q/"\u0001\u0301"/,
+		"q\"\x[301]"              => Q/"q\"\u0301"/,
+		"b\\\x[301]"              => Q/"b\\\u0301"/,
+		"\n\x[1D165]z"            => Q/"\n\ud834\udd65z"/,
+		"x\x[316]\x[301]\n"       => "\"x\x[316]\x[301]\\n\"";
+	plan @cases.elems * 3;
+	for @cases -> (:key($in), :value($want)) {
+		my $json = to-wire-json($in);
+		is $json, $want, "{$in.NFC.list.fmt('%04x', ' ')} escaped as expected";
+		ok valid-escapes($json.encode('utf-8')), '... encodes to valid escapes';
+		is from-json($json), $in, '... and parses back to the original';
+	}
+};
+
+subtest 'parses to the same data JSON::Fast produced' => {
+	plan 1;
+	my %body =
+		model             => 'test/model',
+		max_tokens        => 4096,
+		temperature       => 0.7e0,
+		top_k             => 200,
+		stop              => [ "\n\nUser:", '</s>' ],
+		stream            => True,
+		messages          => [
+			%( role => 'system', content => "Rules:\n1. \"Quote\" \\ it\n\ttabbed" ),
+			%( role => 'user',   content => "café ✓ 日本語 — “quoted” 🎲" ),
+			%(
+				role       => 'assistant',
+				content    => Any,
+				tool_calls => [
+					%(
+						id       => 'c1',
+						type     => 'function',
+						function => %( name => 'lookup', arguments => '{"q":"x"}' ),
+					),
+				],
+			),
+			%( role => 'tool', tool_call_id => 'c1', content => 'result' ),
+		],
+		tools             => [
+			%(
+				type     => 'function',
+				function => %( name => 'lookup', parameters => probe() ),
+			),
+		],
+		response_format   => %(
+			type        => 'json_schema',
+			json_schema => %( name => 'response', strict => False, schema => probe() ),
+		),
+		repetition_penalty => 1.1e0;
+
+	is-deeply from-json(to-wire-json(%body, :data-members<messages>)),
+		from-json(to-json(%body, :!pretty)),
+		'only member order differs';
+};
+
+subtest 'the same data built in any order serializes to the same bytes' => {
+	plan 2;
+	my @keys = ('k00' .. 'k29');
+	sub build(@order --> Hash:D) {
+		my %props;
+		%props{$_} = %( type => 'string', title => $_ ) for @order;
+		my %schema;
+		%schema<type>       = 'object';
+		%schema<properties> = %props;
+		%schema<required>   = [ 'k17', 'k03', 'k29' ];
+		my %body;
+		%body{$_} = $_.substr(1).Int for @order;
+		%body<schema> = %schema;
+		%body;
+	}
+	my $reference = to-wire-json(build(@keys));
+	my @outputs = (^20).map({ to-wire-json(build(@keys.pick(*))) });
+	is @outputs.unique.elems, 1, 'twenty insertion orders, one output';
+	is @outputs[0], $reference, 'identical to the one built in key order';
+};
+
+subtest 'the same data serializes to the same bytes in every process' => {
+	plan 2;
+	# The include paths this process was given, so each child resolves
+	# LLM::Chat exactly as the parent did.
+	my @inc = $*REPO.repo-chain
+		.grep(CompUnit::Repository::FileSystem)
+		.map({ '-I' ~ .prefix.absolute });
+
+	# Every child builds its hashes in its own random insertion order,
+	# under its own hash seed, and meets the two synthetic-grapheme
+	# names in the opposite order to the parent.
+	my constant CHILD = q:to/RAKU/;
+        use LLM::Chat::WireJSON;
+        my @keys = ('k00' .. 'k19').pick(*);
+        my %props;
+        %props{$_} = %( type => 'string', title => $_ ) for @keys;
+        my %names;
+        %names{"a\x[301]\x[302]\x[303]"} = 1;
+        %names{"a\x[303]\x[301]"} = 2;
+        my %body =
+            messages => [ %( role => 'user', content => "hi\n\x[301]✓", z => 1, a => 2 ), ],
+            schema   => %( type => 'object', properties => %props, required => [ 'k07', 'k01' ] ),
+            names    => %names;
+        print to-wire-json(%body, :data-members<messages>).encode('utf-8').list.fmt('%02x', '');
+        RAKU
+
+	my @keys = ('k00' .. 'k19');
+	my %props;
+	%props{$_} = %( type => 'string', title => $_ ) for @keys.reverse;
+	my %names;
+	%names{"a\x[303]\x[301]"} = 2;
+	%names{"a\x[301]\x[302]\x[303]"} = 1;
+	my %body =
+		messages => [ %( role => 'user', content => "hi\n\x[301]✓", z => 1, a => 2 ), ],
+		schema   => %( type => 'object', properties => %props, required => [ 'k07', 'k01' ] ),
+		names    => %names;
+	my $ours = to-wire-json(%body, :data-members<messages>).encode('utf-8').list.fmt('%02x', '');
+
+	my @theirs = (^3).map({
+		my $proc = run $*EXECUTABLE, |@inc, '-e', CHILD, :out, :err;
+		my $out  = $proc.out.slurp(:close);
+		my $err  = $proc.err.slurp(:close);
+		diag $err if $err.chars;
+		$proc.exitcode == 0 && !$proc.signal ?? $out !! "child failed: {$proc.exitcode}/{$proc.signal}";
+	});
+	is @theirs.unique.elems, 1, 'three fresh processes wrote identical bytes';
+	is @theirs[0], $ours, 'and the same bytes as this process';
+};
+
+# How much CPU time the serializer spends on one large body grows
+# linearly with the body. CPU time, not wall-clock time: on a busy
+# machine the wall clock also counts the time this process spent
+# waiting for a core, which has nothing to do with the code. Telemetry's
+# `cpu` is the process's user + system time, in microseconds.
+sub cpu-seconds(&work --> Real:D) {
+	my $before = T;
+	work();
+	my $after = T;
+	($after - $before)<cpu> / 1_000_000;
+}
+
+subtest 'large bodies cost linear time' => {
+	plan 3;
+	# A transcript dense with characters that need escaping — quotes,
+	# tabs, newlines — which is the case a splice-based escaper turns
+	# quadratic (JSON::Fast's own to-json is one: twice the input, four
+	# times the time). Eight times the input must cost about eight times
+	# the CPU time; quadratic would be sixty-four.
+	#
+	# The bound, from measurement: linear came out at 7.5x-8.6x on an
+	# idle machine and 6.8x-12.7x with twice as many busy processes as
+	# cores; this serializer with JSON::Fast's escaper swapped in came out
+	# at 61x-62x. 24 is three times linear and under half of quadratic. A
+	# round measures each size twice and keeps the lower CPU time; the
+	# subtest fails only when all three rounds are over the bound, so one
+	# round spoilt by a collection or a burst of compilation decides
+	# nothing.
+	my constant STEP   = 8;
+	my constant BOUND  = 24;
+	my constant ROUNDS = 3;
+
+	sub body-of(Int:D $lines --> Hash:D) {
+		%(
+			model    => 'm',
+			messages => [ %( role => 'user', content => "say \"hi\"\tthere, café ✓\n" x $lines ), ],
+		);
+	}
+	sub best-cpu(%body --> Real:D) {
+		(^2).map({ cpu-seconds({ to-wire-json(%body, :data-members<messages>) }) }).min;
+	}
+
+	my %small = body-of(6_000);           # ~140 KB
+	my %large = body-of(6_000 * STEP);    # ~1.1 MB
+	to-wire-json(%small, :data-members<messages>);   # warm up
+
+	my @rounds = (^ROUNDS).map({
+		my $small = best-cpu(%small);
+		my $large = best-cpu(%large);
+		%( :$small, :$large, ratio => $large / max($small, 1e-6) );
+	});
+	my $report = @rounds.map({
+		"{.<ratio>.fmt('%.1f')}x ({.<small>.fmt('%.3f')}s -> {.<large>.fmt('%.3f')}s)"
+	}).join(', ');
+	ok @rounds.first(*<ratio> < BOUND).defined,
+		"{STEP}x the input cost under {BOUND}x the CPU time in at least one of {ROUNDS} rounds: $report";
+
+	my $json = to-wire-json(%large, :data-members<messages>);
+	cmp-ok $json.encode('utf-8').bytes, '>', 1_000_000, 'the large body really is a megabyte';
+	is from-json($json)<messages>[0]<content>, %large<messages>[0]<content>,
+		'and survives the round trip intact';
+};
+
+done-testing;

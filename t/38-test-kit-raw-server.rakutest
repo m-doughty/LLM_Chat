@@ -1,0 +1,262 @@
+use Test;
+use lib 'lib';
+
+use Cro::HTTP::Client;
+
+use LLM::Chat::Test::Kit;
+
+# LLM::Chat::Test::Kit's raw-server: the fixture every HTTP-level test
+# uses, in place of Cro's server, which can lose the end of a response
+# on its Connection: close path when the machine is busy. Its own
+# behaviour is pinned here, against Cro's client, since every other
+# HTTP-level test leans on it.
+
+plan 11;
+
+my constant LIMIT = 10;
+
+# Poll &cond until it holds or LIMIT seconds pass; whether it held.
+sub eventually(&cond --> Bool:D) {
+	my $deadline = now + LIMIT;
+	until cond() {
+		return False if now > $deadline;
+		sleep 0.005;
+	}
+	True;
+}
+
+sub client(Bool :$persistent = False) {
+	Cro::HTTP::Client.new(:$persistent, :http<1.1>);
+}
+
+# Every emission of a response's body, decoded.
+sub emissions($response --> List:D) {
+	my @seen;
+	react {
+		whenever $response.body-byte-stream -> $blob { @seen.push($blob.decode('utf-8')) }
+	}
+	@seen.grep(*.chars).List;
+}
+
+# The status a request was answered with, whether or not Cro called it an error.
+sub status-of(Promise:D $request --> Int:D) {
+	await Promise.anyof($request, Promise.in(LIMIT));
+	given $request.status {
+		when Kept   { $request.result.status }
+		when Broken { (try $request.cause.response.status) // -1 }
+		default     { -2 }
+	}
+}
+
+subtest 'a body is sent whole, with its Content-Length and type as given' => {
+	plan 6;
+	my $server = raw-server(-> $request {
+		$request.path eq '/typed'
+			?? %( status => 201, type => 'application/json', body => '{"café":"✓"}' )
+			!! %( type => Str, body => Blob.new(1, 2, 3) );
+	});
+	LEAVE $server.stop;
+
+	my $typed = await client.get($server.url ~ '/typed');
+	is $typed.status, 201, 'the status';
+	is $typed.header('content-type'), 'application/json', 'the type, without a charset added';
+	is $typed.header('content-length'), '{"café":"✓"}'.encode('utf-8').bytes, 'the length in bytes';
+	is (await $typed.body-blob).decode('utf-8'), '{"café":"✓"}', 'the body, as UTF-8';
+
+	my $untyped = await client.get($server.url ~ '/untyped');
+	nok $untyped.has-header('content-type'), 'an undefined type sends no Content-Type';
+	is-deeply (await $untyped.body-blob).list, (1, 2, 3), 'a Blob body is sent as is';
+};
+
+subtest 'a list of chunks arrives one HTTP chunk at a time' => {
+	plan 3;
+	my $server = raw-server(-> $ {
+		%( type => 'text/event-stream', chunks => ['data: a', Blob.new(|'b'.encode), '', 'c'] );
+	});
+	LEAVE $server.stop;
+
+	my $response = await client.get($server.url);
+	is $response.header('transfer-encoding'), 'chunked', 'sent chunked';
+	is-deeply emissions($response), ('data: a', 'b', 'c'),
+		'each piece is its own emission; an empty piece is skipped';
+	is $server.errors.elems, 0, 'and the server saw nothing wrong';
+};
+
+subtest 'a Supply of chunks is followed until it is done' => {
+	plan 2;
+	my $server = raw-server(-> $ {
+		%( type => 'text/event-stream', chunks => supply {
+			emit 'one';
+			whenever Promise.in(0.05) { emit 'two'; done }
+		} );
+	});
+	LEAVE $server.stop;
+
+	my $response = await client.get($server.url);
+	is-deeply emissions($response), ('one', 'two'), 'every emission, in order';
+	ok eventually({ $server.open-connections == 0 }), 'and the connection closed after it';
+};
+
+subtest 'a client hang-up closes the chunks tap, so its CLOSE phaser runs' => {
+	plan 3;
+	my $closed = Promise.new;
+	my $server = raw-server(-> $ {
+		%( type => 'text/event-stream', chunks => supply {
+			whenever Supply.interval(0.01) -> $n { emit "tick $n\n" }
+			CLOSE { $closed.keep(True) unless $closed.status }
+		} );
+	});
+	LEAVE $server.stop;
+
+	my $response = await client.get($server.url);
+	my $first = Promise.new;
+	my $tap = $response.body-byte-stream.tap(
+		-> $ { $first.keep(True) unless $first.status },
+		quit => -> $ { },
+	);
+	await Promise.anyof($first, Promise.in(LIMIT));
+	ok $first.status ~~ Kept, 'the stream was flowing';
+	$response.cancel;
+	await Promise.anyof($closed, Promise.in(LIMIT));
+	ok $closed.status ~~ Kept, "the server saw the hang-up: the Supply's CLOSE ran";
+	ok eventually({ $server.open-connections == 0 }), 'and the connection is gone';
+	$tap.close;
+};
+
+subtest 'Connection: close is honoured; otherwise the connection is kept' => {
+	plan 6;
+	my $server = raw-server(-> $ { 'ok' });
+	LEAVE $server.stop;
+
+	my $once = await client.get($server.url);
+	await $once.body-blob;
+	is $once.header('connection'), 'close', 'a non-persistent client is told the connection closes';
+	ok eventually({ $server.open-connections == 0 }), 'and it does';
+
+	my $reusing = client(:persistent);
+	for ^2 {
+		my $response = await $reusing.get($server.url);
+		await $response.body-blob;
+	}
+	is $server.requests.elems, 3, 'three requests';
+	is $server.accepted, 2, 'over two connections: the persistent client reused its own';
+	ok eventually({ $server.open-connections == 1 }), 'which stays open';
+	nok $server.requests[*-1].wants-close, 'because it never asked to close';
+};
+
+subtest 'requests are parsed: method, path, query, headers, body' => {
+	plan 8;
+	my $server = raw-server(-> $ { %( status => 204 ) });
+	LEAVE $server.stop;
+
+	await client.post($server.url ~ '/v1/chat/completions?x=1&y=2',
+		headers      => [ X-Trace => 'abc' ],
+		content-type => 'application/json',
+		body         => '{"stream":true}'.encode('utf-8'));
+	my $request = $server.requests[0];
+	is $request.method, 'POST', 'method';
+	is $request.path, '/v1/chat/completions', 'path, without the query';
+	is $request.query, 'x=1&y=2', 'query';
+	is $request.header('X-TRACE'), 'abc', 'headers by name, in any case';
+	is $request.headers<content-type>, 'application/json', 'and in .headers, lower-cased';
+	is $request.json<stream>, True, 'a Content-Length body, as JSON';
+
+	# Cro's client only sends a chunked body it is handed as a Supply of
+	# a type it can serialize, so this one goes over a socket by hand.
+	my $socket = await IO::Socket::Async.connect('127.0.0.1', $server.port);
+	my $answered = Promise.new;
+	$socket.Supply(:bin).tap(
+		-> $ { $answered.keep(True) unless $answered.status },
+		quit => -> $ { },
+	);
+	await $socket.write(("POST /chunked HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+		~ "Connection: close\r\n\r\n3\r\nhel\r\n2;ext=1\r\nlo\r\n0\r\n\r\n").encode('latin-1'));
+	await Promise.anyof($answered, Promise.in(LIMIT));
+	$socket.close;
+	my $chunked = $server.requests[1];
+	is $chunked.header('transfer-encoding'), 'chunked', 'the client sent the body chunked';
+	is $chunked.text, 'hello', 'and it was reassembled';
+};
+
+subtest 'delay: seconds, or a Promise, before the headers' => {
+	plan 3;
+	my $release = Promise.new;
+	my $server = raw-server(-> $request {
+		$request.path eq '/seconds'
+			?? %( delay => 0.3, body => 'late' )
+			!! %( delay => $release, body => 'released' );
+	});
+	LEAVE $server.stop;
+
+	my $t0 = now;
+	await (await client.get($server.url ~ '/seconds')).body-blob;
+	ok now - $t0 >= 0.3, 'a numeric delay holds the headers back';
+
+	my $held = client.get($server.url ~ '/promise');
+	await Promise.anyof($held, Promise.in(0.3));
+	is $held.status, Planned, 'a Promise holds them until it is kept';
+	$release.keep(True);
+	is (await (await $held).body-blob).decode, 'released', 'then the answer goes out';
+};
+
+subtest 'a bare Str or Blob is a body' => {
+	plan 2;
+	my $server = raw-server(-> $request { $request.path eq '/str' ?? '{"a":1}' !! Blob.new(7) });
+	LEAVE $server.stop;
+
+	my $str = await client.get($server.url ~ '/str');
+	is (await $str.body-blob).decode, '{"a":1}', 'a Str';
+	is-deeply (await (await client.get($server.url ~ '/blob')).body-blob).list, (7,), 'a Blob';
+};
+
+subtest 'an unusable answer is a 500 and an error, never a hang' => {
+	my %bad =
+		'/unknown-key' => %( bogus => 1 ),
+		'/both'        => %( body => 'a', chunks => ['b'] ),
+		'/status'      => %( status => 99 ),
+		'/headers'     => %( headers => 'X-A: b' ),
+		'/chunks'      => %( chunks => 'not a list' ),
+		'/delay'       => %( delay => -1 ),
+		'/not-a-hash'  => 42;
+	plan 2 * %bad + 2;
+	my $server = raw-server(-> $request {
+		die 'the responder broke' if $request.path eq '/dies';
+		%bad{$request.path};
+	});
+	LEAVE $server.stop;
+
+	for %bad.keys.sort -> $path {
+		is status-of(client.get($server.url ~ $path)), 500, "$path is answered with a 500";
+		ok $server.errors.first(*.contains($path)).defined, "and recorded as an error";
+	}
+	is status-of(client.get($server.url ~ '/dies')), 500, 'a responder that dies is a 500 too';
+	ok $server.errors.first(*.contains('the responder broke')).defined, 'with its message recorded';
+};
+
+subtest 'chunks that quit end the connection and are recorded' => {
+	plan 2;
+	my $server = raw-server(-> $ {
+		%( type => 'text/event-stream', chunks => supply { emit 'partial'; die 'the stream broke' } );
+	});
+	LEAVE $server.stop;
+
+	my $response = await client.get($server.url);
+	my $body = $response.body-blob;
+	await Promise.anyof($body, Promise.in(LIMIT));
+	ok eventually({ $server.open-connections == 0 }), 'the connection is closed';
+	ok $server.errors.first(*.contains('the stream broke')).defined, 'and the failure recorded';
+};
+
+subtest 'stop closes the listener and every open connection' => {
+	plan 2;
+	my $server = raw-server(-> $ { 'ok' });
+	my $persistent = client(:persistent);
+	await (await $persistent.get($server.url)).body-blob;
+	$server.stop;
+	ok eventually({ $server.open-connections == 0 }), 'open connections are closed';
+	my $refused = client.get($server.url);
+	await Promise.anyof($refused, Promise.in(LIMIT));
+	is $refused.status, Broken, 'and nothing is listening';
+};
+
+done-testing;

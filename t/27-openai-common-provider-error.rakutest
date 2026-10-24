@@ -1,0 +1,264 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Test::Kit;
+use LLM::Chat::Backend::OpenAICommon;
+use LLM::Chat::Backend::Settings;
+use LLM::Chat::Conversation::Message;
+
+use Cro::HTTP::Client;
+use Cro::HTTP::Response;
+use JSON::Fast;
+
+plan 9;
+
+constant PROVIDER-MESSAGE = 'System message must be at the beginning.';
+constant HUGE-TEXT = 'x' ~ ('é' x 9000);
+constant MERGED = "prefix one\n\n---\n\ntrailing context\n\n---\n\nsystem after tool";
+
+sub json-blob(%payload --> Blob) {
+	to-json(%payload, :!pretty).encode('utf-8');
+}
+
+sub sse-ok(--> Blob) {
+	(q:to/SSE/).encode('utf-8');
+data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+SSE
+}
+
+my $requests = Channel.new;
+
+# LLM::Chat::Test::Kit's raw server: the provider-error captures read
+# whole error bodies, so the assertions rest on every response arriving
+# complete.
+my $server = raw-server(-> $request {
+	given $request.method, $request.path {
+		when ('POST', '/json500/chat/completions') {
+			%( status => 500, body => json-blob({
+				error => {
+					message => PROVIDER-MESSAGE,
+					type => 'invalid_request_error',
+					code => 500,
+				},
+			}) );
+		}
+		when ('POST', '/json400/chat/completions') {
+			%( status => 400, body => json-blob({
+				error => {
+					message => 'bad request body',
+					type => 'invalid_request_error',
+					code => 'bad_request',
+				},
+			}) );
+		}
+		when ('POST', '/text500/chat/completions') {
+			%( status => 500, type => 'text/plain', body => 'plain provider failure' );
+		}
+		when ('POST', '/huge500/chat/completions') {
+			%( status => 500, type => 'text/plain', body => HUGE-TEXT );
+		}
+		when ('POST', '/empty500/chat/completions') {
+			%( status => 500, type => 'text/plain', body => '' );
+		}
+		when ('POST', '/hook/chat/completions') {
+			my %body = $request.json.Hash;
+			$requests.send(%body<messages>);
+			%body<stream>
+				?? %( type => 'text/event-stream', body => sse-ok() )
+				!! %( body => json-blob({
+					choices => [ { message => { content => 'ok' }, finish_reason => 'stop' }, ],
+				}) );
+		}
+		default {
+			%( status => 404, body => '' );
+		}
+	}
+});
+LEAVE { $server.stop }
+
+class BrokenBodyResponse is Cro::HTTP::Response {
+	method body-byte-stream(--> Supply) {
+		supply {
+			emit '{"error":'.encode('utf-8');
+			die 'fixture body broke';
+		}
+	}
+}
+
+class FixtureHTTPError is X::Cro::HTTP::Error::Server {
+	method message(--> Str) { '500 Internal Server Error (fixture POST)' }
+}
+
+class BrokenBodyBackend is LLM::Chat::Backend::OpenAICommon {
+	method _finalize-request-body(%settings --> Hash) {
+		FixtureHTTPError.new(response => BrokenBodyResponse.new(status => 500)).throw;
+	}
+}
+
+sub make-backend(Str:D $prefix, Str :$system-message-mode = 'preserve') {
+	LLM::Chat::Backend::OpenAICommon.new(
+		api_url => "{$server.url}/$prefix",
+		api_key => 'test-key-that-must-not-appear-in-provider-error',
+		model => 'test/model',
+		settings => LLM::Chat::Backend::Settings.new,
+		:$system-message-mode,
+	);
+}
+
+sub user-turn(--> Array:D) {
+	[ LLM::Chat::Conversation::Message.new(role => 'user', content => 'hello') ]
+}
+
+sub provider-response(Str:D $prefix) {
+	settled(make-backend($prefix).chat-completion(user-turn), "$prefix chat-completion");
+}
+
+sub posted-messages(Str:D $what --> Array:D) {
+	my $received = start { $requests.receive };
+	timed($received, $what);
+	$received.result.Array;
+}
+
+subtest 'HTTP 500 JSON provider error is retained and augments safe error text' => {
+	plan 8;
+	my $response = provider-response('json500');
+	my %error = $response.provider-error;
+
+	ok $response.is-done, 'response settled';
+	nok $response.is-success, 'response failed';
+	is $response.error-class, 'http', 'classified as HTTP';
+	is $response.error-status, 500, 'status preserved';
+	is %error<error_message>, PROVIDER-MESSAGE, 'provider message preserved';
+	is %error<error_type>, 'invalid_request_error', 'provider type preserved';
+	is %error<error_code>, '500', 'numeric provider code preserved safely';
+	ok (~$response.err).contains(PROVIDER-MESSAGE), 'safe response error includes provider message';
+}
+
+subtest 'HTTP 400 JSON provider error is retained through the same path' => {
+	plan 4;
+	my $response = provider-response('json400');
+	my %error = $response.provider-error;
+
+	is $response.error-status, 400, 'status preserved';
+	is %error<error_message>, 'bad request body', 'message preserved';
+	is %error<error_code>, 'bad_request', 'code preserved';
+	ok (~$response.err).contains('bad request body'), 'response error includes provider message';
+}
+
+subtest 'non-JSON error body is bounded text evidence without invented OAI fields' => {
+	plan 5;
+	my $response = provider-response('text500');
+	my %error = $response.provider-error;
+
+	is $response.error-status, 500, 'status preserved';
+	is %error<body_text>, 'plain provider failure', 'text body preserved';
+	ok %error<body_available>, 'body marked available';
+	nok (%error<error_message>:exists), 'no error.message invented';
+	ok (~$response.err).contains('plain provider failure'), 'bounded non-JSON body excerpt is appended to the error text';
+}
+
+subtest 'oversized UTF-8 error body is captured by byte prefix only' => {
+	plan 7;
+	my $response = provider-response('huge500');
+	my %error = $response.provider-error;
+
+	is $response.error-status, 500, 'status preserved';
+	ok %error<body_truncated>, 'body marked truncated';
+	ok %error<body_bytes> > 16 * 1024, 'actual size records over-limit body';
+	ok %error<retained_bytes> <= 16 * 1024, 'retained bytes are bounded';
+	ok %error<body_text>.encode('utf-8').bytes <= 16 * 1024, 'decoded text stays under byte cap';
+	is %error<decode_error>, 'utf8-prefix-truncated', 'split UTF-8 sequence is identified';
+	ok %error<body_text>.ends-with('�'), 'split UTF-8 is represented explicitly';
+}
+
+subtest 'absent and broken bodies do not mask the primary HTTP failure' => {
+	plan 8;
+	my $empty = provider-response('empty500');
+	my %empty = $empty.provider-error;
+	is $empty.error-class, 'http', 'empty body still classified';
+	is $empty.error-status, 500, 'empty body status preserved';
+	nok %empty<body_available>, 'empty body marked unavailable';
+	ok (~$empty.err).contains('500 Internal Server Error'), 'primary HTTP exception remains visible';
+
+	my $broken = settled(BrokenBodyBackend.new(
+		api_url => 'http://127.0.0.1/unused',
+		settings => LLM::Chat::Backend::Settings.new,
+	).chat-completion(user-turn), 'broken body capture');
+	my %broken = $broken.provider-error;
+	is $broken.error-class, 'http', 'broken body still classified';
+	is $broken.error-status, 500, 'broken body status preserved';
+	is %broken<capture_error>, 'body-capture-failed', 'capture failure is bounded metadata';
+	ok (~$broken.err).contains('500 Internal Server Error'), 'primary HTTP exception remains visible after capture failure';
+}
+
+subtest 'streamed requests preserve provider failure details too' => {
+	plan 3;
+	my $response = stream-settled(make-backend('json500').chat-completion-stream(user-turn),
+		'stream HTTP 500');
+	is $response.error-status, 500, 'stream request preserves HTTP status';
+	is $response.provider-error<error_message>, PROVIDER-MESSAGE,
+		'stream request captures provider message';
+	ok (~$response.err).contains(PROVIDER-MESSAGE), 'stream error is actionable';
+}
+
+subtest 'provider-error accessor returns detached bounded data' => {
+	plan 4;
+	my $response = provider-response('json500');
+	my %first = $response.provider-error;
+	%first<error_message> = 'mutated';
+	my %second = $response.provider-error;
+
+	is %second<error_message>, PROVIDER-MESSAGE, 'caller mutation did not reach response';
+	is %second.keys.grep(* eq 'Authorization').elems, 0, 'no auth header key appears';
+	is %second.keys.grep(* eq 'headers').elems, 0, 'no headers object appears';
+	is %second.keys.grep(* eq 'request').elems, 0, 'no request payload appears';
+}
+
+subtest 'system-message-mode leading exposes exact pure wire hashes' => {
+	plan 8;
+	my @messages = (
+		LLM::Chat::Conversation::Message.new(role => 'system', content => 'prefix one'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'hello'),
+		LLM::Chat::Conversation::Message.new(role => 'tool', content => 'tool result', tool-call-id => 'call-1'),
+		LLM::Chat::Conversation::Message.new(role => 'system', content => 'trailing context'),
+		LLM::Chat::Conversation::Message.new(role => 'assistant', content => '', tool-calls => [
+			{ id => 'call-2', type => 'function', function => { name => 'memory_search', arguments => '{}' } },
+		]),
+		LLM::Chat::Conversation::Message.new(role => 'system', content => 'system after tool'),
+	);
+
+	my $preserve = make-backend('hook').wire-message-hashes(@messages);
+	is $preserve.map(*<role>).join(','), 'system,user,tool,system,assistant,system', 'preserve mode leaves roles in place';
+
+	my $leading = make-backend('hook', system-message-mode => 'leading').wire-message-hashes(@messages);
+	is $leading.elems, 4, 'all system messages merged into one';
+	is $leading[0]<role>, 'system', 'merged message is first';
+	is $leading[0]<content>, MERGED, 'system contents merged in original order with stable delimiter';
+	is $leading.map(*<role>).join(','), 'system,user,tool,assistant', 'non-system order preserved';
+	is $leading[2]<tool_call_id>, 'call-1', 'tool message call id preserved';
+	is $leading[3]<tool_calls>[0]<function><name>, 'memory_search', 'assistant tool_calls preserved';
+	is @messages.map(*.role).join(','), 'system,user,tool,system,assistant,system', 'caller messages unchanged';
+}
+
+subtest 'system-message-mode leading applies to both blocking and streaming chat requests' => {
+	plan 4;
+	my @messages = (
+		LLM::Chat::Conversation::Message.new(role => 'system', content => 'prefix one'),
+		LLM::Chat::Conversation::Message.new(role => 'user', content => 'hello'),
+		LLM::Chat::Conversation::Message.new(role => 'system', content => 'trailing context'),
+	);
+	my $backend = make-backend('hook', system-message-mode => 'leading');
+
+	settled($backend.chat-completion(@messages), 'hook blocking completion');
+	my @blocking = posted-messages('blocking request body');
+	is @blocking.map(*<role>).join(','), 'system,user', 'blocking request has one leading system';
+	is @blocking[0]<content>, "prefix one\n\n---\n\ntrailing context", 'blocking merged content exact';
+
+	stream-settled($backend.chat-completion-stream(@messages), 'hook streaming completion');
+	my @streaming = posted-messages('streaming request body');
+	is @streaming.map(*<role>).join(','), 'system,user', 'streaming request has one leading system';
+	is @streaming[0]<content>, "prefix one\n\n---\n\ntrailing context", 'streaming merged content exact';
+}

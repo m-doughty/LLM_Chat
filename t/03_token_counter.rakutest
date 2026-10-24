@@ -19,9 +19,9 @@ my $message = LLM::Chat::Conversation::Message.new(:role<system>, :content('This
 is $token-counter.get-message-count($message), 20, 'Correct token count for message';
 
 my @messages = (
-    LLM::Chat::Conversation::Message.new(:role<system>,    :content('Be helpful.'),            :sysprompt(True)),
-    LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
-    LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi! How can I help you?'))
+	LLM::Chat::Conversation::Message.new(:role<system>,    :content('Be helpful.'),            :sysprompt(True)),
+	LLM::Chat::Conversation::Message.new(:role<user>,      :content('Hello?')),
+	LLM::Chat::Conversation::Message.new(:role<assistant>, :content('Hi! How can I help you?'))
 );
 is $token-counter.get-conversation-count(@messages), 31, 'Correct token count for conversation';
 
