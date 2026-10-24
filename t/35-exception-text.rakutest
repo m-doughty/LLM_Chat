@@ -8,7 +8,8 @@ use LLM::Chat::ExceptionText;
 # Exceptions without a message.
 #
 # Rakudo's base Exception.message is a stub (`...`): an exception class
-# that defines no message hands back a Failure of X::StubCode, which
+# that defines no message hands back a Failure ("Stub code executed";
+# an X::StubCode from Rakudo 2026.08 on, an X::AdHoc before), which
 # throws the moment it is used as text. Cro::HTTP::Client raises exactly
 # such a class, Cro::HTTP::Client::PipelineClosedBeforeHeaders, whenever
 # a server closes the connection before sending response headers. Every
@@ -126,13 +127,19 @@ my @messageless =
 
 # --- exception-message / exception-text -------------------------------
 
+# The stub's exception class depends on the Rakudo: X::StubCode from
+# 2026.08 on, X::AdHoc before. Its message is the same on both, and so
+# is what matters here: an undefined Failure that throws when used.
 subtest 'the premise: a messageless exception has a booby-trapped .message' => {
-	plan 3;
+	plan 5;
 	my $message := X::ExceptionTextTest::Quiet.new.message;
 	isa-ok $message, Failure, 'the base Exception.message stub returns a Failure';
-	is $message.exception.^name, 'X::StubCode', '... of X::StubCode';
-	$message.so;
-	throws-like { my $text = "{X::ExceptionTextTest::Quiet.new.message}" }, X::StubCode,
+	ok $message.exception ~~ X::StubCode | X::AdHoc,
+		"... of X::StubCode or, before Rakudo 2026.08, X::AdHoc ({$message.exception.^name})";
+	is $message.exception.message, 'Stub code executed', '... saying "Stub code executed"';
+	nok $message.defined, 'an undefined value, as any Failure is';
+	throws-like { my $text = "{X::ExceptionTextTest::Quiet.new.message}" }, Exception,
+		message => 'Stub code executed',
 		'which throws as soon as it is interpolated, as the handlers did';
 };
 

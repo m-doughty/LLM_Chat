@@ -1,0 +1,60 @@
+use Test;
+use lib 'lib';
+
+use LLM::Chat::Backend::Response;
+
+# A Response is settled on one thread and read on another.
+#
+# The backend's worker emits the reply and then calls .done (or .quit);
+# the consumer, on its own thread, polls .is-done and then reads
+# .is-success, .msg, .is-cancelled and .err. .is-done used to turn True
+# one assignment before .is-success did, so a poll that landed in
+# between saw a finished Response that had not succeeded — a completed
+# generation reported as a failure. It took a loaded CI runner to hit it
+# in the suite; a tight loop finds it in a few tens of thousands of
+# Responses. The terminal state is now published all at once: once
+# .is-done is True, everything set before it is visible.
+#
+# A race cannot be pinned deterministically; this file makes it as
+# likely as a loop can (the reader spins on .is-done with nothing in
+# between), so a regression is caught on most runs, and a correct
+# Response can never fail it.
+
+plan 2;
+
+my constant ROUNDS = 40_000;
+
+subtest 'a Response seen done after .done has succeeded' => {
+	plan 2;
+	my Int $early-success = 0;
+	my Int $early-msg = 0;
+	for ^ROUNDS {
+		my $response = LLM::Chat::Backend::Response.new(id => 'done-race');
+		start {
+			$response.emit('hello');
+			$response.done;
+		};
+		until $response.is-done { }
+		$early-success++ unless $response.is-success;
+		$early-msg++ unless $response.msg eq 'hello';
+	}
+	is $early-success, 0, "never done without success, in {ROUNDS} Responses";
+	is $early-msg, 0, 'never done without its message';
+};
+
+subtest 'a Response seen done after .quit is cancelled and carries its error' => {
+	plan 2;
+	my Int $early-cancelled = 0;
+	my Int $early-err = 0;
+	for ^ROUNDS {
+		my $response = LLM::Chat::Backend::Response.new(id => 'quit-race');
+		start { $response.quit('boom') };
+		until $response.is-done { }
+		$early-cancelled++ unless $response.is-cancelled;
+		$early-err++ unless $response.err.defined;
+	}
+	is $early-cancelled, 0, "never done without is-cancelled, in {ROUNDS} Responses";
+	is $early-err, 0, 'never done without its error';
+};
+
+done-testing;

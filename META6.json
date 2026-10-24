@@ -63,5 +63,5 @@
   "test-depends": [
     "Cro::HTTP::Response:ver<0.8.11+>:auth<zef:cro>"
   ],
-  "version": "0.10.1"
+  "version": "0.10.2"
 }

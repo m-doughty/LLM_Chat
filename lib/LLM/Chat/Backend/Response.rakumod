@@ -115,6 +115,16 @@ has Lock     $!abort-lock = Lock.new;
 has          $!abort;
 has Bool     $!cancel-requested = False;
 
+# Publishes the terminal state. The backend's worker settles a Response
+# while a consumer on another thread polls C<is-done> and then reads
+# C<is-success>, C<is-cancelled>, C<.err> and C<.msg>; C<is-done> used to
+# turn True one assignment before C<is-success> did, so a poll landing in
+# between saw a finished Response that had not succeeded. Now the
+# terminal fields are written first and C<$!done> last, inside this lock,
+# and C<is-done> reads C<$!done> through it: once a consumer sees True,
+# every write that came before it is visible too.
+has Lock     $!state-lock = Lock.new;
+
 submethod BUILD(:$id) {
 	$!id       := $id;
 	$!supplier := Supplier.new;
@@ -127,12 +137,12 @@ submethod BUILD(:$id) {
 	);
 }
 
-method is-done { 
-	$!done;
+method is-done {
+	$!state-lock.protect: { $!done }
 }
 
 method is-cancelled {
-	$!cancelled;
+	$!state-lock.protect: { $!cancelled }
 }
 
 #|( True once C<cancel> has been called on this Response, whether or not
@@ -243,7 +253,7 @@ method !run-aborter($aborter --> Nil) {
 }
 
 method is-success {
-	$!success;
+	$!state-lock.protect: { $!success }
 }
 
 method supply {
@@ -528,8 +538,11 @@ method has-tool-calls(--> Bool:D) {
 }
 
 method _done {
-	$!done    = True;
-	$!success = True;
+	# $!done last: see $!state-lock.
+	$!state-lock.protect: {
+		$!success = True;
+		$!done    = True;
+	};
 	# Nothing left to abort: the body arrived. Dropped rather than kept
 	# so a late cancel cannot reset a connection that has since been
 	# handed back to Cro's pool.
@@ -538,9 +551,12 @@ method _done {
 }
 
 method _quit($ex) {
-	$!err       = $ex;
-	$!done      = True;
-	$!cancelled = True;
+	# $!done last: see $!state-lock.
+	$!state-lock.protect: {
+		$!err       = $ex;
+		$!cancelled = True;
+		$!done      = True;
+	};
 	self!take-aborter;
 	$!tap.close;
 }

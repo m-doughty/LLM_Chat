@@ -38,8 +38,9 @@ plan 9;
 
 my constant REQUESTS = 20;
 
-# How long the last closes may take to land once the requests are done.
-my constant CLOSE-LIMIT = 10;
+# How long the last closes may take to land once the requests are done:
+# a failsafe, not a timing assumption; they land in milliseconds.
+my constant CLOSE-LIMIT = 30;
 
 # How long one request may take before it counts as lost.
 my constant SETTLE-LIMIT = 30;
@@ -224,7 +225,9 @@ sub settled($response) {
 # Make REQUESTS calls of &call, one after another, against a fresh
 # server handed to &backend-for; then check that every call got the
 # fixture's answer, that the requests reached the server, and that no
-# connection is left open once the closes have landed.
+# connection is left open once the closes have landed. &call returns ''
+# when its call got the answer, and otherwise says what it got instead,
+# which is reported if the check fails.
 sub closes-every-connection(Str:D $what, &backend-for, &call, *@expected-requests) {
 	subtest "$what leaves no connection open" => {
 		plan 4;
@@ -232,9 +235,12 @@ sub closes-every-connection(Str:D $what, &backend-for, &call, *@expected-request
 		LEAVE { $server.stop }
 		my $backend = backend-for($server.port);
 
-		my @answers = (^REQUESTS).map({ call($backend) });
-		my Int $wrong = @answers.grep(!*).elems;
-		is $wrong, 0, "all {REQUESTS} calls got the fixture's answer";
+		my @problems = (1 .. REQUESTS).map(-> $n {
+			my Str:D $problem = call($backend);
+			$problem.chars ?? "call $n: $problem" !! Empty;
+		});
+		is @problems.elems, 0, "all {REQUESTS} calls got the fixture's answer";
+		diag $_ for @problems;
 
 		my @seen = $server.requests;
 		is-deeply @seen.unique.List, @expected-requests.List,
@@ -273,42 +279,57 @@ sub openrouter(Int:D $port) {
 	);
 }
 
-sub said-hello($response --> Bool:D) {
+# '' when a completion settled on the fixture's "hello"; otherwise how
+# it ended instead.
+sub hello-problem($response --> Str:D) {
 	settled($response);
-	so $response.is-success && ($response.msg // '') eq 'hello';
+	return '' if $response.is-success && ($response.msg // '') eq 'hello';
+	my $err = $response.err;
+	"done={$response.is-done} success={$response.is-success} "
+		~ "msg={($response.msg // '').raku} "
+		~ "err={$err.defined ?? ((try ~$err) // $err.^name).raku !! '-'} "
+		~ "error-class={$response.error-class // '-'} "
+		~ "error-status={$response.error-status // '-'} "
+		~ "finish-reason={$response.finish-reason // '-'}";
 }
 
 closes-every-connection 'chat-completion', &openai,
-	-> $backend { said-hello($backend.chat-completion(user-turn())) },
+	-> $backend { hello-problem($backend.chat-completion(user-turn())) },
 	'POST /v1/chat/completions';
 
 closes-every-connection 'chat-completion-stream', &openai,
-	-> $backend { said-hello($backend.chat-completion-stream(user-turn())) },
+	-> $backend { hello-problem($backend.chat-completion-stream(user-turn())) },
 	'POST /v1/chat/completions';
 
 closes-every-connection 'text-completion', &openai,
-	-> $backend { said-hello($backend.text-completion(user-turn())) },
+	-> $backend { hello-problem($backend.text-completion(user-turn())) },
 	'POST /v1/completions';
 
 closes-every-connection 'text-completion-stream', &openai,
-	-> $backend { said-hello($backend.text-completion-stream(user-turn())) },
+	-> $backend { hello-problem($backend.text-completion-stream(user-turn())) },
 	'POST /v1/completions';
 
 closes-every-connection 'probe-server-limits', &openai,
 	-> $backend {
 		my %limits = $backend.probe-server-limits;
-		so (%limits<context_length> // 0) == 4096 && (%limits<slots> // 0) == 2;
+		(%limits<context_length> // 0) == 4096 && (%limits<slots> // 0) == 2
+			?? '' !! "limits {%limits.sort.raku}";
 	},
 	'GET /props', 'GET /slots';
 
 closes-every-connection 'KoboldCpp probe-server-limits', &koboldcpp,
-	-> $backend { ($backend.probe-server-limits<context_length> // 0) == 8192 },
+	-> $backend {
+		my %limits = $backend.probe-server-limits;
+		(%limits<context_length> // 0) == 8192 ?? '' !! "limits {%limits.sort.raku}";
+	},
 	'GET /api/extra/true_max_context_length';
 
 closes-every-connection "KoboldCpp's length check", &koboldcpp,
 	-> $backend {
 		my $response = LLM::Chat::Backend::Response.new(id => 'length-check');
-		$backend._reconcile-finish-reason($response, 'length', %(max_tokens => 16)) eq 'stop';
+		my $verdict = $backend._reconcile-finish-reason($response, 'length', %(max_tokens => 16));
+		$verdict eq 'stop'
+			?? '' !! "verdict $verdict, evidence {$response.finish-reason-evidence.sort.raku}";
 	},
 	'GET /api/extra/perf';
 
@@ -316,14 +337,19 @@ closes-every-connection "KoboldCpp's abort", &koboldcpp,
 	-> $backend {
 		my $abort = $backend.cancel(LLM::Chat::Backend::Response.new(id => 'abort'));
 		await Promise.anyof($abort, Promise.in(SETTLE-LIMIT));
-		so $abort.status ~~ Kept && ($abort.result.?status // 0) == 200;
+		given $abort.status {
+			when Kept   { ($abort.result.?status // 0) == 200 ?? '' !! "abort answered {$abort.result.raku}" }
+			when Broken { "abort failed: {$abort.cause.^name}" }
+			default     { "abort still pending after {SETTLE-LIMIT}s" }
+		}
 	},
 	'POST /api/extra/abort';
 
 closes-every-connection "OpenRouter's generation lookup", &openrouter,
 	-> $backend {
 		my $response = $backend.chat-completion(user-turn());
-		said-hello($response) && ($response.cost // 0) == 0.25;
+		my $problem = hello-problem($response);
+		$problem || (($response.cost // 0) == 0.25 ?? '' !! "cost {($response.cost // 'none').raku}");
 	},
 	'POST /v1/chat/completions', 'GET /v1/generation';
 

@@ -219,7 +219,7 @@ subtest 'premise: Cro raises a messageless exception on a dropped connection' =>
 	is $post.status, Broken, 'the request fails';
 	my $cause = $post.status ~~ Broken ?? $post.cause !! Mu;
 	ok $cause.^name.starts-with(DROPPED), "it fails with {DROPPED}";
-	throws-like { $cause.message }, X::StubCode,
+	throws-like { $cause.message }, Exception, message => 'Stub code executed',
 		'... whose .message is the base stub';
 	is exception-text($cause), DROPPED, 'exception-text names it';
 };

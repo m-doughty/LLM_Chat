@@ -2,6 +2,20 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.10.2  2026-10-24T18:26:08+01:00
+    - [2026-10-24] Installs on Rakudo 2026.07 work again. The test suite
+      failed there, so installing 0.10.1 on 2026.07 stopped at the test
+      step: one test pinned the exception class behind Rakudo's message
+      stub, which is X::AdHoc before 2026.08 and X::StubCode since. It
+      now accepts either; the library itself was unaffected.
+    - [2026-10-24] A finished Response could briefly look failed.
+      `.is-done` turned True one step before `.is-success` (and, on a
+      failure, before `.is-cancelled` and `.err`), so a consumer polling
+      `.is-done` from another thread could see a completed generation
+      as one that had not succeeded. The terminal state is now published
+      all at once: when `.is-done` is True, `.is-success`,
+      `.is-cancelled`, `.err` and `.msg` are already final.
+
 0.10.1  2026-10-24T17:46:46+01:00
     - [2026-10-24] The HTTP-level tests run against `raw-server`, the
       fixture server in LLM::Chat::Test::Kit: an HTTP/1.1 server on

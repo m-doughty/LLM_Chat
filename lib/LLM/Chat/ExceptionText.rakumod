@@ -30,8 +30,9 @@ $quiet.message;                      # dies: Stub code executed
 In Rakudo the base C<Exception.message> is a stub: its whole body is
 C<...>, the yada operator. An exception class that defines neither a
 C<message> method nor a C<$.message> attribute therefore has no message
-to give. What C<.message> hands back is a C<Failure> of C<X::StubCode>
-("Stub code executed"), and that Failure B<throws> the moment anything
+to give. What C<.message> hands back is a C<Failure> whose exception
+says "Stub code executed" (an C<X::StubCode> from Rakudo 2026.08 on, an
+C<X::AdHoc> before), and that Failure B<throws> the moment anything
 uses it as text: interpolates it, stringifies it, calls C<.lc> or
 C<.lines> on it.
 
