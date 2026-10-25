@@ -411,11 +411,16 @@ subtest 'the same data built in any order serializes to the same bytes' => {
 
 subtest 'the same data serializes to the same bytes in every process' => {
 	plan 2;
-	# The include paths this process was given, so each child resolves
-	# LLM::Chat exactly as the parent did.
+	# Every repository this process loads modules from, by path-spec, so
+	# each child resolves LLM::Chat exactly as the parent did. Under
+	# `zef install` that includes the CompUnit::Repository::Staging repo
+	# holding the dependencies zef has staged but not yet installed; a
+	# child handed only the FileSystem repos could not see them. The
+	# default home/site/vendor/core repos are passed too, harmlessly: a
+	# child given them by -I builds the same chain it would anyway.
 	my @inc = $*REPO.repo-chain
-		.grep(CompUnit::Repository::FileSystem)
-		.map({ '-I' ~ .prefix.absolute });
+		.grep(CompUnit::Repository::Locally)
+		.map({ '-I' ~ .path-spec });
 
 	# Every child builds its hashes in its own random insertion order,
 	# under its own hash seed, and meets the two synthetic-grapheme

@@ -2,6 +2,20 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.10.3  2026-10-25T13:25:17Z
+    - [2026-10-25] A fresh `zef install` failed in t/30 because the
+      child process it starts could not see the dependencies zef had
+      staged but not yet installed: it died with "Could not find
+      Digest::SHA256::Native". zef tests a distribution from a staging
+      repository and installs nothing until every test has passed, and
+      the test handed its child only the FileSystem module
+      repositories. It passed wherever the dependencies were already
+      installed, so installing LLM::Chat failed only on a machine that
+      did not have them yet. t/29, t/30 and t/35 now hand each child
+      the test's whole module search path, every repository by its
+      path-spec, the staging repository included. The library itself
+      was unaffected.
+
 0.10.2  2026-10-24T18:26:08+01:00
     - [2026-10-24] Installs on Rakudo 2026.07 work again. The test suite
       failed there, so installing 0.10.1 on 2026.07 stopped at the test

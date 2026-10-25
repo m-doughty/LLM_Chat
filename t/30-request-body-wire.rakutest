@@ -281,9 +281,17 @@ subtest 'the same request is the same bytes in every process' => {
 	settled($backend.chat-completion(@messages, tools => tools()), 'chat-completion for the process check');
 	my $ours = next-request('the chat-completion body')<bytes>.list.fmt('%02x', '');
 
+	# Every repository this process loads modules from, by path-spec, so
+	# each child resolves LLM::Chat exactly as the parent did. Under
+	# `zef install` that includes the CompUnit::Repository::Staging repo
+	# holding the dependencies zef has staged but not yet installed
+	# (Digest::SHA256::Native, for one); a child handed only the
+	# FileSystem repos could not see them. The default
+	# home/site/vendor/core repos are passed too, harmlessly: a child
+	# given them by -I builds the same chain it would anyway.
 	my @inc = $*REPO.repo-chain
-		.grep(CompUnit::Repository::FileSystem)
-		.map({ '-I' ~ .prefix.absolute });
+		.grep(CompUnit::Repository::Locally)
+		.map({ '-I' ~ .path-spec });
 
 	# Assembles the chat body exactly as chat-completion does, in a
 	# fresh VM with its own hash seed, and prints the bytes.

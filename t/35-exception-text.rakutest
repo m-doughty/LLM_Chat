@@ -1,8 +1,6 @@
 use Test;
 use lib 'lib';
 
-use CompUnit::Repository::Staging;
-
 use LLM::Chat::ExceptionText;
 
 # Exceptions without a message.
@@ -246,25 +244,16 @@ my IO::Path $handlers = $?FILE.IO.absolute.IO.parent.add('35-exception-text-hand
 # The child's own waits are bounded; this bounds the child.
 my constant CHILD-LIMIT = 600;
 
-# Every non-default repo this process has, for the child: a FileSystem
-# repo (forwarded as its dist root when its prefix is a `lib` beside a
-# META6.json, so a provides alias still resolves), or a Staging repo
-# (forwarded by its path-spec, the form `zef install` hands a test
-# process). The default site/vendor/core/home chain needs no forwarding.
-my @inc = $*REPO.repo-chain.grep({
-	$_ ~~ CompUnit::Repository::FileSystem | CompUnit::Repository::Staging
-}).map(-> $repo {
-	if $repo ~~ CompUnit::Repository::Staging {
-		'-I' ~ $repo.path-spec;
-	}
-	else {
-		my $prefix = $repo.prefix;
-		my $dist-root = $prefix.basename eq 'lib'
-				&& $prefix.parent.add('META6.json').e
-			?? $prefix.parent !! $prefix;
-		'-I' ~ $dist-root.absolute;
-	}
-});
+# Every repository this process loads modules from, by path-spec, so the
+# child resolves LLM::Chat exactly as this process did. Under
+# `zef install` that includes the CompUnit::Repository::Staging repo
+# holding the dependencies zef has staged but not yet installed; a child
+# handed only the FileSystem repos could not see them. The default
+# home/site/vendor/core repos are passed too, harmlessly: a child given
+# them by -I builds the same chain it would anyway.
+my @inc = $*REPO.repo-chain
+	.grep(CompUnit::Repository::Locally)
+	.map({ '-I' ~ .path-spec });
 
 # Run the handlers script; collect its stdout, stderr and fate. Both
 # streams are read as they arrive, so neither pipe can fill and stall
