@@ -37,10 +37,11 @@ use JSON::Fast;
 # 'Understood.' by default — between the tool results and that user
 # message.
 
-plan 31;
+plan 35;
 
 constant MARK = '[System message]';
 constant ACK  = 'Understood.';
+constant INITIAL-USER = 'Acknowledged.';
 
 sub msg(Str:D $role, Str:D $content = '', *%extra) {
 	LLM::Chat::Conversation::Message.new(:$role, :$content, |%extra);
@@ -74,6 +75,63 @@ sub norm(@messages, *%extra --> Array:D) {
 sub roles(@hashes --> Str:D) { @hashes.map(*<role>).join(',') }
 
 # === The rules, one at a time ===
+
+subtest 'an assistant opening gets a user turn after the optional system block' => {
+	for [], [msg('system', 'persona')],
+		[msg('system', ''), msg('system', 'persona'), msg('system', 'rules')] -> @systems {
+		my @in = |@systems, msg('assistant', 'Hello.'), msg('assistant', 'Welcome.'), msg('user', 'Hi.');
+		my @before = @in.map(&wire);
+		my @expected;
+		my $system = @systems.map(*.content).grep(*.chars).join("\n\n");
+		@expected.push: %(role => 'system', content => $system) if $system.chars;
+		@expected.append: %(role => 'user', content => INITIAL-USER),
+			%(role => 'assistant', content => "Hello.\n\nWelcome."),
+			%(role => 'user', content => 'Hi.');
+		is-deeply norm(@in), @expected.Array, 'wire messages start with a user turn';
+		my @text = backend().normalized-messages(@in);
+		is-deeply @text.map(&wire).Array, @expected.Array, 'text templates get the same opening';
+		is-deeply norm(@text), @expected.Array, 'normalizing again adds no second user turn';
+		is-deeply @in.map(&wire).Array, @before.Array, 'caller messages are unchanged';
+	}
+	done-testing;
+};
+
+subtest 'the initial user turn preserves tool calls and decorated assistant messages' => {
+	my $call = tool-call-turn('opening');
+	my $result = tool-result('opening', 'found');
+	my @in = msg('system', 'persona'), $call, $result, msg('assistant', 'Hello.'), msg('user', 'Hi.');
+	my @out = norm(@in);
+	is-deeply @out.Array, [
+		wire(@in[0]), %(role => 'user', content => INITIAL-USER),
+		wire($call), wire($result), wire(@in[3]), wire(@in[4]),
+	], 'the opening tool call and its result retain every field';
+	my @text = backend().normalized-messages(@in);
+	ok @text[2] === $call && @text[3] === $result, 'text path retains both tool objects';
+	my class OpeningMessage is LLM::Chat::Conversation::Message {
+		method to-hash { %( |callsame, name => 'greeter' ) }
+	}
+	my $decorated = OpeningMessage.new(role => 'assistant', content => 'Hello.');
+	is-deeply norm([$decorated]), [%(role => 'user', content => INITIAL-USER), wire($decorated)],
+		'an assistant with extra fields also gets an opening user turn';
+	is norm([$decorated])[1]<name>, 'greeter', 'the extra field survives';
+	done-testing;
+};
+
+subtest 'an initial user turn is only added when strict mode needs it' => {
+	for [], [msg('system', 'persona')], [msg('user', '')],
+		[msg('system', 'persona'), msg('user', 'Hi.'), msg('assistant', 'Hello.')] -> @in {
+		is-deeply norm(@in), @in.map(&wire).Array, 'empty, system-only and user-first histories are unchanged';
+	}
+	my @in = msg('system', 'persona'), msg('assistant', 'Hello.');
+	is-deeply norm(@in, message-normalization => 'none'), @in.map(&wire).Array,
+		'normalization off retains an assistant opening';
+	is-deeply backend(message-normalization => 'none').normalized-messages(@in).map(&wire).Array,
+		@in.map(&wire).Array, 'text mode off also retains the opening';
+	is-deeply norm(@in, tool-result-acknowledgement => ''), [
+		wire(@in[0]), %(role => 'user', content => INITIAL-USER), wire(@in[1]),
+	], 'disabling tool acknowledgements does not disable the initial user turn';
+	done-testing;
+};
 
 subtest 'adjacent user messages merge, in order, joined by a blank line' => {
 	plan 3;
@@ -441,6 +499,10 @@ sub is-ack(%h --> Bool:D) {
 	is-plain(%h) && %h<role> eq 'assistant' && (%h<content> // '') eq ACK;
 }
 
+sub is-initial-user(%h --> Bool:D) {
+	is-plain(%h) && %h<role> eq 'user' && (%h<content> // '') eq INITIAL-USER;
+}
+
 sub ack-positions(@hashes --> List:D) { @hashes.keys.grep({ is-ack(@hashes[$_]) }).List }
 
 # What the normalized conversation must contain, in order: each tool
@@ -458,9 +520,10 @@ sub expected-pieces(@messages --> List:D) {
 	@pieces.List;
 }
 
-# The caller's text, in order: acknowledgements are not the caller's.
+# Generated contents never equal either inserted turn's text.
+# The caller's text, in order, excludes those synthetic turns.
 sub actual-pieces(@hashes --> List:D) {
-	@hashes.grep({ !is-ack($_) }).map(-> %h {
+	@hashes.grep({ !is-ack($_) && !is-initial-user($_) }).map(-> %h {
 		is-plain(%h)
 			?? (%h<content> // '').split("\n\n").grep(*.chars).Slip
 			!! to-wire-json(%h)
@@ -484,14 +547,21 @@ sub expected-acks(@messages --> Int:D) {
 constant CONVERSATIONS = 150;
 
 subtest "generated conversations: nothing lost, nothing reordered, roles alternate" => {
-	plan 8;
+	plan 10;
 	my $rng = Lcg.new;
 	my ($lossless, $alternating, $answered, $template-view, $no-mid-system, $acknowledged, $deterministic)
 		= 0 xx 7;
 	my Int $acks = 0;
+	my Int $user-first = 0;
+	my Int $initial-turns = 0;
 	for ^CONVERSATIONS {
 		my @m = generate($rng, 1 + $rng.next(14));
 		my @out = norm(@m);
+		my $first = @out.first(*<role> ne 'system');
+		$user-first++ if !$first.defined || $first<role> eq 'user';
+		my $original-first = @m.first(*.role ne 'system');
+		$initial-turns++ if @out.grep(&is-initial-user).elems
+			== ($original-first.defined && $original-first.role eq 'assistant' ?? 1 !! 0);
 
 		$lossless++ if actual-pieces(@out) eqv expected-pieces(@m);
 
@@ -546,6 +616,8 @@ subtest "generated conversations: nothing lost, nothing reordered, roles alterna
 		'acknowledgements exactly where the rule calls for them, each between a tool result and a user message';
 	is $deterministic, CONVERSATIONS, 'the same messages always normalize to the same bytes';
 	ok $acks >= CONVERSATIONS div 10, "the conversations exercised $acks acknowledgements";
+	is $user-first, CONVERSATIONS, 'every nonempty conversation starts with a user after its system block';
+	is $initial-turns, CONVERSATIONS, 'exactly one initial user turn is added only for an assistant opening';
 };
 
 subtest 'generated conversations: a prefix normalizes to a prefix (cache stability)' => {
@@ -837,6 +909,34 @@ sub strict-template(--> LLM::Chat::Template::Jinja2:D) {
         {% endfor %}
         JINJA
 }
+
+subtest 'an assistant greeting passes strict templates in all four request paths' => {
+	my @in = msg('system', 'persona'), msg('assistant', 'Hello.'), msg('user', 'Hi.');
+	my @expected = wire(@in[0]), %(role => 'user', content => INITIAL-USER), wire(@in[1]), wire(@in[2]);
+	my $strict = strict-template();
+	my $raw = stream-settled(live-backend(template => $strict).text-completion(@in), 'raw assistant opening');
+	nok $raw.is-success, 'the original assistant opening is rejected';
+	like ($raw.err // '').Str, /'must alternate'/, 'with the reported template error';
+	my $backend = live-backend(template => $strict, message-normalization => 'alternate-roles');
+	for <chat-completion chat-completion-stream text-completion text-completion-stream> -> $method {
+		my $response = stream-settled($backend."$method"(@in), $method);
+		if ok $response.is-success, "$method accepts the assistant opening" {
+			my %body = posted("$method with assistant opening");
+			if $method.starts-with('chat') {
+				is-deeply %body<messages>, @expected.Array, "$method sends the exact user-first sequence";
+			}
+			else {
+				is %body<prompt>, @expected.map({ "[{.<role>}]{.<content>}\n" }).join ~ "\n",
+					"$method renders the exact user-first sequence";
+			}
+		}
+	}
+	is-deeply @in.map(&wire).Array, [
+		%(role => 'system', content => 'persona'), %(role => 'assistant', content => 'Hello.'),
+		%(role => 'user', content => 'Hi.'),
+	], 'sending leaves the original conversation intact';
+	done-testing;
+};
 
 subtest 'a strict-alternation chat template: fails without, renders with' => {
 	plan 4;

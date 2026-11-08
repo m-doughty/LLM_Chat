@@ -303,7 +303,7 @@ The default, C<'none'>, sends every message as given.
 
 =head2 The rules
 
-Only I<plain> messages take part: C<user>, C<assistant> and C<system>
+Only I<plain> messages are merged or folded: C<user>, C<assistant> and C<system>
 messages made of a role and text and nothing else. A tool result, an
 assistant turn carrying C<tool_calls>, or a message with any other key
 is passed through exactly as it is, and nothing is ever merged into or
@@ -319,6 +319,13 @@ messages at the start becomes one system message.
 before the first non-system message is the leading block, and it is
 never rewritten beyond merging it into one message — it is the prefix
 every request shares, and rewriting it would change every request.
+
+=item B<An assistant opening gets an initial user turn.> If the first
+non-system message is an assistant message, C<'Acknowledged.'> is
+inserted as a user message immediately before it. This also applies
+when that assistant message carries tool calls or extra fields.
+An existing user opening, an empty list, or a system-only list gets
+no added turn. The original messages stay unchanged.
 
 =item B<A system message after the first turn becomes user text.> Its
 content goes out as C<"[System message]\n"> followed by its text (the
@@ -345,8 +352,9 @@ L</Tool results are acknowledged>.
 
 =item B<Nothing is reordered, and no text is dropped.> The one thing
 removed is an empty system message, which carries nothing and would
-fold into a bare marker line; the one thing added is the
-acknowledgement above. An empty user or assistant message is kept:
+fold into a bare marker line. The initial user turn and tool-result
+acknowledgement above are the only additions. An empty user or
+assistant message is kept:
 merged into a same-role neighbour it adds nothing (no stray blank
 line), and standing alone it is still a turn, which keeps the roles
 alternating. Whitespace is text and is kept verbatim.
@@ -484,8 +492,6 @@ inserts none.
 
 =head2 What it does not fix
 
-=item A conversation whose first turn after the system message is an
-assistant message. Normalization never invents a user message.
 =item Assistant text on both sides of a tool call: a plain assistant
 message written just before a tool-call turn, then the assistant's
 answer after the tool results. A template that skips the tool-call
@@ -753,7 +759,8 @@ has Bool $.request-stream-usage = False;
 #|( How the conversation is reshaped before it is sent: C<'none'> (the
     default) sends every message as given; C<'alternate-roles'> merges
     runs of same-role messages, folds mid-conversation system messages
-    into user turns and has the assistant acknowledge tool results a
+    into user turns, adds an initial user turn before an assistant
+    opening, and has the assistant acknowledge tool results a
     user message follows, for chat templates that insist on strict
     user/assistant alternation. Applies to the chat paths' C<messages>
     and to the messages the text paths hand their template. See
@@ -958,7 +965,8 @@ method wire-message-hashes(@messages --> Array:D) {
     list is normalized exactly as C<wire-message-hashes> normalizes a
     chat body (see L</MESSAGE NORMALIZATION>): a message that survives
     untouched is the caller's own Message object, and a merged or
-    folded one — or an inserted tool-result acknowledgement — is a new
+    folded one — or an inserted initial user turn or tool-result
+    acknowledgement — is a new
     C<LLM::Chat::Conversation::Message> carrying only a role and its
     content.
 
@@ -1842,8 +1850,8 @@ method !normalize-system-messages($messages --> Array:D) {
 
 #|( True for a message that is nothing but a role and its text: a
     C<user>, C<assistant> or C<system> hash with no key besides C<role>
-    and C<content>, and string (or absent) content. Only these take
-    part in C<alternate-roles> normalization. Anything else — a tool
+    and C<content>, and string (or absent) content. Only these are
+    merged or folded by C<alternate-roles> normalization. Anything else — a tool
     result (C<tool_call_id>), an assistant turn carrying C<tool_calls>,
     a message some subclass decorated with extra keys — is passed
     through exactly as it is and is never merged with anything, because
@@ -1886,6 +1894,8 @@ my sub user-group(%group --> Bool:D) {
     C<sources> lists the input indexes the group was built from;
     C<rewritten> is False only for a group that is a single input
     message passed through untouched (C<message> is then that input).
+    An initial user turn inserted before an assistant opening has no
+    C<sources> and is rewritten, but is not a tool acknowledgement.
     C<acknowledgement> is True only for an assistant turn inserted
     between tool results and the user message after them; it has no
     C<sources> and its one part is C<$acknowledgement>. Acknowledgements
@@ -1920,6 +1930,22 @@ my sub alternate-role-groups(
 				$text      = $marker.chars ?? "$marker\n$text" !! $text;
 				$rewritten = True;
 			}
+		}
+
+		# WHY: Strict templates require a user first, even when a character
+		# greeting or a truncated history starts with an assistant. Insert
+		# only when that opening arrives, preserving every earlier prefix.
+		if $index == $first-turn && $message ~~ Associative:D
+			&& ($message<role> // '') eq 'assistant' {
+			@groups.push: %(
+				role            => 'user',
+				plain           => True,
+				message         => Nil,
+				parts           => ['Acknowledged.'],
+				sources         => [],
+				rewritten       => True,
+				acknowledgement => False,
+			);
 		}
 
 		my $last = @groups.elems ?? @groups.tail !! Nil;

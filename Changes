@@ -2,6 +2,13 @@ Revision history for LLM::Chat
 
 {{$NEXT}}
 
+0.10.4  2026-11-08T21:26:08Z
+    - [2026-11-07] With alternate-roles normalization, an assistant opening
+      now gets a preceding user turn saying "Acknowledged." after the
+      optional system block. Strict chat templates accept character greetings
+      and histories that start with an assistant. Chat and text paths share
+      the fix; stored messages and normalization-off behavior are unchanged.
+
 0.10.3  2026-10-25T13:25:17Z
     - [2026-10-25] A fresh `zef install` failed in t/30 because the
       child process it starts could not see the dependencies zef had
